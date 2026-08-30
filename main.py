@@ -24,9 +24,11 @@ See README.md for setup instructions.
 import asyncio
 import collections
 import logging
+import time
 
 import bptf_client
 import bptf_ws
+import error_log
 import mannco_client
 import mannco_ws
 import marketplacetf_client
@@ -44,6 +46,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("main")
+
+_error_buffer = error_log.install()
 
 # Only cosmetics (hats/misc) can carry a Paint Can colour in TF2 - weapons
 # can never be painted (that's a common misconception; War Paint *skins*
@@ -200,7 +204,18 @@ class Watcher:
         self.telegram = telegram_notify.TelegramNotifier(cfg["telegram_bot_token"], cfg["telegram_chat_id"])
         self.particle_name_to_id = steam_schema.fetch_particle_name_to_id(cfg.get("steam_api_key", ""))
         self.particle_id_to_name = {v: k for k, v in self.particle_name_to_id.items()}
-        self.defindex_to_name = steam_schema.fetch_defindex_to_name(cfg.get("steam_api_key", ""))
+        # Case/whitespace-normalized lookup too, alongside the exact one -
+        # mannco.store's effect-name field isn't documented (see
+        # mannco_effect_name's own comment), so a mismatch as small as
+        # "kill-a-watt" vs "Kill-A-Watt" or stray whitespace would
+        # otherwise silently make every one of that effect's Unusuals
+        # unmatchable, with no indication why.
+        self.particle_name_to_id_normalized = {
+            name.strip().lower(): pid for name, pid in self.particle_name_to_id.items()
+        }
+        self.defindex_to_name, self.name_to_image_url = steam_schema.fetch_defindex_to_name(
+            cfg.get("steam_api_key", "")
+        )
         if not self.defindex_to_name:
             log.warning(
                 "No Steam schema defindex map available (steam_api_key missing or fetch failed) - "
@@ -214,6 +229,28 @@ class Watcher:
         self.mannco_key_usd_cents = None
         self.seen = collections.deque(maxlen=cfg["seen_listings_max"])
         self.seen_set = set()
+
+        # Funnel counters, purely diagnostic - answers "is the bot even
+        # seeing the volume I'd expect, and if so, where is it narrowing
+        # down: the cheap quality/category filter, or the accuracy checks
+        # inside evaluate_listing (discount threshold, liquidity, tier
+        # consistency, community-price cross-check, etc)?" - see /stats
+        # in Telegram. Reset whenever /stats is read, so each read shows
+        # "since last time you checked", not a lifetime total.
+        self.stats = collections.Counter()
+        self.stats_since = time.time()
+
+        # Item-type cooldown state - see send_deal(). Keyed by (source,
+        # display_name, particle, paint, killstreaker, sheen) -> last
+        # alert timestamp.
+        self.item_type_last_alerted = {}
+
+        # Which "kinds" of item structure we've already logged a raw
+        # sample of since startup - see the sampling calls in
+        # handle_bptf_event. One sample per kind is plenty; the point is
+        # having real captured data on hand if extraction for that kind
+        # ever turns out wrong, not building an ongoing log of every item.
+        self._sampled_item_kinds = set()
 
         if not cfg.get("backpacktf_token"):
             log.warning(
@@ -265,6 +302,60 @@ class Watcher:
                 log.exception("Price refresh failed, will retry next cycle.")
             await asyncio.sleep(self.cfg["price_refresh_seconds"])
 
+    async def health_check_loop(self):
+        """
+        Proactively pings Telegram only when something looks worth
+        knowing about - NOT a routine "all good" check-in every few
+        hours, which would just be noise. Specifically watches for a
+        meaningful number of new warnings/errors piling up since the
+        last check (see error_log.py) - the kind of thing that, across
+        this project's history, otherwise only surfaced once someone
+        noticed a bad alert and had to go dig through logs by hand.
+
+        When the threshold is crossed, this also PAUSES deal alerts (the
+        same /pause a person can trigger by hand) - not a full process
+        stop. A full stop was the original ask, but risks two things: (1)
+        systemd's own restart policy could just bring the process back up
+        within seconds, defeating the point, and (2) actually stopping
+        for longer would mean missing real, time-sensitive deals for
+        however long it takes to notice - the exact opposite of what this
+        project is for. Pausing achieves the same "impossible to miss"
+        effect (no more deal alerts show up at all until /resume) while
+        keeping the websocket connections and monitoring themselves alive
+        in the background, and it's fully reversible with one command
+        once the /errors output has been checked.
+        """
+        last_error_count = len(_error_buffer.recent(1000))
+        interval_seconds = self.cfg.get("health_check_interval_minutes", 180) * 60
+        threshold = self.cfg.get("health_check_error_threshold", 5)
+        auto_pause = self.cfg.get("health_check_auto_pause", True)
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                current_errors = _error_buffer.recent(1000)
+                new_error_count = len(current_errors) - last_error_count
+                if new_error_count >= threshold:
+                    recent_messages = [e["message"][:150] for e in current_errors[-new_error_count:]]
+                    summary = "\n".join(f"• {m}" for m in recent_messages[-5:])
+                    pause_note = ""
+                    if auto_pause and not self.runtime.paused:
+                        self.runtime.paused = True
+                        self.runtime.save()
+                        pause_note = (
+                            "\n\n⏸ <b>Уведомления о сделках приостановлены</b>, чтобы это точно "
+                            "не потерялось - мониторинг продолжает работать в фоне. Посмотри /errors "
+                            "и напиши, что нашлось - или просто /resume, если показалось лишним."
+                        )
+                    await asyncio.to_thread(
+                        self.telegram.send,
+                        f"⚠️ <b>За последние {interval_seconds // 60:.0f} мин. накопилось "
+                        f"{new_error_count} предупреждений/ошибок</b>.\n\nПоследние:\n{summary}"
+                        f"{pause_note}",
+                    )
+                last_error_count = len(current_errors)
+            except Exception:
+                log.exception("Health check loop itself failed - continuing anyway.")
+
     # -- marketplace.tf (autonomous - scrapes their public /deals page) -----
 
     async def marketplacetf_poll_loop(self):
@@ -285,12 +376,14 @@ class Watcher:
             return  # can't safely resolve item names - see __init__ warning
         deals = await asyncio.to_thread(client.fetch_deals)
         for raw in deals:
+            self.stats["mptf_received"] += 1
             # Include price in the dedup key too, same reasoning as the
             # mannco.store/backpack.tf handlers - a price drop on a SKU
             # already seen once must still be evaluated fresh, not
             # silently skipped because that SKU showed up before.
             dedup_id = f"mptf:{raw['sku']}:{round(raw['price_usd'], 2)}"
             if not self._mark_seen(dedup_id):
+                self.stats["mptf_deduped"] += 1
                 continue
 
             defindex, quality_name, particle_id, craftable = marketplacetf_client.parse_sku(raw["sku"])
@@ -333,9 +426,13 @@ class Watcher:
                 price_usd=raw["price_usd"],
                 link=f"https://marketplace.tf/items/tf2/{raw['sku']}",
             )
-            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg())
+            self.stats["mptf_evaluated"] += 1
+            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url)
             if deal:
+                self.stats["mptf_alerts"] += 1
                 await self.send_deal(deal)
+            else:
+                self.stats["mptf_rejected_by_checks"] += 1
 
     # -- stntrading.eu (opt-in watchlist - see /watchstn in Telegram) -------
 
@@ -356,6 +453,7 @@ class Watcher:
         if self.runtime.paused or not self.runtime.stn_watchlist:
             return
         for item_name in list(self.runtime.stn_watchlist):
+            self.stats["stn_received"] += 1
             price_keys, _stock = await asyncio.to_thread(
                 client.get_item_price_keys, item_name, self.bptf.key_price_metal
             )
@@ -374,6 +472,7 @@ class Watcher:
             # a genuine price *change* still gets through.
             dedup_id = f"stn:{item_name}:{round(price_keys, 2)}"
             if not self._mark_seen(dedup_id):
+                self.stats["stn_deduped"] += 1
                 continue
 
             listing = matcher.NormalizedListing(
@@ -387,9 +486,13 @@ class Watcher:
                 price_usd=None,
                 link="https://stntrading.eu/tf2",
             )
-            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg())
+            self.stats["stn_evaluated"] += 1
+            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url)
             if deal:
+                self.stats["stn_alerts"] += 1
                 await self.send_deal(deal)
+            else:
+                self.stats["stn_rejected_by_checks"] += 1
 
     def format_alert(self, deal: dict) -> str:
         effect = f" ({deal['particle_name']})" if deal["particle_name"] else ""
@@ -447,7 +550,9 @@ class Watcher:
             link_lines.append(f"📋 Объявление на backpack.tf: {deal['backpacktf_search_link']}")
         links_block = ("\n" + "\n".join(link_lines)) if link_lines else ""
 
+        priority_prefix = "⭐ ПРИОРИТЕТ (ликвидно/хайп) ⭐\n" if deal.get("is_priority") else ""
         return (
+            f"{priority_prefix}"
             f"🔥 <b>-{deal['discount_percent']:.0f}%</b> — {deal['source']}\n"
             f"<b>{deal['display_name']}</b>{effect}{variant}"
             f"{special_block}\n"
@@ -460,18 +565,58 @@ class Watcher:
         )
 
     async def send_deal(self, deal):
+        # Per-SELLER cooldown: don't re-alert on the same item from the
+        # SAME seller repeatedly (bumped/re-listed) within a short window
+        # - but a DIFFERENT seller's listing of the same kind of item is a
+        # genuinely different opportunity and must never be held back by
+        # this. An earlier version of this scoped the cooldown to the item
+        # type alone (no seller in the key), which was wrong per direct
+        # correction: it was silently swallowing every other seller's
+        # listing of the same item for a full hour after the first one
+        # alerted - exactly the effect of "new items stopped showing up",
+        # since they WERE being found, just suppressed by too broad a key.
+        identity_key = (
+            deal["source"], deal.get("seller_id"), deal["display_name"],
+            deal.get("particle_name"), deal.get("paint"), deal.get("killstreaker"), deal.get("sheen"),
+        )
+        now = time.time()
+        cooldown_seconds = self.cfg.get("item_type_cooldown_minutes", 60) * 60
+        last_alerted = self.item_type_last_alerted.get(identity_key)
+        if last_alerted is not None and (now - last_alerted) < cooldown_seconds:
+            log.info(
+                "Suppressing repeat alert for %s (%s, seller %s) - alerted %.0f min ago, within "
+                "the %d min per-seller cooldown.",
+                deal["display_name"], deal["source"], deal.get("seller_id"), (now - last_alerted) / 60,
+                self.cfg.get("item_type_cooldown_minutes", 60),
+            )
+            self.stats["suppressed_item_cooldown"] += 1
+            return
+        self.item_type_last_alerted[identity_key] = now
+
         log.info(
             "DEAL [%s]: %s - %.2f keys vs %.2f keys before (%.0f%% off)",
             deal["source"], deal["display_name"],
             deal["price_keys"], deal["previous_low_keys"], deal["discount_percent"],
         )
-        await asyncio.to_thread(self.telegram.send, self.format_alert(deal))
+        alert_text = self.format_alert(deal)
+        image_url = deal.get("image_url")
+        sent_as_photo = False
+        if image_url:
+            # send_photo itself refuses (returns False, doesn't raise) if
+            # the caption is over Telegram's 1024-char photo-caption limit
+            # (plain messages allow 4096) - falls straight through to the
+            # normal text-only send below either way, so a long alert or a
+            # dead/blocked image URL never costs the alert itself.
+            sent_as_photo = await asyncio.to_thread(self.telegram.send_photo, image_url, alert_text)
+        if not sent_as_photo:
+            await asyncio.to_thread(self.telegram.send, alert_text)
 
     # -- mannco.store side ------------------------------------------------
 
     async def handle_mannco_event(self, event: dict):
         if self.runtime.paused:
             return
+        self.stats["mannco_received"] += 1
 
         data = event.get("data", {})
         item_id = data.get("itemId")
@@ -488,6 +633,7 @@ class Watcher:
         # silently swallowed every one of those, missing exactly the kind
         # of price-drop event this whole feature exists to catch.
         if not self._mark_seen(f"mannco:{listing_id}:{price_cents}"):
+            self.stats["mannco_deduped"] += 1
             return
 
         details = await asyncio.to_thread(self.mannco.get_item_details, item_id)
@@ -504,6 +650,11 @@ class Watcher:
             particle_name = mannco_effect_name(details)
             if particle_name and self.particle_name_to_id:
                 particle_id = self.particle_name_to_id.get(particle_name)
+                if particle_id is None:
+                    # Exact match failed - try case/whitespace-normalized,
+                    # in case mannco.store formats the effect name
+                    # slightly differently than Valve's own schema does.
+                    particle_id = self.particle_name_to_id_normalized.get(particle_name.strip().lower())
 
         if not self.mannco_key_usd_cents:
             return
@@ -534,15 +685,20 @@ class Watcher:
             paint=mannco_paint(details),
         )
 
-        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg())
+        self.stats["mannco_evaluated"] += 1
+        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url)
         if deal:
+            self.stats["mannco_alerts"] += 1
             await self.send_deal(deal)
+        else:
+            self.stats["mannco_rejected_by_checks"] += 1
 
     # -- backpack.tf side ---------------------------------------------------
 
     async def handle_bptf_event(self, payload: dict):
         if self.runtime.paused:
             return
+        self.stats["bptf_received"] += 1
 
         listing_id = payload.get("id")
         if listing_id is None:
@@ -559,21 +715,57 @@ class Watcher:
         currencies = payload.get("currencies") or {}
         price_fingerprint = tuple(sorted(currencies.items()))
         if not self._mark_seen(f"bptf:{listing_id}:{price_fingerprint}"):
+            self.stats["bptf_deduped"] += 1
             return
 
         item = payload.get("item") or {}
         quality_obj = item.get("quality") or {}
         quality = quality_obj.get("name")
         if quality not in self.runtime.watched_qualities:
+            self.stats["bptf_rejected_quality"] += 1
             return
 
         name = item.get("name") or item.get("marketName") or item.get("baseName")
         if not name:
             return
 
+        if quality == "Unusual" and "bptf_unusual" not in self._sampled_item_kinds:
+            self._sampled_item_kinds.add("bptf_unusual")
+            log.warning(
+                "DIAGNOSTIC SAMPLE (first Unusual seen this run) - raw item fields relevant to "
+                "particle extraction: particle=%r, particleId=%r, attributes=%r",
+                item.get("particle"), item.get("particleId"), item.get("attributes"),
+            )
+
         particle_obj = item.get("particle") or {}
         particle_id = particle_obj.get("id")
         particle_name = particle_obj.get("name")
+
+        if particle_id is None:
+            # Defensive fallback paths - not independently confirmed
+            # against a real live backpack.tf Unusual payload (a repeated
+            # report that NO Unusual alerts were ever seen from ANY
+            # source raised real doubt about the primary path above).
+            # Try a flat field name first...
+            particle_id = item.get("particleId") or item.get("particle_id")
+        if particle_id is None:
+            # ...then raw Steam-schema-style attributes, where the
+            # "attach particle effect" attribute (defindex 134, a
+            # well-known constant in TF2 tooling) carries the particle id
+            # as its value - plausible if backpack.tf passes through
+            # relatively unprocessed inventory-style attribute data.
+            for attr in (item.get("attributes") or []):
+                if isinstance(attr, dict) and attr.get("defindex") == 134:
+                    raw_value = attr.get("value", attr.get("float_value"))
+                    try:
+                        particle_id = int(raw_value) if raw_value is not None else None
+                    except (TypeError, ValueError):
+                        particle_id = None
+                    break
+        if particle_id is not None and not particle_name:
+            # Resolve the name from the id via the schema we already have,
+            # in case a fallback path above found the id but not a name.
+            particle_name = self.particle_id_to_name.get(particle_id)
 
         spells = [s.get("name") for s in (item.get("spells") or []) if isinstance(s, dict) and s.get("name")]
         strange_parts = [p.get("name") for p in (item.get("strangeParts") or [])
@@ -601,6 +793,13 @@ class Watcher:
         killstreaker = None
         sheen = None
         if slot in WEAPON_SLOTS and killstreak_tier:
+            if "bptf_killstreak_tier3" not in self._sampled_item_kinds and killstreak_tier >= 2:
+                self._sampled_item_kinds.add("bptf_killstreak_tier3")
+                log.warning(
+                    "DIAGNOSTIC SAMPLE (first tier-2+ Killstreak weapon seen this run) - raw item "
+                    "fields relevant to killstreaker/sheen extraction: killstreaker=%r, sheen=%r",
+                    item.get("killstreaker"), item.get("sheen"),
+                )
             killstreaker_obj = item.get("killstreaker") or {}
             raw_killstreaker = killstreaker_obj.get("name") if isinstance(killstreaker_obj, dict) else None
             if killstreak_tier >= 3 and raw_killstreaker in bptf_client.VALID_KILLSTREAKERS:
@@ -659,9 +858,12 @@ class Watcher:
             sheen=sheen,
         )
 
-        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg())
+        self.stats["bptf_evaluated"] += 1
+        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url)
         if not deal:
+            self.stats["bptf_rejected_by_checks"] += 1
             return
+        self.stats["bptf_alerts"] += 1
 
         # Only bother checking inventory privacy for a deal that already
         # qualifies (same "expensive check only when it matters"
@@ -715,10 +917,19 @@ class Watcher:
                 await asyncio.to_thread(self.telegram.send, menu_text, keyboard)
             else:
                 reply = telegram_commands.handle_command(
-                    text, self.runtime, has_stn_key=bool(self.cfg.get("stntrading_api_key"))
+                    text, self.runtime, has_stn_key=bool(self.cfg.get("stntrading_api_key")),
+                    stats=self.stats, stats_since=self.stats_since,
+                    currently_rate_limited=bptf_client.is_rate_limited(),
+                    error_entries=_error_buffer.recent(50),
                 )
                 log.info("Telegram command: %r -> %s", text, reply.splitlines()[0])
                 await asyncio.to_thread(self.telegram.send, reply)
+                if command == "stats":
+                    # Each /stats read shows "since last time you checked",
+                    # not a lifetime total - reset right after sending so
+                    # the next read starts a fresh window.
+                    self.stats = collections.Counter()
+                    self.stats_since = time.time()
 
         elif event["type"] == "callback_query":
             menu_text, keyboard = telegram_commands.handle_callback(event["data"], self.runtime)
@@ -728,6 +939,58 @@ class Watcher:
             await asyncio.to_thread(self.telegram.answer_callback_query, event["id"])
             if event["message_id"] is not None:
                 await asyncio.to_thread(self.telegram.edit_message, event["message_id"], menu_text, keyboard)
+
+    async def _startup_sanity_check(self):
+        """
+        Proactively checks a few core assumptions against what actually
+        got loaded, right after startup, and sends an immediate Telegram
+        warning if any look wrong - rather than waiting for the user to
+        notice bad alerts and report them. Each of these bounds traces
+        back to a real, previously-hit bug in this project's history:
+        key_price_metal ending up None (a parsing bug that broke every
+        metal->keys conversion silently) and a schema fetch coming back
+        suspiciously small (would mean marketplace.tf items and Unusual
+        effect matching are both compromised) are exactly the kind of
+        thing that otherwise wasn't visible until an alert already looked
+        wrong.
+        """
+        problems = []
+
+        if self.bptf.key_price_metal is None:
+            problems.append(
+                "key_price_metal не определился вообще - конвертация металл→ключи "
+                "сломана для ВСЕХ предметов в металле."
+            )
+        elif not (10 <= self.bptf.key_price_metal <= 300):
+            problems.append(
+                f"key_price_metal выглядит неправдоподобно ({self.bptf.key_price_metal:.2f} "
+                f"металла за ключ, обычно 30-80) - возможно, парсинг цены сломан."
+            )
+
+        if self.cfg.get("steam_api_key"):
+            if len(self.particle_name_to_id) < 400:
+                problems.append(
+                    f"Загружено только {len(self.particle_name_to_id)} unusual-эффектов из схемы "
+                    f"Steam (обычно 600+) - определение Unusual-предметов может работать не полностью."
+                )
+            if len(self.defindex_to_name) < 5000:
+                problems.append(
+                    f"Загружено только {len(self.defindex_to_name)} записей defindex->название "
+                    f"(обычно 10000+) - marketplace.tf и картинки предметов могут работать не полностью."
+                )
+
+        if not self.mannco_key_usd_cents:
+            problems.append("Цена ключа с mannco.store не определилась - конвертация цен оттуда сломана.")
+
+        if not problems:
+            log.info("Startup sanity check: all core values look reasonable.")
+            return
+
+        log.warning("Startup sanity check found %d issue(s): %s", len(problems), "; ".join(problems))
+        message = "⚠️ <b>Проверка при запуске нашла возможные проблемы:</b>\n\n" + "\n\n".join(
+            f"• {p}" for p in problems
+        )
+        await asyncio.to_thread(self.telegram.send, message)
 
     async def run(self):
         log.info("Starting up: loading initial prices...")
@@ -742,9 +1005,12 @@ class Watcher:
             # rather than crash-and-let-systemd-restart over it.
             log.exception("Initial price load failed - continuing anyway, will retry on schedule.")
 
+        await self._startup_sanity_check()
+
         await asyncio.gather(
             self.price_refresh_loop(),
             self.telegram_command_loop(),
+            self.health_check_loop(),
             self.marketplacetf_poll_loop(),
             self.stntrading_poll_loop(),
             mannco_ws.stream_listing_events(self.handle_mannco_event),

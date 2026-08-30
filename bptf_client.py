@@ -49,23 +49,69 @@ _request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
 # alone doesn't prevent a burst of requests from tripping the limit and
 # then immediately tripping it again on the very next one. Once that
 # happens, every snapshot/history request just returns "unavailable"
-# (same as any other transient failure - callers already fall back to
-# the community price list gracefully) until the cooldown clears,
-# instead of continuing to hammer an endpoint that's already said no.
-_RATE_LIMIT_COOLDOWN_SECONDS = 10
+# (evaluate_listing treats that as "can't evaluate this one right now"
+# and skips it, never falling back to a less-reliable number) until the
+# cooldown clears, instead of continuing to hammer an endpoint that's
+# already said no.
+#
+# The cooldown itself is adaptive, not a flat 10s every time: if we get
+# rate-limited AGAIN shortly after a previous cooldown already ended,
+# that's evidence the wait wasn't long enough for genuinely sustained
+# overload (not just a momentary burst), so it doubles (capped at 5
+# minutes) rather than repeating the same too-short wait indefinitely.
+# It resets back to the base duration once we go a while without hitting
+# a 429 at all - an old bad patch shouldn't keep the backoff escalated
+# forever once things have actually settled down.
+_RATE_LIMIT_BASE_COOLDOWN_SECONDS = 10
+_RATE_LIMIT_MAX_COOLDOWN_SECONDS = 300
+_RATE_LIMIT_RESET_AFTER_SECONDS = 300
 _rate_limited_until_lock = threading.Lock()
 _rate_limited_until = 0.0
+_current_cooldown_seconds = _RATE_LIMIT_BASE_COOLDOWN_SECONDS
+_last_rate_limit_hit = 0.0
 
 
 def _note_rate_limited():
-    global _rate_limited_until
+    global _rate_limited_until, _current_cooldown_seconds, _last_rate_limit_hit
     with _rate_limited_until_lock:
-        _rate_limited_until = time.time() + _RATE_LIMIT_COOLDOWN_SECONDS
+        now = time.time()
+        if now - _last_rate_limit_hit > _RATE_LIMIT_RESET_AFTER_SECONDS:
+            _current_cooldown_seconds = _RATE_LIMIT_BASE_COOLDOWN_SECONDS
+        else:
+            _current_cooldown_seconds = min(
+                _current_cooldown_seconds * 2, _RATE_LIMIT_MAX_COOLDOWN_SECONDS
+            )
+        _last_rate_limit_hit = now
+        _rate_limited_until = now + _current_cooldown_seconds
+        log.warning(
+            "backpack.tf rate limit (429) hit - backing off for %ds this time (adaptive).",
+            _current_cooldown_seconds,
+        )
 
 
 def _currently_rate_limited():
     with _rate_limited_until_lock:
         return time.time() < _rate_limited_until
+
+
+def is_rate_limited() -> bool:
+    """
+    Public check for whether backpack.tf's snapshot/history endpoints are
+    currently in the post-429 cooldown (see _note_rate_limited above).
+    Used by matcher.py to distinguish "no live data because there
+    genuinely isn't any" from "no live data because we're deliberately
+    not asking right now" - the two look identical from inside
+    _fetch_snapshot_prices (both just return None), but they call for
+    different handling: the first is a legitimate reason to fall back to
+    the (possibly stale) community price, the second is not - falling
+    back during a cooldown risks trusting a stale community number for
+    an item that actually has an abundance of live listings, just not
+    ones we asked about right now. A real report showed exactly this:
+    a "reference" of 6.90 keys shown for an item with 6+ live listings
+    all sitting at 6.55 - the gap was too small for the community-price
+    cross-check (which only catches wildly-off numbers) to catch.
+    """
+    return _currently_rate_limited()
 
 
 def _get_with_retry(session, url, params, timeout=20):
@@ -223,7 +269,23 @@ def strip_killstreak_prefix(name: str) -> str:
     everything else) intact - e.g. "Professional Killstreak Australium
     Rocket Launcher" -> "Australium Rocket Launcher". Used to recover the
     tier-independent base name so another tier's name can be
-    reconstructed (see name_for_killstreak_tier)."""
+    reconstructed (see name_for_killstreak_tier).
+
+    Does NOT strip the prefix on a Killstreak Kit/Kit Fabricator itself
+    (e.g. "Professional Killstreak Medi Gun Kit Fabricator") - a real
+    report showed this producing wrong reference prices, traced to
+    exactly this: unlike a weapon, a Kit/Fabricator has no tier-
+    independent "base item" underneath it - "Killstreak X Kit",
+    "Specialized Killstreak X Kit", and "Professional Killstreak X Kit"
+    are three entirely separate, independently-priced items, not one
+    item with a stripped-off tier modifier. Stripping the prefix here
+    searched backpack.tf for a name that doesn't exist ("Medi Gun Kit
+    Fabricator" alone isn't a real item), and whatever price came back
+    for that mismatched query was reference-price noise, not the real
+    Fabricator's price.
+    """
+    if name.endswith("Kit") or name.endswith("Fabricator"):
+        return name
     for prefix in _KILLSTREAK_PREFIXES:
         if name.startswith(prefix):
             return name[len(prefix):]

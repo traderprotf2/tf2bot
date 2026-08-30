@@ -13,6 +13,7 @@ anyone else who happens to message the bot is silently ignored.
 """
 
 import logging
+import time
 
 import requests
 
@@ -38,6 +39,9 @@ HELP_TEXT = (
     "<b>Команды</b>\n"
     "/menu — меню с кнопками (рекомендуется)\n"
     "/status — текущие настройки\n"
+    "/stats — сколько событий пришло по каждому источнику и где отсеялись "
+    "(диагностика, если алертов кажется меньше, чем должно быть)\n"
+    "/errors — последние предупреждения/ошибки из логов, без захода на сервер\n"
     "/pause — приостановить уведомления\n"
     "/resume — возобновить\n"
     "/minprice [число] — минимальная цена в ключах (без числа — показать текущую)\n"
@@ -334,7 +338,107 @@ def _find_category(name: str):
     return None
 
 
-def handle_command(text: str, runtime, has_stn_key: bool = False) -> str:
+def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
+    """
+    Answers "is the bot even seeing the volume I'd expect, and if so,
+    where's it narrowing down" - a real question that came up when alert
+    volume looked lower than the site's overall activity would suggest.
+    Shows the funnel per source since the last time /stats was read (see
+    main.py - the counters reset after every read), not a lifetime total,
+    so this always reflects "what's happened lately". Also flags whether
+    backpack.tf's rate-limit cooldown is active RIGHT NOW - a direct
+    answer to "is the bot currently being throttled", rather than having
+    to infer it from the funnel numbers.
+    """
+    if stats is None:
+        return "Статистика недоступна."
+    if stats_since is not None:
+        minutes = max(1, round((time.time() - stats_since) / 60))
+        header = f"📊 <b>За последние {minutes} мин.</b>\n\n"
+    else:
+        header = "📊 <b>Статистика</b>\n\n"
+    if currently_rate_limited:
+        header += "⏳ Сейчас в кулдауне после 429 от backpack.tf - оценка временно приостановлена.\n\n"
+
+    if not stats:
+        return header + "Событий пока не было."
+
+    lines = []
+    total_alerts = 0
+    sources = [
+        ("bptf", "backpack.tf"),
+        ("mannco", "mannco.store"),
+        ("mptf", "marketplace.tf"),
+        ("stn", "stntrading.eu"),
+    ]
+    for prefix, label in sources:
+        received = stats.get(f"{prefix}_received", 0)
+        evaluated = stats.get(f"{prefix}_evaluated", 0)
+        alerts = stats.get(f"{prefix}_alerts", 0)
+        deduped = stats.get(f"{prefix}_deduped", 0)
+        rejected_quality = stats.get(f"{prefix}_rejected_quality", 0)
+        rejected_checks = stats.get(f"{prefix}_rejected_by_checks", 0)
+        total_alerts += alerts
+
+        if received == 0 and evaluated == 0:
+            if prefix == "stn":
+                lines.append(f"<b>{label}</b>: список наблюдения пуст или ключ не задан")
+            else:
+                lines.append(f"<b>{label}</b>: 0 событий - проверь подключение (см. журнал)")
+            continue
+
+        detail_bits = []
+        if deduped:
+            detail_bits.append(f"{deduped} повтор(ов)")
+        if rejected_quality:
+            detail_bits.append(f"{rejected_quality} не по качеству")
+        if rejected_checks:
+            detail_bits.append(f"{rejected_checks} отсеяно проверками точности")
+        detail = f" ({', '.join(detail_bits)})" if detail_bits else ""
+
+        lines.append(
+            f"<b>{label}</b>: получено {received} → оценено {evaluated} → "
+            f"найдено {alerts}{detail}"
+        )
+
+    lines.append(f"\nИтого алертов: {total_alerts}")
+    return header + "\n".join(lines)
+
+
+def _format_errors(error_entries) -> str:
+    """
+    Shows the most recent WARNING+ log entries captured by
+    error_log.TelegramErrorBuffer - so "something looks wrong" can be
+    checked directly in Telegram instead of needing SSH+journalctl every
+    time (that still has the full, unfiltered log if more context is
+    needed - this is specifically the filtered subset worth attention).
+    Newest first, since that's usually what you want when checking in
+    right after noticing a problem.
+
+    Capped to the last 15 regardless of how many are passed in - even at
+    the buffer's full 100-entry capacity, showing all of them at ~220
+    chars each could exceed Telegram's 4096-char message limit.
+    """
+    if not error_entries:
+        return "Ошибок и предупреждений не было (или бот только что запущен)."
+
+    import datetime
+
+    shown = list(error_entries)[-15:]
+    lines = [f"⚠️ <b>Последние {len(shown)} из {len(error_entries)} предупреждений/ошибок</b> (сначала новые):\n"]
+    for entry in reversed(shown):
+        ts = datetime.datetime.fromtimestamp(entry.get("time", 0)).strftime("%H:%M:%S")
+        level = entry.get("level", "?")
+        logger_name = entry.get("logger", "?")
+        message = entry.get("message", "")
+        if len(message) > 220:
+            message = message[:220] + "…"
+        lines.append(f"[{ts}] <b>{level}</b> {logger_name}: {message}")
+    return "\n".join(lines)
+
+
+def handle_command(text: str, runtime, has_stn_key: bool = False, stats=None, stats_since=None,
+                    currently_rate_limited: bool = False, error_entries=None) -> str:
     """Parses one typed command and applies it to `runtime`, returning
     the reply text. Any state change is saved to disk before returning."""
     parts = text.strip().split(maxsplit=1)
@@ -343,6 +447,12 @@ def handle_command(text: str, runtime, has_stn_key: bool = False) -> str:
 
     if command == "help":
         return HELP_TEXT
+
+    if command == "stats":
+        return _format_stats(stats, stats_since, currently_rate_limited)
+
+    if command == "errors":
+        return _format_errors(error_entries)
 
     if command == "status":
         state = "⏸ на паузе" if runtime.paused else "▶️ работает"

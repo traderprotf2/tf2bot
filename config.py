@@ -89,6 +89,38 @@ DEFAULTS = {
     # see bptf_client._filter_price_outliers.
     "min_other_listings": 1,
 
+    # After alerting on an item from a given seller, don't alert again on
+    # basically the same item FROM THAT SAME SELLER (same
+    # source/seller/name/effect/paint/killstreaker/sheen - see send_deal
+    # in main.py) for this many minutes - covers a seller bumping/
+    # re-listing the same offer repeatedly. Scoped to the seller
+    # specifically: a DIFFERENT seller's listing of the same kind of item
+    # is a genuinely different opportunity and is never held back by this.
+    "item_type_cooldown_minutes": 60,
+
+    # Item names (substring match, case-insensitive) that always get a
+    # priority marker on the alert, on top of every Unusual automatically
+    # getting one - well-known "hype" items that are worth reacting to
+    # first even outside the Unusual pool, since demand (and so how fast
+    # they sell) isn't only about quality. This is a starting list, not a
+    # definitive one - edit freely, what counts as "hyped" changes over
+    # time and is inherently a judgment call, not something to treat as
+    # authoritative.
+    "priority_item_names": ["Max's Severed Head"],
+
+    # Proactive health check (see health_check_loop in main.py) - if this
+    # many NEW warnings/errors pile up within one interval, sends a
+    # Telegram message about it unprompted, instead of waiting for
+    # someone to notice a bad alert and go check /errors by hand.
+    "health_check_interval_minutes": 180,
+    "health_check_error_threshold": 5,
+    # When the threshold above is crossed, also auto-pause deal alerts
+    # (like /pause) so the problem can't be missed among regular alerts -
+    # monitoring itself keeps running, only the alerting pauses, and it's
+    # undone with /resume. Set to false to get the warning message only,
+    # without the auto-pause.
+    "health_check_auto_pause": True,
+
     # Liquidity filter: skip a deal if this item's price hasn't been
     # revised by the community in more than this many days - a discount
     # on something nobody's actively trading is more likely a forgotten

@@ -29,9 +29,11 @@ from typing import List, Optional
 
 from bptf_client import (
     build_classifieds_url,
+    is_rate_limited,
     name_for_killstreak_tier,
     strip_killstreak_prefix,
     strip_quality_prefix,
+    strip_variant_prefixes,
 )
 
 log = logging.getLogger("matcher")
@@ -145,28 +147,23 @@ def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, 
                                killstreak_tier, min_other_listings, exclude_listing_id="",
                                paint=None, killstreaker=None, sheen=None):
     """
-    Shared snapshot-first / community-pricelist-fallback reference price
-    lookup. Used both for the item actually being evaluated, and (in
-    check_killstreak_tier_pricing below) for its OTHER killstreak tiers,
-    so both use the exact same logic to decide what "the going rate" is.
-    Returns a single float in keys, or None if unavailable from either
-    source.
+    Live-snapshot-ONLY reference price lookup. Used both for the item
+    actually being evaluated, and (in check_killstreak_tier_pricing
+    below) for its OTHER killstreak tiers, so both use the exact same
+    logic to decide what "the going rate" is. Returns a single float in
+    keys, or None if not enough live data is available.
 
-    Cross-checks the live snapshot against the community-suggested price
-    (an already-cached lookup - no extra network call, so this is free)
-    even when the snapshot has enough listings to normally be trusted on
-    its own. A real report showed a "reference" of 20 keys for an item
-    that's realistically worth close to nothing - traced to
-    min_other_listings' default of 1 being enough to trust a snapshot
-    entirely, and with only ONE data point there's nothing to
-    outlier-filter against (_filter_price_outliers needs at least 3
-    prices to attempt anything). A single overpriced, mistaken, or
-    scam-bait listing was the whole "market" backing that number. The
-    community price aggregates many submissions over time and isn't
-    swayed by one bad listing the way a single live one can be, so it's
-    a natural sanity bound: if the live snapshot claims a price wildly
-    above community consensus, trust the community number instead of
-    quietly running with the outlier.
+    Deliberately does NOT fall back to, or cross-check against, the
+    community-suggested price (backpack.tf's voted/aggregated IGetPrices
+    number) - per explicit correction: the entire point of comparing
+    against LIVE listings is to catch real, current underpricing, and a
+    community-suggested number doesn't reflect what's actually for sale
+    right now. Two real, concrete cases showed a "suggested" price being
+    used instead of - or overriding - real, currently-live listings that
+    told a different (truer) story, which is the opposite of what this
+    project is supposed to do. If there isn't enough live data to trust,
+    the honest answer is "can't evaluate this one right now", not "use a
+    number that isn't from an actual current listing".
     """
     ref_keys, other_count = bptf.get_snapshot_min_other_keys(
         name, quality_name, exclude_listing_id=exclude_listing_id,
@@ -174,20 +171,28 @@ def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, 
         australium=australium, killstreak_tier=killstreak_tier,
         paint=paint, killstreaker=killstreaker, sheen=sheen,
     )
-    community_ref = bptf.get_price_keys(name, quality_name, particle_id)
 
     if ref_keys is not None and other_count >= min_other_listings:
-        if community_ref is not None and community_ref > 0 and ref_keys > community_ref * 3:
-            log.info(
-                "Live snapshot reference for %s (%.2f keys, %d listing(s)) is implausibly far "
-                "above the community price (%.2f keys) - using the community price instead of "
-                "trusting what's likely a single overpriced/mistaken listing.",
-                name, ref_keys, other_count, community_ref,
-            )
-            return community_ref
+        log.info(
+            "Reference for %s: %.2f keys from LIVE snapshot (%d other listing(s)).",
+            name, ref_keys, other_count,
+        )
         return ref_keys
 
-    return community_ref
+    if is_rate_limited():
+        log.info(
+            "Skipping %s - backpack.tf rate-limit cooldown is active, so 'not enough live "
+            "listings' can't be trusted as genuine right now.",
+            name,
+        )
+    else:
+        log.info(
+            "Skipping %s - only %s live listing(s) found, needed >= %d. Not falling back to "
+            "the community-suggested price - only live listings count here.",
+            name, other_count if ref_keys is not None else 0, min_other_listings,
+        )
+    return None
+
 
 
 def check_killstreak_tier_pricing(bptf, listing: "NormalizedListing", lookup_name: str,
@@ -274,7 +279,7 @@ def is_watched(listing: NormalizedListing, cfg: dict) -> bool:
     return True
 
 
-def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict):
+def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_url=None):
     """Returns a deal dict if this listing qualifies, otherwise None."""
     if not is_watched(listing, cfg):
         return None
@@ -285,7 +290,15 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict):
     # don't have one (e.g. a mannco.store Unusual whose effect name we
     # couldn't resolve without a Steam API key), we can't safely compare -
     # skip rather than risk comparing against the wrong effect's price.
+    # Logged explicitly (not just silently skipped) - a real report that
+    # NO Unusual alerts were ever seen made clear this needs to be
+    # diagnosable, not just a silent, invisible drop.
     if listing.quality == "Unusual" and listing.particle_id is None:
+        log.warning(
+            "Skipping Unusual %s (%s) - could not resolve a particle id for effect %r. "
+            "If this keeps happening, the effect-name lookup for this source may need a fix.",
+            listing.name, listing.source, listing.particle_name,
+        )
         return None
 
     lookup_name = strip_quality_prefix(listing.name, listing.quality)
@@ -390,9 +403,36 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict):
             killstreaker=listing.killstreaker, sheen=listing.sheen,
         )
 
+    # Real item picture for the Telegram alert, straight from Valve's own
+    # schema (confirmed OK to hotlink directly - see steam_schema.py).
+    # Tries the same name in two forms: first as backpack.tf/mannco.store
+    # display it (only quality stripped) in case Valve's schema happens to
+    # index australium/non-craftable variants under that fuller name too
+    # (as IGetPrices does), then the fully bare base name as a fallback -
+    # not certain which convention the schema itself uses, so both are
+    # tried rather than guessing one and missing pictures for no reason.
+    image_url = None
+    if name_to_image_url:
+        bare_name_for_image = strip_variant_prefixes(lookup_name)
+        image_url = name_to_image_url.get(lookup_name) or name_to_image_url.get(bare_name_for_image)
+
+    # Priority flag - Unusuals are the most liquid and highest-margin
+    # category, worth calling out so they're not lost in a busy chat;
+    # cfg["priority_item_names"] adds specific well-known "hype" items on
+    # top of that, by name substring (case-insensitive) - not an
+    # authoritative list, just a configurable starting point.
+    is_priority = listing.quality == "Unusual"
+    if not is_priority:
+        name_lower = listing.name.lower()
+        is_priority = any(
+            hype_name.lower() in name_lower for hype_name in cfg.get("priority_item_names", [])
+        )
+
     return {
         "source": listing.source,
+        "is_priority": is_priority,
         "display_name": clean_display_name(listing),
+        "image_url": image_url,
         "variant_label": detect_special_variant(listing.name),
         "particle_name": listing.particle_name,
         "killstreaker": listing.killstreaker,
@@ -410,5 +450,6 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict):
         "days_since_price_update": days_since_update,
         "discount_percent": discount_percent,
         "link": listing.link,
+        "seller_id": listing.seller_steamid or listing.listing_id,
         "backpacktf_search_link": backpacktf_search_link,
     }
