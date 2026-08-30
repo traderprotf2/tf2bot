@@ -286,14 +286,17 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
     if listing.price_keys is None or listing.price_keys < cfg["min_price_keys"]:
         return None
 
-    # Unusuals need a resolved particle id to compare like-for-like. If we
-    # don't have one (e.g. a mannco.store Unusual whose effect name we
-    # couldn't resolve without a Steam API key), we can't safely compare -
-    # skip rather than risk comparing against the wrong effect's price.
-    # Logged explicitly (not just silently skipped) - a real report that
-    # NO Unusual alerts were ever seen made clear this needs to be
-    # diagnosable, not just a silent, invisible drop.
-    if listing.quality == "Unusual" and listing.particle_id is None:
+    # Unusuals need a resolved particle id to compare like-for-like - EXCEPT
+    # "Unusualifier" tools, which are a genuinely different case: they GRANT
+    # an effect when used, rather than wearing one themselves, so the raw
+    # payload legitimately has no particle data for them (confirmed via a
+    # real production log: these consistently had no particle field at all,
+    # while a real worn Unusual in the same log DID - not a parsing miss,
+    # a real structural difference for this item type). Comparing them by
+    # name+quality alone (no particle requirement) is correct here, same
+    # as any other non-Unusual item.
+    is_unusualifier = "Unusualifier" in listing.name
+    if listing.quality == "Unusual" and listing.particle_id is None and not is_unusualifier:
         log.warning(
             "Skipping Unusual %s (%s) - could not resolve a particle id for effect %r. "
             "If this keeps happening, the effect-name lookup for this source may need a fix.",
