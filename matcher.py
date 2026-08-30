@@ -151,6 +151,22 @@ def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, 
     so both use the exact same logic to decide what "the going rate" is.
     Returns a single float in keys, or None if unavailable from either
     source.
+
+    Cross-checks the live snapshot against the community-suggested price
+    (an already-cached lookup - no extra network call, so this is free)
+    even when the snapshot has enough listings to normally be trusted on
+    its own. A real report showed a "reference" of 20 keys for an item
+    that's realistically worth close to nothing - traced to
+    min_other_listings' default of 1 being enough to trust a snapshot
+    entirely, and with only ONE data point there's nothing to
+    outlier-filter against (_filter_price_outliers needs at least 3
+    prices to attempt anything). A single overpriced, mistaken, or
+    scam-bait listing was the whole "market" backing that number. The
+    community price aggregates many submissions over time and isn't
+    swayed by one bad listing the way a single live one can be, so it's
+    a natural sanity bound: if the live snapshot claims a price wildly
+    above community consensus, trust the community number instead of
+    quietly running with the outlier.
     """
     ref_keys, other_count = bptf.get_snapshot_min_other_keys(
         name, quality_name, exclude_listing_id=exclude_listing_id,
@@ -158,9 +174,20 @@ def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, 
         australium=australium, killstreak_tier=killstreak_tier,
         paint=paint, killstreaker=killstreaker, sheen=sheen,
     )
+    community_ref = bptf.get_price_keys(name, quality_name, particle_id)
+
     if ref_keys is not None and other_count >= min_other_listings:
+        if community_ref is not None and community_ref > 0 and ref_keys > community_ref * 3:
+            log.info(
+                "Live snapshot reference for %s (%.2f keys, %d listing(s)) is implausibly far "
+                "above the community price (%.2f keys) - using the community price instead of "
+                "trusting what's likely a single overpriced/mistaken listing.",
+                name, ref_keys, other_count, community_ref,
+            )
+            return community_ref
         return ref_keys
-    return bptf.get_price_keys(name, quality_name, particle_id)
+
+    return community_ref
 
 
 def check_killstreak_tier_pricing(bptf, listing: "NormalizedListing", lookup_name: str,
