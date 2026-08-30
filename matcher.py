@@ -316,6 +316,16 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict):
 
     # Best current buy order - "could I flip this for an instant, guaranteed
     # profit". Also only fetched now, same reasoning as the average price.
+    #
+    # A buy order priced ABOVE the sell reference is NOT itself a red flag
+    # (an earlier version of this treated it as one and discarded the buy
+    # order whenever this happened - wrong, per direct correction: TF2
+    # marketplaces aren't efficient markets with instant arbitrage. Anyone
+    # can list an item well below a standing buy order and it just sits
+    # there unsold - sellers don't necessarily know about the buy order,
+    # and nothing auto-matches them - so this gap is exactly the kind of
+    # real opportunity this whole feature exists to surface, not a data
+    # bug to suppress).
     buy_order_keys, buy_order_count = bptf.get_best_buy_order_keys(
         lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable,
         spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,

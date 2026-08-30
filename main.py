@@ -709,7 +709,16 @@ class Watcher:
 
     async def run(self):
         log.info("Starting up: loading initial prices...")
-        await asyncio.to_thread(self.refresh_prices)
+        try:
+            await asyncio.to_thread(self.refresh_prices)
+        except Exception:
+            # A transient hiccup here (e.g. mannco.store still rate-limited
+            # even after login()'s own retry) shouldn't take down the whole
+            # process the way it used to - price_refresh_loop below retries
+            # this on its own schedule anyway, so it's fine to start the
+            # websocket listeners now and let prices catch up shortly after,
+            # rather than crash-and-let-systemd-restart over it.
+            log.exception("Initial price load failed - continuing anyway, will retry on schedule.")
 
         await asyncio.gather(
             self.price_refresh_loop(),

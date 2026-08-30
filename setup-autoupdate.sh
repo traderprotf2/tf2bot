@@ -44,7 +44,29 @@ else
     git remote add origin "$REPO_URL"
 fi
 
-git fetch origin --quiet
+if ! git fetch origin --quiet 2>/tmp/git-fetch-error.log; then
+    echo ""
+    echo "❌ Не получилось скачать код с $REPO_URL"
+    echo ""
+    if grep -qi "authentication\|username\|password\|could not read" /tmp/git-fetch-error.log; then
+        echo "Похоже, репозиторий приватный (Private) - для автообновления он должен"
+        echo "быть Public, иначе серверу нечем подтвердить, что он имеет право его читать."
+        echo ""
+        echo "Как исправить: на GitHub открой репозиторий -> Settings -> в самом низу"
+        echo "'Danger Zone' -> Change visibility -> Make public."
+        echo "Секреты (config.json, webhook_secret.txt) в репозиторий не попадают в любом"
+        echo "случае - они в .gitignore, так что публичность репозитория их не раскроет."
+    else
+        echo "Ошибка git:"
+        cat /tmp/git-fetch-error.log
+    fi
+    echo ""
+    echo "После исправления запусти команду ещё раз:"
+    echo "  sudo bash setup-autoupdate.sh $REPO_URL"
+    rm -f /tmp/git-fetch-error.log
+    exit 1
+fi
+rm -f /tmp/git-fetch-error.log
 
 BRANCH="main"
 if ! git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then

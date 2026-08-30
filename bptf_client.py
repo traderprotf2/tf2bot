@@ -37,8 +37,35 @@ log = logging.getLogger("bptf")
 # requests failing together, right when there's the most going on.
 # threading.Semaphore (not asyncio.Semaphore) because these calls run in
 # worker threads via asyncio.to_thread, not on the event loop itself.
-MAX_CONCURRENT_REQUESTS = 8
+# Lowered from an earlier 8 after a real production log showed 429s
+# happening even at that level - 8 concurrent evidently wasn't
+# conservative enough on its own, hence also the cooldown below.
+MAX_CONCURRENT_REQUESTS = 4
 _request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+# On top of capping concurrency, back off entirely for a bit once
+# backpack.tf actually returns 429 - real production logs showed repeated
+# 429s in quick succession right as they started, meaning concurrency
+# alone doesn't prevent a burst of requests from tripping the limit and
+# then immediately tripping it again on the very next one. Once that
+# happens, every snapshot/history request just returns "unavailable"
+# (same as any other transient failure - callers already fall back to
+# the community price list gracefully) until the cooldown clears,
+# instead of continuing to hammer an endpoint that's already said no.
+_RATE_LIMIT_COOLDOWN_SECONDS = 10
+_rate_limited_until_lock = threading.Lock()
+_rate_limited_until = 0.0
+
+
+def _note_rate_limited():
+    global _rate_limited_until
+    with _rate_limited_until_lock:
+        _rate_limited_until = time.time() + _RATE_LIMIT_COOLDOWN_SECONDS
+
+
+def _currently_rate_limited():
+    with _rate_limited_until_lock:
+        return time.time() < _rate_limited_until
 
 QUALITY_NAME_TO_ID = {
     "Normal": 0,
@@ -186,22 +213,38 @@ def name_for_killstreak_tier(name_without_killstreak: str, tier: int) -> str:
 
 def strip_variant_prefixes(name: str) -> str:
     """
-    Strips Killstreak-tier and Australium prefixes on top of
-    strip_quality_prefix(), e.g. "Professional Killstreak Australium
-    Rocket Launcher" -> "Rocket Launcher". Needed for the classifieds
-    *search* family (the live snapshot API and the webpage link) - a
-    real search the user built by hand and confirmed working uses just
-    the bare weapon name ("Ambassador"), with killstreak_tier/australium
-    as their own separate filter params, NOT baked into the name text;
-    a name like "Professional Killstreak Ambassador" or "Australium
-    Rocket Launcher" doesn't match anything there.
+    Strips "Non-Craftable", Killstreak-tier, and Australium prefixes on
+    top of strip_quality_prefix(), e.g. "Non-Craftable Professional
+    Killstreak Australium Rocket Launcher" -> "Rocket Launcher". Needed
+    for the classifieds *search* family (the live snapshot API and the
+    webpage link) - a real search the user built by hand and confirmed
+    working uses just the bare weapon name ("Ambassador"), with
+    killstreak_tier/australium/craftable as their own separate filter
+    params, NOT baked into the name text; a name like "Non-Craftable
+    Spine-Chilling Skull" doesn't match anything there (confirmed by a
+    real report: the search came back empty, and the reference/buy-order
+    numbers computed from that broken lookup were themselves wrong -
+    once the name doesn't match the real item, nothing downstream that
+    depends on it can be trusted either).
+
+    "Non-Craftable " is checked first, since (best available
+    understanding of Valve's naming order, not independently verified
+    the way the killstreak/australium order was) it comes immediately
+    after quality and before killstreak-tier/Australium - if that
+    ordering assumption is ever wrong for some combination, the fix is
+    almost always just reordering the checks here.
 
     Deliberately NOT used for IGetPrices / IGetPriceHistory (see
     get_price_keys / _fetch_price_history) - those are a different,
     older API family, independently confirmed to index Australium items
     by their full name ("Australium Rocket Launcher" is genuinely its
-    own top-level entry, not "Rocket Launcher" + a flag, there).
+    own top-level entry, not "Rocket Launcher" + a flag, there). Craftable
+    status there is instead read from which JSON branch the entry came
+    from (Tradable.Craftable vs Tradable.Non-Craftable) - see
+    _iter_price_entries - never from name text, on that endpoint either.
     """
+    if name.startswith("Non-Craftable "):
+        name = name[len("Non-Craftable "):]
     name = strip_killstreak_prefix(name)
     if name.startswith("Australium "):
         name = name[len("Australium "):]
@@ -340,6 +383,49 @@ def _filter_price_outliers(prices, floor_fraction: float = 0.3, ceiling_fraction
     return filtered if filtered else list(prices)
 
 
+def _iter_price_entries(craft_block):
+    """
+    Yields (particle_id, entry) pairs from one Craftable/Non-Craftable
+    block of backpack.tf's IGetPrices response.
+
+    CONFIRMED (via a real, working third-party script that reads this
+    exact API) that this block has two genuinely different shapes
+    depending on the item: for anything that CAN'T carry an Unusual
+    effect (the Mann Co. Supply Crate Key itself, Refined Metal, and
+    presumably others), it's a plain LIST of price entries directly -
+    `prices['6']['Tradable']['Craftable'][0]['value']` in that script's
+    own indexing. For items that CAN be Unusual, it's a DICT keyed by
+    particle id instead, to hold one price entry per effect.
+
+    An earlier version of this parser only handled the dict shape and
+    used an isinstance() check to defensively skip anything else -
+    which meant the list shape was silently dropped entirely, including
+    the Key's own entry. That's a serious bug beyond just missing the
+    Key's price for its own sake: this project converts every
+    metal-denominated price (mannco.store listings priced in metal,
+    backpack.tf listings in scrap/reclaimed/refined) into keys using
+    that exact number, so losing it silently breaks that conversion
+    project-wide, not just for the Key itself.
+    """
+    if isinstance(craft_block, list):
+        for entry in craft_block:
+            if isinstance(entry, dict):
+                yield None, entry
+    elif isinstance(craft_block, dict):
+        for particle_key, entries in craft_block.items():
+            if not isinstance(entries, list):
+                entries = [entries]
+            particle_id = None
+            if particle_key not in ("0", 0):
+                try:
+                    particle_id = int(particle_key)
+                except ValueError:
+                    particle_id = None
+            for entry in entries:
+                if isinstance(entry, dict):
+                    yield particle_id, entry
+
+
 class BackpackTFPriceList:
     def __init__(self, api_key: str, token: str = "", snapshot_cache_seconds: int = 20):
         self.api_key = api_key
@@ -373,22 +459,9 @@ class BackpackTFPriceList:
                 except ValueError:
                     continue
                 tradable = quality_block.get("Tradable", {})
-                craftable = tradable.get("Craftable", tradable.get("Non-Craftable", {}))
-                if not isinstance(craftable, dict):
-                    continue
-                for particle_key, entries in craftable.items():
-                    if not isinstance(entries, list):
-                        entries = [entries]
-                    particle_id = None
-                    if particle_key not in ("0", 0):
-                        try:
-                            particle_id = int(particle_key)
-                        except ValueError:
-                            particle_id = None
-                    for entry in entries:
-                        if not isinstance(entry, dict):
-                            continue
-                        table.setdefault((name, quality_id, particle_id), []).append(entry)
+                craft_block = tradable.get("Craftable", tradable.get("Non-Craftable", {}))
+                for particle_id, entry in _iter_price_entries(craft_block):
+                    table.setdefault((name, quality_id, particle_id), []).append(entry)
 
         self.by_name_quality = table
 
@@ -505,7 +578,8 @@ class BackpackTFPriceList:
         """
         if not self.token:
             return None
-
+        if _currently_rate_limited():
+            return None
         name = strip_variant_prefixes(name)
         paint_value = paint_rgb_decimal(paint) if paint else None
         cache_key = (name, quality_name, particle_id, intent, spell, australium, killstreak_tier, paint_value,
@@ -543,6 +617,8 @@ class BackpackTFPriceList:
         try:
             with _request_semaphore:
                 resp = self.session.get(SNAPSHOT_URL, params=params, timeout=20)
+            if resp.status_code == 429:
+                _note_rate_limited()
             resp.raise_for_status()
             data = resp.json()
         except Exception:
@@ -693,6 +769,8 @@ class BackpackTFPriceList:
         now = time.time()
         if cached and (now - cached[0]) < self.snapshot_cache_seconds:
             return cached[1]
+        if _currently_rate_limited():
+            return None
 
         params = {
             "key": self.api_key,
@@ -707,6 +785,8 @@ class BackpackTFPriceList:
         try:
             with _request_semaphore:
                 resp = self.session.get(HISTORY_URL, params=params, timeout=20)
+            if resp.status_code == 429:
+                _note_rate_limited()
             resp.raise_for_status()
             data = resp.json()
         except Exception:

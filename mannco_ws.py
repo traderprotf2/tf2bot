@@ -40,7 +40,7 @@ async def stream_listing_events(on_event):
     while True:
         try:
             log.info("Connecting to mannco.store market stream...")
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, max_size=None) as ws:
                 log.info("Connected to market stream.")
                 while True:
                     try:

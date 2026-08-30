@@ -12,11 +12,15 @@ became invalid early for some reason).
 """
 
 import logging
+import re
 import time
 
 import requests
 
 log = logging.getLogger("mannco")
+
+_RATE_LIMIT_WAIT_PATTERN = re.compile(r"try again in (\d+)\s*seconds?", re.IGNORECASE)
+_RATE_LIMIT_MAX_WAIT_SECONDS = 60  # cap however long the server claims to need
 
 BASE_URL = "https://api.mannco.store"
 TF2_GAME_ID = 440
@@ -39,6 +43,19 @@ class ManncoClient:
     # -- auth -----------------------------------------------------------
 
     def login(self):
+        """
+        Raises RuntimeError only for a genuinely unexpected/permanent
+        failure. A RATE LIMIT specifically is treated as transient: this
+        waits out the exact cooldown mannco.store itself reports (capped,
+        defensively, at _RATE_LIMIT_MAX_WAIT_SECONDS) and retries once
+        before giving up. A real crash-loop was traced to this method
+        raising unconditionally on ANY login failure, including a rate
+        limit hit during the very first startup call - which happens
+        outside the try/except that protects every *later* scheduled
+        refresh (see price_refresh_loop in main.py), so it took down the
+        whole process instead of just logging a warning and trying again
+        shortly after, the way a transient hiccup should be handled.
+        """
         log.info("Logging in to mannco.store...")
         resp = self.session.post(
             f"{BASE_URL}/user/login",
@@ -46,8 +63,27 @@ class ManncoClient:
             timeout=30,
         )
         data = resp.json()
+
+        if not data.get("success"):
+            content = str(data.get("content", ""))
+            match = _RATE_LIMIT_WAIT_PATTERN.search(content)
+            if match:
+                wait_seconds = min(int(match.group(1)), _RATE_LIMIT_MAX_WAIT_SECONDS) + 1
+                log.warning(
+                    "mannco.store login rate-limited (%s) - waiting %ds and retrying once...",
+                    content, wait_seconds,
+                )
+                time.sleep(wait_seconds)
+                resp = self.session.post(
+                    f"{BASE_URL}/user/login",
+                    json={"apiKey": self.api_key},
+                    timeout=30,
+                )
+                data = resp.json()
+
         if not data.get("success"):
             raise RuntimeError(f"mannco.store login failed: {data}")
+
         self.jwt = data["content"]["jwt"]
         self.jwt_obtained_at = time.time()
         log.info("mannco.store login OK.")

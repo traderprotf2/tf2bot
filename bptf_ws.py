@@ -67,11 +67,18 @@ async def stream_listing_events(on_event):
     `on_event(payload_dict)` for every active TF2 'sell' listing-update.
     Automatically reconnects on any connection drop OR if the connection
     goes idle for IDLE_TIMEOUT_SECONDS.
+
+    max_size=None (no cap) on the connection - confirmed via a real
+    production log that backpack.tf sends batched messages over 1 MiB
+    (the `websockets` library's own default cap), which without this
+    gets the connection closed with "message too big" and forces a
+    reconnect - losing whatever was in that batch and repeating every
+    time a large-enough batch comes through, not a one-off.
     """
     while True:
         try:
             log.info("Connecting to backpack.tf market stream...")
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, max_size=None) as ws:
                 log.info("Connected to backpack.tf market stream.")
                 while True:
                     try:
