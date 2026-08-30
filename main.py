@@ -285,7 +285,11 @@ class Watcher:
             return  # can't safely resolve item names - see __init__ warning
         deals = await asyncio.to_thread(client.fetch_deals)
         for raw in deals:
-            dedup_id = f"mptf:{raw['sku']}"
+            # Include price in the dedup key too, same reasoning as the
+            # mannco.store/backpack.tf handlers - a price drop on a SKU
+            # already seen once must still be evaluated fresh, not
+            # silently skipped because that SKU showed up before.
+            dedup_id = f"mptf:{raw['sku']}:{round(raw['price_usd'], 2)}"
             if not self._mark_seen(dedup_id):
                 continue
 
@@ -476,7 +480,14 @@ class Watcher:
 
         if item_id is None or price_cents is None or listing_id is None:
             return
-        if not self._mark_seen(f"mannco:{listing_id}"):
+        # Dedup key includes the price, not just the listing id - a price
+        # CHANGE on an already-seen listing must still be evaluated fresh.
+        # Confirmed this matters: mannco.store's own price_changed event
+        # (the `newPrice` branch above) carries a real new price for an
+        # EXISTING listing id, and deduping by id alone would have
+        # silently swallowed every one of those, missing exactly the kind
+        # of price-drop event this whole feature exists to catch.
+        if not self._mark_seen(f"mannco:{listing_id}:{price_cents}"):
             return
 
         details = await asyncio.to_thread(self.mannco.get_item_details, item_id)
@@ -536,7 +547,18 @@ class Watcher:
         listing_id = payload.get("id")
         if listing_id is None:
             return
-        if not self._mark_seen(f"bptf:{listing_id}"):
+        # Dedup key includes the raw currencies, not just the listing id -
+        # a price CHANGE on an already-seen listing id must still be
+        # evaluated fresh. This matters even if backpack.tf's "bump"
+        # normally keeps the same listing id: a real forum thread from
+        # their own community confirms sellers deliberately delete+relist
+        # (or otherwise update in place) specifically TO change price -
+        # "if that relisting involves a price change" is discussed as a
+        # known, real scenario, not a hypothetical. Deduping by id alone
+        # would silently swallow exactly that kind of price-drop event.
+        currencies = payload.get("currencies") or {}
+        price_fingerprint = tuple(sorted(currencies.items()))
+        if not self._mark_seen(f"bptf:{listing_id}:{price_fingerprint}"):
             return
 
         item = payload.get("item") or {}
