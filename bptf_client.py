@@ -67,6 +67,31 @@ def _currently_rate_limited():
     with _rate_limited_until_lock:
         return time.time() < _rate_limited_until
 
+
+def _get_with_retry(session, url, params, timeout=20):
+    """
+    Shared GET for the two backpack.tf endpoints that scale with
+    evaluation volume (snapshot + price-history). Tracks 429s into the
+    shared cooldown above. Retries ONCE, after a short pause, on a 5xx
+    response - a real production log showed a 503 from backpack.tf's own
+    infrastructure (their side being briefly overloaded/restarting, not
+    something caused by our request volume or pattern the way a 429 is)
+    - these tend to be momentary, so it's worth one quick retry rather
+    than immediately falling back to the less-precise community price
+    for what might just be a one-second blip.
+    """
+    with _request_semaphore:
+        resp = session.get(url, params=params, timeout=timeout)
+    if resp.status_code == 429:
+        _note_rate_limited()
+    elif resp.status_code >= 500:
+        time.sleep(1.5)
+        with _request_semaphore:
+            resp = session.get(url, params=params, timeout=timeout)
+        if resp.status_code == 429:
+            _note_rate_limited()
+    return resp
+
 QUALITY_NAME_TO_ID = {
     "Normal": 0,
     "Genuine": 1,
@@ -615,10 +640,7 @@ class BackpackTFPriceList:
             params["sheen"] = sheen
 
         try:
-            with _request_semaphore:
-                resp = self.session.get(SNAPSHOT_URL, params=params, timeout=20)
-            if resp.status_code == 429:
-                _note_rate_limited()
+            resp = _get_with_retry(self.session, SNAPSHOT_URL, params)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
@@ -783,10 +805,7 @@ class BackpackTFPriceList:
             params["priceindex"] = particle_id
 
         try:
-            with _request_semaphore:
-                resp = self.session.get(HISTORY_URL, params=params, timeout=20)
-            if resp.status_code == 429:
-                _note_rate_limited()
+            resp = _get_with_retry(self.session, HISTORY_URL, params)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
