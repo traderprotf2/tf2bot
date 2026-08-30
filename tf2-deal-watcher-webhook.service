@@ -1,0 +1,16 @@
+[Unit]
+Description=TF2 Deal Watcher - GitHub webhook listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/tf2-deal-watcher
+Environment=WEBHOOK_PORT=9001
+ExecStart=/root/tf2-deal-watcher/venv/bin/python3 /root/tf2-deal-watcher/webhook_listener.py
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target

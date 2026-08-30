@@ -1,0 +1,16 @@
+[Unit]
+Description=TF2 Deal Watcher (mannco.store -> backpack.tf -> Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust this path if you deployed the project somewhere else:
+WorkingDirectory=/root/tf2-deal-watcher
+ExecStart=/root/tf2-deal-watcher/venv/bin/python3 /root/tf2-deal-watcher/main.py
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target

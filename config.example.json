@@ -1,0 +1,25 @@
+{
+  "backpacktf_api_key": "PUT_YOUR_BACKPACK_TF_API_KEY_HERE",
+  "backpacktf_token": "OPTIONAL_BUT_RECOMMENDED_SEE_README",
+  "mannco_api_key": "PUT_YOUR_MANNCO_STORE_API_KEY_HERE",
+  "telegram_bot_token": "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE",
+  "telegram_chat_id": "PUT_YOUR_TELEGRAM_CHAT_ID_HERE",
+  "steam_api_key": "OPTIONAL_BUT_RECOMMENDED_SEE_README",
+  "stntrading_api_key": "OPTIONAL_SEE_README",
+
+  "watched_qualities": ["Unusual", "Strange", "Unique"],
+  "watched_categories": ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"],
+  "excluded_types": ["War Paint"],
+  "min_price_keys": 5,
+  "discount_threshold_percent": 5,
+  "min_other_listings": 1,
+  "max_days_since_price_update": 90,
+  "marketplacetf_poll_seconds": 300,
+  "stntrading_poll_seconds": 300,
+
+  "price_refresh_seconds": 900,
+  "jwt_refresh_seconds": 3600,
+  "seen_listings_max": 20000,
+  "snapshot_cache_seconds": 20,
+  "inventory_cache_seconds": 900
+}

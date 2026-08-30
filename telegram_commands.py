@@ -1,0 +1,486 @@
+"""
+Telegram bot control surface: both typed commands (/pause, /minprice 10,
+...) and an inline button menu (/menu) that does the same things by
+tapping instead of typing.
+
+Long-polling (GET /getUpdates) - no webhook/port needed. Handles two
+kinds of Telegram updates:
+  - "message": a typed command
+  - "callback_query": a button tap in a menu this bot sent
+
+Only events from the configured telegram_chat_id are ever acted on -
+anyone else who happens to message the bot is silently ignored.
+"""
+
+import logging
+
+import requests
+
+from bptf_client import QUALITY_NAME_TO_ID
+
+log = logging.getLogger("telegram_commands")
+
+VALID_QUALITIES = list(QUALITY_NAME_TO_ID.keys())
+VALID_CATEGORIES = ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"]
+PRICE_PRESETS = [1, 5, 10, 20, 50, 100, 200, 500]
+DISCOUNT_PRESETS = [10, 15, 20, 25, 30, 40, 50, 70]
+LIQUIDITY_PRESETS = [14, 30, 45, 60, 90, 120, 180, 365]
+
+BOT_COMMANDS = [
+    ("menu", "Открыть меню настроек"),
+    ("status", "Текущие настройки"),
+    ("pause", "Приостановить"),
+    ("resume", "Возобновить"),
+    ("help", "Список текстовых команд"),
+]
+
+HELP_TEXT = (
+    "<b>Команды</b>\n"
+    "/menu — меню с кнопками (рекомендуется)\n"
+    "/status — текущие настройки\n"
+    "/pause — приостановить уведомления\n"
+    "/resume — возобновить\n"
+    "/minprice [число] — минимальная цена в ключах (без числа — показать текущую)\n"
+    "/discount [число] — порог скидки в % (без числа — показать текущий)\n"
+    "/liquidity [число] — игнорировать предметы без переоценки цены дольше N дней\n"
+    "/qualities, /addquality Название, /removequality Название\n"
+    "/categories, /addcategory weapon|cosmetic|taunt|killstreak_kit|other, /removecategory ...\n"
+    "/watchstn Название, /unwatchstn Название, /stnwatchlist — точечно следить за "
+    "предметом на stntrading.eu (нужен STN Premium, иначе просто ничего не найдёт)\n"
+    "/help — это сообщение"
+)
+
+
+class TelegramCommandListener:
+    def __init__(self, bot_token: str, chat_id: str):
+        self.api_base = f"https://api.telegram.org/bot{bot_token}"
+        self.chat_id = str(chat_id)
+        self.offset = 0
+        self.session = requests.Session()
+
+    def get_updates(self):
+        """
+        One long-poll call (blocking - call via asyncio.to_thread).
+        Returns a list of events from the configured chat only:
+          {"type": "message", "text": "..."}
+          {"type": "callback_query", "id": "...", "data": "...", "message_id": 123}
+        Advances the internal offset so nothing is processed twice.
+        """
+        try:
+            resp = self.session.get(
+                f"{self.api_base}/getUpdates",
+                params={"offset": self.offset, "timeout": 25,
+                        "allowed_updates": '["message","callback_query"]'},
+                timeout=35,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException:
+            log.warning("Telegram getUpdates request failed, will retry.")
+            return []
+
+        if not data.get("ok"):
+            return []
+
+        events = []
+        for update in data.get("result", []):
+            self.offset = update["update_id"] + 1
+
+            message = update.get("message")
+            if message:
+                chat = message.get("chat") or {}
+                text = message.get("text")
+                if text and str(chat.get("id")) == self.chat_id:
+                    events.append({"type": "message", "text": text.strip()})
+                elif text:
+                    log.warning("Ignored a message from an unrecognised chat id %s", chat.get("id"))
+                continue
+
+            callback = update.get("callback_query")
+            if callback:
+                cb_message = callback.get("message") or {}
+                chat = cb_message.get("chat") or {}
+                if str(chat.get("id")) == self.chat_id:
+                    events.append({
+                        "type": "callback_query",
+                        "id": callback.get("id"),
+                        "data": callback.get("data", ""),
+                        "message_id": cb_message.get("message_id"),
+                    })
+                else:
+                    log.warning("Ignored a callback from an unrecognised chat id %s", chat.get("id"))
+        return events
+
+
+# -- button menu screens --------------------------------------------------
+
+def build_main_menu(runtime):
+    text = (
+        "⚙️ <b>Настройки</b>\n\n"
+        f"Статус: {'⏸ на паузе' if runtime.paused else '▶️ работает'}\n"
+        f"Мин. цена: {runtime.min_price_keys:g} ключей\n"
+        f"Скидка от рынка: от {runtime.discount_threshold_percent:g}%\n"
+        f"Ликвидность: не старше {runtime.max_days_since_price_update:g} дн.\n"
+        f"Качества: {', '.join(runtime.watched_qualities) or '—'}\n"
+        f"Категории: {', '.join(runtime.watched_categories) or '—'}"
+    )
+    pause_button = (
+        {"text": "▶️ Возобновить", "callback_data": "t:pause"}
+        if runtime.paused else
+        {"text": "⏸ Пауза", "callback_data": "t:pause"}
+    )
+    keyboard = [
+        [pause_button],
+        [{"text": "💰 Мин. цена", "callback_data": "m:price"},
+         {"text": "🎯 Скидка %", "callback_data": "m:discount"}],
+        [{"text": "✨ Качества", "callback_data": "m:qual"},
+         {"text": "📦 Категории", "callback_data": "m:cat"}],
+        [{"text": "📈 Ликвидность", "callback_data": "m:liquidity"}],
+    ]
+    return text, keyboard
+
+
+def build_qualities_menu(runtime):
+    text = "✨ <b>Качества</b>\nНажми, чтобы включить/выключить."
+    keyboard = []
+    row = []
+    for q in VALID_QUALITIES:
+        mark = "✅" if q in runtime.watched_qualities else "⬜"
+        row.append({"text": f"{mark} {q}", "callback_data": f"t:q:{q}"})
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([{"text": "⬅️ Назад", "callback_data": "m:main"}])
+    return text, keyboard
+
+
+def build_categories_menu(runtime):
+    text = (
+        "📦 <b>Категории</b>\n"
+        "weapon = оружие, cosmetic = шапки/аксессуары, taunt = насмешки,\n"
+        "killstreak_kit = наборы киллстриков (обычно Unique-качества — "
+        "включи ещё и Unique в /qualities, иначе они не пройдут фильтр "
+        "по качеству), other = всё остальное"
+    )
+    keyboard = []
+    row = []
+    for c in VALID_CATEGORIES:
+        mark = "✅" if c in runtime.watched_categories else "⬜"
+        row.append({"text": f"{mark} {c}", "callback_data": f"t:c:{c}"})
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([{"text": "⬅️ Назад", "callback_data": "m:main"}])
+    return text, keyboard
+
+
+def build_price_menu(runtime):
+    text = (
+        f"💰 <b>Минимальная цена</b>\n"
+        f"Сейчас: {runtime.min_price_keys:g} ключей\n\n"
+        f"Нужно другое число — просто напиши боту, например: /minprice 33"
+    )
+    keyboard = []
+    row = []
+    for v in PRICE_PRESETS:
+        is_current = abs(runtime.min_price_keys - v) < 1e-9
+        label = f"🔘{v}" if is_current else str(v)
+        row.append({"text": label, "callback_data": f"p:{v}"})
+        if len(row) == 4:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([{"text": "⬅️ Назад", "callback_data": "m:main"}])
+    return text, keyboard
+
+
+def build_discount_menu(runtime):
+    text = (
+        f"🎯 <b>Порог скидки</b>\n"
+        f"Сейчас: алерт при цене от {runtime.discount_threshold_percent:g}% ниже рынка\n\n"
+        f"Меньше % — больше алертов (и больше шума). Своё число —\n"
+        f"/discount 12"
+    )
+    keyboard = []
+    row = []
+    for v in DISCOUNT_PRESETS:
+        is_current = abs(runtime.discount_threshold_percent - v) < 1e-9
+        label = f"🔘{v}%" if is_current else f"{v}%"
+        row.append({"text": label, "callback_data": f"d:{v}"})
+        if len(row) == 4:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([{"text": "⬅️ Назад", "callback_data": "m:main"}])
+    return text, keyboard
+
+
+def build_liquidity_menu(runtime):
+    text = (
+        f"📈 <b>Порог ликвидности</b>\n"
+        f"Сейчас: игнорировать предметы без переоценки цены на\n"
+        f"backpack.tf дольше {runtime.max_days_since_price_update:g} дн.\n\n"
+        f"Смысл: если скидка есть, а предмет никто давно не продавал\n"
+        f"и не переоценивал — скорее всего, это не реальная сделка, а\n"
+        f"просто забытая цена. Больше значение — строже отсекаем "
+        f"неликвид.\n"
+        f"Честная оговорка: backpack.tf не отдаёт историю подтверждённых\n"
+        f"продаж бесплатно (это платная Premium-функция) — используется\n"
+        f"дата последней переоценки цены сообществом как ближайший\n"
+        f"бесплатный показатель активности по предмету.\n\n"
+        f"Своё число — /liquidity 45"
+    )
+    keyboard = []
+    row = []
+    for v in LIQUIDITY_PRESETS:
+        is_current = abs(runtime.max_days_since_price_update - v) < 1e-9
+        label = f"🔘{v}" if is_current else str(v)
+        row.append({"text": label, "callback_data": f"l:{v}"})
+        if len(row) == 4:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([{"text": "⬅️ Назад", "callback_data": "m:main"}])
+    return text, keyboard
+
+
+def handle_callback(data: str, runtime):
+    """Applies one button tap and returns (text, keyboard) for the menu
+    screen to show afterwards (the caller edits the tapped message in
+    place with this)."""
+    if data == "m:main":
+        return build_main_menu(runtime)
+    if data == "m:qual":
+        return build_qualities_menu(runtime)
+    if data == "m:cat":
+        return build_categories_menu(runtime)
+    if data == "m:price":
+        return build_price_menu(runtime)
+    if data == "m:discount":
+        return build_discount_menu(runtime)
+    if data == "m:liquidity":
+        return build_liquidity_menu(runtime)
+
+    if data == "t:pause":
+        runtime.paused = not runtime.paused
+        runtime.save()
+        return build_main_menu(runtime)
+
+    if data.startswith("t:q:"):
+        quality = data[4:]
+        if quality in runtime.watched_qualities:
+            runtime.watched_qualities.remove(quality)
+        elif quality in VALID_QUALITIES:
+            runtime.watched_qualities.append(quality)
+        runtime.save()
+        return build_qualities_menu(runtime)
+
+    if data.startswith("t:c:"):
+        category = data[4:]
+        if category in runtime.watched_categories:
+            runtime.watched_categories.remove(category)
+        elif category in VALID_CATEGORIES:
+            runtime.watched_categories.append(category)
+        runtime.save()
+        return build_categories_menu(runtime)
+
+    if data.startswith("p:"):
+        try:
+            runtime.min_price_keys = float(data[2:])
+            runtime.save()
+        except ValueError:
+            pass
+        return build_price_menu(runtime)
+
+    if data.startswith("d:"):
+        try:
+            runtime.discount_threshold_percent = float(data[2:])
+            runtime.save()
+        except ValueError:
+            pass
+        return build_discount_menu(runtime)
+
+    if data.startswith("l:"):
+        try:
+            runtime.max_days_since_price_update = float(data[2:])
+            runtime.save()
+        except ValueError:
+            pass
+        return build_liquidity_menu(runtime)
+
+    return build_main_menu(runtime)
+
+
+# -- typed commands (still supported alongside the button menu) ----------
+
+def _find_quality(name: str):
+    for q in VALID_QUALITIES:
+        if q.lower() == name.lower():
+            return q
+    return None
+
+
+def _find_category(name: str):
+    for c in VALID_CATEGORIES:
+        if c.lower() == name.lower():
+            return c
+    return None
+
+
+def handle_command(text: str, runtime, has_stn_key: bool = False) -> str:
+    """Parses one typed command and applies it to `runtime`, returning
+    the reply text. Any state change is saved to disk before returning."""
+    parts = text.strip().split(maxsplit=1)
+    command = parts[0].lower().lstrip("/").split("@")[0]
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if command == "help":
+        return HELP_TEXT
+
+    if command == "status":
+        state = "⏸ на паузе" if runtime.paused else "▶️ работает"
+        return (
+            f"{state}\n"
+            f"Минимальная цена: {runtime.min_price_keys:g} ключей\n"
+            f"Порог скидки: {runtime.discount_threshold_percent:g}%\n"
+            f"Порог ликвидности: {runtime.max_days_since_price_update:g} дн.\n"
+            f"Качества: {', '.join(runtime.watched_qualities) or '(пусто)'}\n"
+            f"Категории: {', '.join(runtime.watched_categories) or '(пусто)'}"
+        )
+
+    if command == "pause":
+        runtime.paused = True
+        runtime.save()
+        return "⏸ Приостановлено. /resume — включить обратно."
+
+    if command == "resume":
+        runtime.paused = False
+        runtime.save()
+        return "▶️ Возобновлено."
+
+    if command == "minprice":
+        if not arg:
+            return f"Сейчас: {runtime.min_price_keys:g} ключей. Чтобы поменять: /minprice 10"
+        try:
+            value = float(arg.replace(",", "."))
+        except ValueError:
+            return f"Не понял число: {arg!r}. Пример: /minprice 10"
+        if value < 0:
+            return "Цена не может быть отрицательной."
+        runtime.min_price_keys = value
+        runtime.save()
+        return f"Минимальная цена теперь {value:g} ключей."
+
+    if command == "discount":
+        if not arg:
+            return f"Сейчас: от {runtime.discount_threshold_percent:g}%. Чтобы поменять: /discount 12"
+        try:
+            value = float(arg.replace(",", "."))
+        except ValueError:
+            return f"Не понял число: {arg!r}. Пример: /discount 12"
+        if value < 0 or value > 100:
+            return "Процент должен быть от 0 до 100."
+        runtime.discount_threshold_percent = value
+        runtime.save()
+        return f"Порог скидки теперь {value:g}%."
+
+    if command == "liquidity":
+        if not arg:
+            return (
+                f"Сейчас: игнорировать предметы без переоценки цены дольше "
+                f"{runtime.max_days_since_price_update:g} дн. Чтобы поменять: /liquidity 45"
+            )
+        try:
+            value = float(arg.replace(",", "."))
+        except ValueError:
+            return f"Не понял число: {arg!r}. Пример: /liquidity 45"
+        if value < 0:
+            return "Число дней не может быть отрицательным."
+        runtime.max_days_since_price_update = value
+        runtime.save()
+        return f"Порог ликвидности теперь {value:g} дн."
+
+    if command == "qualities":
+        return (
+            f"Сейчас отслеживаются: {', '.join(runtime.watched_qualities) or '(пусто)'}\n"
+            f"Доступные значения: {', '.join(VALID_QUALITIES)}"
+        )
+
+    if command == "addquality":
+        quality = _find_quality(arg)
+        if not quality:
+            return f"Не знаю качество {arg!r}. Доступные: {', '.join(VALID_QUALITIES)}"
+        if quality in runtime.watched_qualities:
+            return f"{quality} уже отслеживается."
+        runtime.watched_qualities.append(quality)
+        runtime.save()
+        return f"Добавил {quality}. Сейчас: {', '.join(runtime.watched_qualities)}"
+
+    if command == "removequality":
+        quality = _find_quality(arg)
+        if not quality or quality not in runtime.watched_qualities:
+            return f"{arg!r} и так не отслеживается. Сейчас: {', '.join(runtime.watched_qualities) or '(пусто)'}"
+        runtime.watched_qualities.remove(quality)
+        runtime.save()
+        return f"Убрал {quality}. Сейчас: {', '.join(runtime.watched_qualities) or '(пусто, алерты не будут приходить)'}"
+
+    if command == "categories":
+        return (
+            f"Сейчас отслеживаются: {', '.join(runtime.watched_categories) or '(пусто)'}\n"
+            f"Доступные значения: {', '.join(VALID_CATEGORIES)}"
+        )
+
+    if command == "addcategory":
+        category = _find_category(arg)
+        if not category:
+            return f"Не знаю категорию {arg!r}. Доступные: {', '.join(VALID_CATEGORIES)}"
+        if category in runtime.watched_categories:
+            return f"{category} уже отслеживается."
+        runtime.watched_categories.append(category)
+        runtime.save()
+        return f"Добавил {category}. Сейчас: {', '.join(runtime.watched_categories)}"
+
+    if command == "removecategory":
+        category = _find_category(arg)
+        if not category or category not in runtime.watched_categories:
+            return f"{arg!r} и так не отслеживается. Сейчас: {', '.join(runtime.watched_categories) or '(пусто)'}"
+        runtime.watched_categories.remove(category)
+        runtime.save()
+        return f"Убрал {category}. Сейчас: {', '.join(runtime.watched_categories) or '(пусто, алерты не будут приходить)'}"
+
+    if command == "watchstn":
+        if not arg:
+            return "Укажи точное название предмета: /watchstn The Team Captain"
+        if arg in runtime.stn_watchlist:
+            return f"{arg!r} уже отслеживается на stntrading.eu."
+        runtime.stn_watchlist.append(arg)
+        runtime.save()
+        if not has_stn_key:
+            return (
+                f"Добавил в список: {arg!r}. Но stntrading_api_key не задан в config.json — "
+                f"пока не будет проверяться вообще. Добавь ключ и перезапусти службу."
+            )
+        return f"Добавил в список наблюдения на stntrading.eu: {arg!r}."
+
+    if command == "unwatchstn":
+        if not arg:
+            return "Укажи точное название предмета: /unwatchstn The Team Captain"
+        if arg not in runtime.stn_watchlist:
+            return f"{arg!r} и так не отслеживается."
+        runtime.stn_watchlist.remove(arg)
+        runtime.save()
+        return f"Убрал {arg!r} из списка наблюдения на stntrading.eu."
+
+    if command == "stnwatchlist":
+        if not runtime.stn_watchlist:
+            return "Список наблюдения на stntrading.eu пуст. Добавить: /watchstn Название предмета"
+        return "Отслеживается на stntrading.eu:\n" + "\n".join(f"— {n}" for n in runtime.stn_watchlist)
+
+    return f"Не знаю команду {command!r}. /help — список команд, /menu — меню с кнопками."
