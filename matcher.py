@@ -64,6 +64,7 @@ class NormalizedListing:
     spells: List[str] = field(default_factory=list)     # Halloween spell names, e.g. "Voices from Below"
     strange_parts: List[str] = field(default_factory=list)  # e.g. "Strange Part: Domination Kills"
     paint: Optional[str] = None                          # paint-can colour name, if painted
+    paint_decimal_hint: Optional[int] = None              # exact RGB decimal, when the source gives one directly (skips RED/BLU guessing for team-coloured paints)
     seller_steamid: Optional[str] = None                 # narrows the backpack.tf search link to just this seller
     killstreak_tier: Optional[int] = None                # narrows the backpack.tf search link further
     killstreaker: Optional[str] = None                    # Professional Killstreak only - the eye-particle effect
@@ -243,33 +244,46 @@ def check_killstreak_tier_pricing(bptf, listing: "NormalizedListing", lookup_nam
         return True
 
     tier = listing.killstreak_tier or 0
+
+    # OPTIMIZED, per direct feedback that the full 4-tier check was
+    # taking up to a minute per killstreak weapon once backpack.tf's
+    # real rate limit (6 requests/60s on a non-premium key - see
+    # bptf_min_request_interval_seconds in config.py) forced requests
+    # 11 seconds apart: checking all 3 OTHER tiers cost 3 extra requests
+    # on top of the 3 already needed for any weapon (reference, buy
+    # order, average price) - 6 total, ~66s sequential.
+    #
+    # Narrowed to checking ONLY against tier 0 (plain) - the single
+    # comparison that catches the actual bug this check exists for
+    # ("Professional priced below plain" - a real report), for 1 extra
+    # request instead of 3. A tier-0 listing itself has nothing lower to
+    # compare against, so it skips this check entirely now rather than
+    # also checking upward against tiers 1-3 (a broader protection added
+    # after a separate real report, now deliberately traded for speed -
+    # tier-0 weapons are also by far the most common weapon listings, so
+    # this also removes the cost from the majority case, not just the
+    # killstreak one). The remaining gap - a plain listing whose OWN
+    # price looks fine even though a higher tier is mispriced - is a
+    # real but narrower loss than what this recovers in speed.
+    if tier == 0:
+        return True
+
     base_name = strip_killstreak_prefix(lookup_name)
     is_australium = base_name.startswith("Australium ")
-
-    tier_refs = {tier: ref_keys}
-    for t in range(4):
-        if t == tier:
-            continue
-        other_name = name_for_killstreak_tier(base_name, t)
-        other_ref = _get_reference_price_keys(
-            bptf, other_name, listing.quality, listing.particle_id, listing.craftable,
-            spell=None, australium=is_australium, killstreak_tier=t,
-            min_other_listings=cfg["min_other_listings"],
+    tier0_name = name_for_killstreak_tier(base_name, 0)
+    tier0_ref = _get_reference_price_keys(
+        bptf, tier0_name, listing.quality, listing.particle_id, listing.craftable,
+        spell=None, australium=is_australium, killstreak_tier=0,
+        min_other_listings=cfg["min_other_listings"],
+    )
+    if tier0_ref is not None and tier0_ref > ref_keys:
+        log.info(
+            "Suppressing %s (evaluated at tier %d, %.2f keys) - plain (tier 0) costs "
+            "%.2f keys, more than this strictly-more-featured tier; the pricing for this "
+            "item looks unreliable right now, not just whichever tier triggered the alert.",
+            lookup_name, tier, ref_keys, tier0_ref,
         )
-        if other_ref is not None:
-            tier_refs[t] = other_ref
-
-    for t1, p1 in tier_refs.items():
-        for t2, p2 in tier_refs.items():
-            if t1 < t2 and p1 > p2:
-                log.info(
-                    "Suppressing %s (evaluated at tier %d, %.2f keys) - tier %d costs "
-                    "%.2f keys but tier %d (strictly more features) costs less (%.2f keys); "
-                    "the tier ladder for this item looks unreliable right now, not just "
-                    "whichever tier happened to trigger the alert.",
-                    lookup_name, tier, ref_keys, t1, p1, t2, p2,
-                )
-                return False
+        return False
     return True
 
 
@@ -401,7 +415,22 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
     # buy-order lookup below too, so both numbers describe the same
     # colour, not two different guesses.
     winning_paint_decimal = None
-    if team_color_decimals:
+    if listing.paint_decimal_hint is not None:
+        # The source told us exactly which colour this listing is
+        # (confirmed real for mannco.store - see mannco_paint_decimal_
+        # hint) - go straight to it, no need to guess-and-try RED then
+        # BLU the way team_color_decimals below does for sources that
+        # don't give this directly.
+        ref_keys = _get_reference_price_keys(
+            bptf, lookup_name, listing.quality, listing.particle_id, listing.craftable,
+            spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
+            min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
+            paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
+            paint_decimal_override=listing.paint_decimal_hint,
+        )
+        if ref_keys is not None:
+            winning_paint_decimal = listing.paint_decimal_hint
+    elif team_color_decimals:
         for candidate in team_color_decimals:
             ref_keys = _get_reference_price_keys(
                 bptf, lookup_name, listing.quality, listing.particle_id, listing.craftable,

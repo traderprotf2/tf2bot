@@ -204,8 +204,23 @@ class ManncoClient:
         mannco.store, used as the USD<->keys exchange rate for every other
         comparison. Falls back to the lowest_sale_price -> steam_price if
         needed.
+
+        Resolves KEY_SLUG to a numeric item id via get_item_details()
+        first, then prices THAT id - a real production log showed
+        get_item_pricing(KEY_SLUG) itself failing outright with "Invalid
+        item ID - must be numeric", contradicting the pricing endpoint's
+        own docs (which say it accepts "a numeric item id or a URL
+        slug"). get_item_details() is a separate endpoint that DOES
+        document (and, per that same log, does) accept a slug - so this
+        goes through it to get a real numeric id, then prices that,
+        rather than trusting the pricing endpoint to accept the same
+        slug format its own error message says it won't.
         """
-        pricing = self.get_item_pricing(KEY_SLUG)
+        details = self.get_item_details(KEY_SLUG)
+        if not details or not details.get("id"):
+            log.warning("Could not resolve mannco.store key slug %r to a numeric item id.", KEY_SLUG)
+            return None
+        pricing = self.get_item_pricing(details["id"])
         if not pricing:
             return None
         for field in ("lowest_sale_price", "suggested_price", "steam_price"):

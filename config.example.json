@@ -28,6 +28,6 @@
   "seen_listings_max": 20000,
   "snapshot_cache_seconds": 20,
   "bptf_max_concurrent_requests": 4,
-  "bptf_min_request_interval_seconds": 1.5,
+  "bptf_min_request_interval_seconds": 11.0,
   "inventory_cache_seconds": 900
 }

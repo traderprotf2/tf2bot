@@ -217,12 +217,40 @@ def mannco_paint(details: dict):
     return None
 
 
+def mannco_paint_decimal_hint(details: dict):
+    """
+    The exact RGB decimal for this SPECIFIC listing's paint, when
+    mannco.store's own payload gives one directly - confirmed real via
+    the diagnostic sample above: a raw paint object of {'name': 'Team
+    Spirit', 'color': 'b8383b', 'team': 'red'}, where 'b8383b' decodes to
+    (184, 56, 59) - an exact match for this project's own independently-
+    researched "Team Spirit RED" RGB value. This means mannco.store
+    tells us directly which of the two colours a team-coloured item
+    actually is, so there's no need to guess-and-try-both the way
+    evaluate_listing does for backpack.tf (which has no equivalent
+    confirmed field yet). Only meaningful for team-coloured paints -
+    ordinary paints already resolve to one RGB value from the name alone
+    (see paint_rgb_decimal), so this returns None for anything else,
+    letting the normal name-based path handle it.
+    """
+    raw = details.get("paint")
+    if not isinstance(raw, dict):
+        return None
+    color_hex = raw.get("color")
+    if not color_hex or not isinstance(color_hex, str):
+        return None
+    try:
+        return int(color_hex, 16)
+    except ValueError:
+        return None
+
+
 class Watcher:
     def __init__(self, cfg):
         self.cfg = cfg
         bptf_client.configure_request_pacing(
             cfg.get("bptf_max_concurrent_requests", 4),
-            cfg.get("bptf_min_request_interval_seconds", 1.5),
+            cfg.get("bptf_min_request_interval_seconds", 11.0),
         )
         self.bptf = bptf_client.BackpackTFPriceList(
             cfg["backpacktf_api_key"],
@@ -903,6 +931,7 @@ class Watcher:
             spells=mannco_spells(details),
             strange_parts=mannco_strange_parts(details),
             paint=mannco_paint(details),
+            paint_decimal_hint=mannco_paint_decimal_hint(details),
         )
 
         self.stats["mannco_evaluated"] += 1
@@ -998,6 +1027,24 @@ class Watcher:
         paint_obj = item.get("paint") or {}
         raw_paint = paint_obj.get("name") if isinstance(paint_obj, dict) else None
         paint = raw_paint if slot in COSMETIC_SLOTS else None
+
+        # Exact RGB decimal straight from the source, same idea as
+        # mannco_paint_decimal_hint - confirmed real for backpack.tf too
+        # by the diagnostic sample below: a raw paint object of {'id':
+        # 5046, 'name': 'Team Spirit', 'color': '#b8383b'} - '#b8383b'
+        # decodes (after stripping the '#', unlike mannco.store's own
+        # hex which has none) to (184, 56, 59), an exact match for this
+        # project's own "Team Spirit RED" value. Team-coloured paints no
+        # longer need the RED/BLU guess-and-check for backpack.tf either -
+        # this goes straight to the exact colour the listing actually is.
+        paint_decimal_hint = None
+        if paint and slot in COSMETIC_SLOTS:
+            raw_color = paint_obj.get("color") if isinstance(paint_obj, dict) else None
+            if isinstance(raw_color, str):
+                try:
+                    paint_decimal_hint = int(raw_color.lstrip("#"), 16)
+                except ValueError:
+                    paint_decimal_hint = None
 
         if slot == "medal" and "bptf_medal_slot" not in self._sampled_item_kinds:
             self._sampled_item_kinds.add("bptf_medal_slot")
@@ -1113,6 +1160,7 @@ class Watcher:
             # ("details - the listing comment, max 200 characters") -
             # both agree on the name, from opposite ends (read vs write).
             seller_note=(payload.get("details") or "").strip() or None,
+            paint_decimal_hint=paint_decimal_hint,
         )
 
         self.stats["bptf_evaluated"] += 1

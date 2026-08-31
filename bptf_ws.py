@@ -74,6 +74,21 @@ async def stream_listing_events(on_event):
     gets the connection closed with "message too big" and forces a
     reconnect - losing whatever was in that batch and repeating every
     time a large-enough batch comes through, not a one-off.
+
+    Each event is dispatched as its own concurrent task (see
+    _dispatch_event below), not awaited one at a time in this loop -
+    per direct feedback that a single killstreak weapon's own
+    (correctly rate-limited) request chain could take up to ~44s
+    end-to-end, and awaiting that FULLY before even starting the NEXT
+    listing's evaluation meant the real bottleneck wasn't backpack.tf's
+    6-requests/60s limit itself, it was this loop only ever having ONE
+    listing "in flight" at a time. The shared throttle/semaphore in
+    bptf_client.py (not this loop) is what actually keeps every
+    concurrent task's requests within that same limit - running many
+    listings' evaluations concurrently doesn't request anything faster
+    than one at a time would, it just stops the gaps between a single
+    listing's own spaced-out requests from sitting completely idle
+    instead of being used for other listings' requests.
     """
     while True:
         try:
@@ -109,9 +124,31 @@ async def stream_listing_events(on_event):
                             continue
                         if payload.get("status") not in (None, "active"):
                             continue
-                        await on_event(payload)
+                        asyncio.create_task(_dispatch_event(on_event, payload))
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("backpack.tf stream connection error, reconnecting in %ss...", RECONNECT_DELAY_SECONDS)
             await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+
+
+# Bounds how many listings' evaluations can be concurrently "in flight"
+# at once (each one mostly just waiting its turn on the shared request
+# throttle, not actually using much of its own resources meanwhile) -
+# not a rate limit itself (bptf_client.py's throttle/semaphore already
+# is one), just a sane ceiling against a burst of thousands of events
+# arriving in one batch spinning up thousands of simultaneous tasks.
+_dispatch_semaphore = asyncio.Semaphore(60)
+
+
+async def _dispatch_event(on_event, payload):
+    async with _dispatch_semaphore:
+        try:
+            await on_event(payload)
+        except Exception:
+            # A task created with asyncio.create_task() that raises is
+            # never awaited here, so an unhandled exception would
+            # otherwise only surface as an easy-to-miss "Task exception
+            # was never retrieved" warning at garbage-collection time,
+            # not a clear log entry when it actually happened.
+            log.exception("Unhandled error while processing a backpack.tf listing event.")

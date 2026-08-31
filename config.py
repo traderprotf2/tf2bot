@@ -180,19 +180,19 @@ DEFAULTS = {
     # This is what actually caps the SUSTAINED request rate over time - a
     # concurrency cap alone doesn't: 4 requests in flight, each finishing
     # quickly, can still add up to more than backpack.tf tolerates per
-    # second. Raised from an original 0.4s (~2.5 req/sec) after real logs
-    # showed sustained rate-limiting continuing even at that pace -
-    # repeated 429s cycling through the full adaptive backoff range (10s
-    # up to the 300s ceiling), with the bot spending most of a 5-minute
-    # window in cooldown and evaluating literally zero deals as a direct
-    # result. Still no confirmed exact number for backpack.tf's real
-    # limit, so 1.5s (~0.67 req/sec sustained) is a considerably more
-    # conservative starting point, chosen because the previous one was
-    # demonstrably still too fast, not because this one is measured
-    # correct either - if 429s keep recurring even at this pace, raise it
-    # further; if /stats and /errors show plenty of headroom, it's safe
-    # to lower.
-    "bptf_min_request_interval_seconds": 1.5,
+    # second. NOW BASED ON A CONFIRMED NUMBER, not a guess: backpack.tf's
+    # own 429 response body states the real limit directly - "Request
+    # limit exceeded... maxWindowRequests: 6, windowSeconds: 60,
+    # limits: {default: 6, premium: 60}" - i.e. a non-premium API key
+    # gets 6 requests per 60 seconds (10s/request minimum), premium gets
+    # 60 per 60 (1s/request). Every earlier value here (0.4s, then 1.5s)
+    # was still 6-15x too fast for the default tier - this is why
+    # rate-limiting kept recurring no matter how much this was raised.
+    # Set to 11s (a small margin over the bare 10s minimum) by default
+    # since most users are on the free/default tier; lower this to
+    # around 1.1s if backpack.tf Premium is active on the account this
+    # bot's token belongs to.
+    "bptf_min_request_interval_seconds": 11.0,
 }
 
 
