@@ -26,6 +26,23 @@ DEFAULTS = {
     # guessed at, so a missing/expired token means most things get
     # skipped, not silently mispriced.
     "backpacktf_token": "",
+
+    # OPTIONAL: additional backpack.tf accounts, each its own {api_key,
+    # token} pair (same two values as above, just from a different
+    # backpack.tf account), to run requests across in parallel -
+    # confirmed directly with backpack.tf that this is fine, the higher
+    # rate limit on Premium is a convenience perk alongside their other
+    # paid features, not a rule against running several accounts'
+    # requests in parallel. Leave empty (the default) to use only the
+    # single account above - nothing changes if this is empty. When
+    # non-empty, the primary account above PLUS every entry here are all
+    # used together, round-robin, so N total accounts give roughly N
+    # times the throughput of one (each account still fully respects
+    # backpack.tf's own per-key rate limit on its own schedule - see
+    # bptf_min_request_interval_seconds below).
+    # Example: [{"api_key": "...", "token": "..."}, {"api_key": "...", "token": "..."}]
+    "backpacktf_accounts": [],
+
     "mannco_api_key": "",           # https://mannco.store/seller
     "telegram_bot_token": "",       # from @BotFather
     "telegram_chat_id": "",         # your numeric chat id (see README)

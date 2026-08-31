@@ -23,6 +23,7 @@ See README.md for setup instructions.
 
 import asyncio
 import collections
+import concurrent.futures
 import logging
 import time
 
@@ -248,8 +249,25 @@ def mannco_paint_decimal_hint(details: dict):
 class Watcher:
     def __init__(self, cfg):
         self.cfg = cfg
+        # The primary account (backpacktf_api_key/backpacktf_token) is
+        # always included, plus any extra accounts in backpacktf_accounts
+        # - confirmed with backpack.tf that running several accounts'
+        # requests in parallel is fine, so this is what makes N accounts
+        # give roughly N times the throughput of one (see
+        # bptf_client._AccountPool). A single account (the default, most
+        # common case) behaves exactly as before - this list just has
+        # one entry in it.
+        bptf_accounts = [{"api_key": cfg["backpacktf_api_key"], "token": cfg.get("backpacktf_token", "")}]
+        bptf_accounts.extend(cfg.get("backpacktf_accounts", []))
+        # At least one concurrent request slot per account, so N accounts
+        # can genuinely have N requests in flight together rather than
+        # being bottlenecked by a smaller concurrency cap sized for the
+        # single-account case - cfg's own value still wins if explicitly
+        # set higher than that.
+        max_concurrent = max(cfg.get("bptf_max_concurrent_requests", 4), len(bptf_accounts))
         bptf_client.configure_request_pacing(
-            cfg.get("bptf_max_concurrent_requests", 4),
+            bptf_accounts,
+            max_concurrent,
             cfg.get("bptf_min_request_interval_seconds", 11.0),
         )
         self.bptf = bptf_client.BackpackTFPriceList(
@@ -1304,6 +1322,31 @@ class Watcher:
         await asyncio.to_thread(self.telegram.send, message)
 
     async def run(self):
+        # CRITICAL: Python's asyncio.to_thread() shares one small
+        # thread pool by default (min(32, cpu_count+4), often ~32-36
+        # threads) across EVERY use of it anywhere in the process - not
+        # just backpack.tf/mannco.store evaluations, but also every
+        # Telegram send/reply/callback-answer (see telegram_command_loop
+        # and send_deal below), Steam inventory checks, and more. Once
+        # listing events started being dispatched concurrently (see
+        # bptf_ws.py/mannco_ws.py's _dispatch_semaphore, up to 60+60
+        # potentially "in flight" at once) instead of one at a time, each
+        # evaluate_listing() call can hold onto a worker thread for its
+        # entire throttled request chain (up to tens of seconds of
+        # time.sleep() inside the account pool's throttle) - direct
+        # feedback confirmed this: with that many long-lived threads
+        # competing for a ~32-thread pool, Telegram's OWN to_thread calls
+        # (a completely unrelated concern) were queuing up behind them,
+        # making the bot feel laggy for commands that have nothing to do
+        # with pricing at all. Set once, explicitly, before anything else
+        # in this process uses to_thread - large enough that the busiest
+        # realistic combination of concurrent evaluations plus normal
+        # Telegram/inventory/other usage never has to wait for a free
+        # worker.
+        asyncio.get_running_loop().set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(max_workers=200)
+        )
+
         log.info("Starting up: loading initial prices...")
         try:
             await asyncio.to_thread(self.refresh_prices)

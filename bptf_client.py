@@ -37,55 +37,89 @@ log = logging.getLogger("bptf")
 # requests failing together, right when there's the most going on.
 # threading.Semaphore (not asyncio.Semaphore) because these calls run in
 # worker threads via asyncio.to_thread, not on the event loop itself.
-# Lowered from an earlier 8 after a real production log showed 429s
-# happening even at that level - 8 concurrent evidently wasn't
-# conservative enough on its own, hence also the cooldown below.
+# Reconfigured to scale with the number of accounts in the pool below -
+# see configure_request_pacing.
 MAX_CONCURRENT_REQUESTS = 4
 _request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-# A cap on CONCURRENT requests alone doesn't cap the SUSTAINED rate over
-# time - 4 requests in flight, each finishing quickly and immediately
-# replaced by the next one queued, can still add up to well more than
-# backpack.tf tolerates per second, minute after minute. A real
-# production log showed sustained 429s cycling through the entire
-# adaptive backoff range (10s doubling up to the 300s ceiling) repeatedly
-# over 90+ minutes straight - not occasional bursts, a continuous
-# pattern - which is exactly what "concurrency capped but rate
-# unthrottled" looks like. This enforces a minimum gap between when each
-# request STARTS, smoothing the actual request rate directly instead of
-# just hoping a low concurrency cap implies a low enough rate. No
-# confirmed exact number for backpack.tf's real limit, so this is a
-# deliberately conservative starting point - see _throttle_request_rate.
-_MIN_REQUEST_INTERVAL_SECONDS = 0.4
-_last_request_started_lock = threading.Lock()
-_last_request_started_at = 0.0
+
+class _AccountPool:
+    """
+    Distributes backpack.tf requests across one or more accounts (each
+    its own api_key + user token), round-robin, so the AGGREGATE
+    throughput scales with the number of accounts configured - added
+    per explicit confirmation from backpack.tf that running several
+    accounts' worth of requests in parallel is fine (the higher premium
+    rate limit is a convenience perk on top of their other paid
+    features, not a rule against this). Each account still fully
+    respects backpack.tf's own per-key rate limit on its OWN clock - two
+    accounts each independently pacing themselves to one request every
+    MIN_REQUEST_INTERVAL_SECONDS means the pool as a whole can sustain
+    roughly twice that rate, N accounts roughly N times, simply because
+    no single account is ever asked to go faster than its own real
+    limit allows.
+
+    Picks whichever account has waited longest since its own last use,
+    not strict round-robin by position - this self-corrects if one
+    account's request happens to take longer than another's (a slow
+    response doesn't throw off the whole rotation), and naturally
+    degenerates into the exact same behavior as the old single-account
+    throttle when there's only one account configured.
+    """
+
+    def __init__(self, accounts, min_interval_seconds):
+        self._accounts = list(accounts)
+        self._min_interval = min_interval_seconds
+        self._last_used_at = [0.0] * len(self._accounts)
+        self._lock = threading.Lock()
+
+    def reconfigure(self, accounts, min_interval_seconds):
+        with self._lock:
+            self._accounts = list(accounts)
+            self._min_interval = min_interval_seconds
+            self._last_used_at = [0.0] * len(self._accounts)
+
+    def account_count(self):
+        with self._lock:
+            return len(self._accounts)
+
+    def acquire(self):
+        """Blocks (in the calling thread) until some account's turn
+        comes up, then returns that account's (api_key, token)."""
+        while True:
+            with self._lock:
+                now = time.time()
+                best_idx = min(range(len(self._accounts)), key=lambda i: self._last_used_at[i])
+                wait = self._last_used_at[best_idx] + self._min_interval - now
+                if wait <= 0:
+                    self._last_used_at[best_idx] = now
+                    account = self._accounts[best_idx]
+                    return account["api_key"], account["token"]
+            time.sleep(wait)
 
 
-def configure_request_pacing(max_concurrent: int, min_interval_seconds: float):
+# Populated by configure_request_pacing at startup (see main.py) with
+# whatever account(s) are in config.json - defaults to a single empty
+# placeholder account so the module still imports cleanly before that
+# call happens (e.g. under a bare unit test).
+_account_pool = _AccountPool([{"api_key": "", "token": ""}], 11.0)
+
+
+def configure_request_pacing(accounts, max_concurrent: int, min_interval_seconds: float):
     """
-    Called once at startup (see main.py) with cfg["bptf_max_concurrent_
-    requests"] / cfg["bptf_min_request_interval_seconds"], so these are
-    tunable from config.json without editing this file - both were
-    hardcoded here originally; exposed after real, repeated rate-limit
-    troubleshooting made clear these are exactly the kind of knob worth
-    adjusting without a code change. Safe to call before any real
-    request has been made (which is when main.py calls it) - rebuilds
-    the semaphore at the new capacity, not just relabels the constant.
+    Called once at startup (see main.py) with the account list built
+    from config.json (backpacktf_accounts if present, otherwise a
+    single-item list from backpacktf_api_key/backpacktf_token) plus
+    cfg["bptf_max_concurrent_requests"] / cfg["bptf_min_request_interval_
+    seconds"] - all tunable from config.json without editing this file.
+    Safe to call before any real request has been made (which is when
+    main.py calls it) - rebuilds the semaphore and account pool fresh,
+    not just relabels the constants.
     """
-    global MAX_CONCURRENT_REQUESTS, _request_semaphore, _MIN_REQUEST_INTERVAL_SECONDS
+    global MAX_CONCURRENT_REQUESTS, _request_semaphore
     MAX_CONCURRENT_REQUESTS = max_concurrent
     _request_semaphore = threading.Semaphore(max_concurrent)
-    _MIN_REQUEST_INTERVAL_SECONDS = min_interval_seconds
-
-
-def _throttle_request_rate():
-    global _last_request_started_at
-    with _last_request_started_lock:
-        now = time.time()
-        wait = _last_request_started_at + _MIN_REQUEST_INTERVAL_SECONDS - now
-        if wait > 0:
-            time.sleep(wait)
-        _last_request_started_at = time.time()
+    _account_pool.reconfigure(accounts, min_interval_seconds)
 
 # On top of capping concurrency, back off entirely for a bit once
 # backpack.tf actually returns 429 - real production logs showed repeated
@@ -169,17 +203,25 @@ def _get_with_retry(session, url, params, timeout=20):
     - these tend to be momentary, so it's worth one quick retry rather
     than immediately falling back to the less-precise community price
     for what might just be a one-second blip.
+
+    `params` should NOT include "key"/"token" - _AccountPool.acquire()
+    picks which account's credentials to use for THIS specific request
+    (round-robin across every configured account) and injects them here,
+    so a retry after a 5xx also goes through the pool fresh rather than
+    reusing whichever account happened to be picked the first time.
     """
+    api_key, token = _account_pool.acquire()
+    request_params = dict(params, key=api_key, token=token)
     with _request_semaphore:
-        _throttle_request_rate()
-        resp = session.get(url, params=params, timeout=timeout)
+        resp = session.get(url, params=request_params, timeout=timeout)
     if resp.status_code == 429:
         _note_rate_limited()
     elif resp.status_code >= 500:
         time.sleep(1.5)
+        api_key, token = _account_pool.acquire()
+        request_params = dict(params, key=api_key, token=token)
         with _request_semaphore:
-            _throttle_request_rate()
-            resp = session.get(url, params=params, timeout=timeout)
+            resp = session.get(url, params=request_params, timeout=timeout)
         if resp.status_code == 429:
             _note_rate_limited()
     return resp
@@ -793,8 +835,9 @@ class BackpackTFPriceList:
         quality_id = QUALITY_NAME_TO_ID.get(quality_name)
         params = {
             "appid": 440,
-            "token": self.token,
-            "key": self.api_key,
+            # "key"/"token" deliberately NOT set here - _get_with_retry
+            # injects them per-request from whichever account the pool
+            # hands out (round-robin across every configured account).
             "sku": name,
             "intent": intent,
             "craftable": 1 if craftable else 0,
@@ -1090,7 +1133,8 @@ class BackpackTFPriceList:
             return None
 
         params = {
-            "key": self.api_key,
+            # "key" deliberately NOT set here - _get_with_retry injects
+            # it per-request from whichever account the pool hands out.
             "item": name,
             "quality": quality_name,
             "craftable": 1 if craftable else 0,

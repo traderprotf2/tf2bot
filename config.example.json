@@ -1,6 +1,7 @@
 {
   "backpacktf_api_key": "PUT_YOUR_BACKPACK_TF_API_KEY_HERE",
   "backpacktf_token": "OPTIONAL_BUT_RECOMMENDED_SEE_README",
+  "backpacktf_accounts": [],
   "mannco_api_key": "PUT_YOUR_MANNCO_STORE_API_KEY_HERE",
   "telegram_bot_token": "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE",
   "telegram_chat_id": "PUT_YOUR_TELEGRAM_CHAT_ID_HERE",
