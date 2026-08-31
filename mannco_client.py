@@ -13,14 +13,47 @@ became invalid early for some reason).
 
 import logging
 import re
+import threading
 import time
 
 import requests
 
 log = logging.getLogger("mannco")
 
+# Same reasoning as bptf_client's request throttle and steam_inventory's -
+# a real production log showed 4854 mannco.store events received in 5
+# minutes with ZERO successfully evaluated, while backpack.tf and Steam's
+# inventory endpoint already had this same protection and mannco.store's
+# own get_item_details call - hit once per received event, no cap at all
+# - did not. At that volume (~16/sec) with no pacing, hitting mannco's
+# own rate limit on nearly every request is exactly what "received high,
+# evaluated near-zero, with no specific rejection reason accounting for
+# the gap" looks like.
+_MIN_REQUEST_INTERVAL_SECONDS = 0.5
+_last_request_started_at = 0.0
+_throttle_lock = threading.Lock()
+
+
+def _throttle():
+    global _last_request_started_at
+    with _throttle_lock:
+        now = time.time()
+        wait = _last_request_started_at + _MIN_REQUEST_INTERVAL_SECONDS - now
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_started_at = time.time()
+
+
 _RATE_LIMIT_WAIT_PATTERN = re.compile(r"try again in (\d+)\s*seconds?", re.IGNORECASE)
-_RATE_LIMIT_MAX_WAIT_SECONDS = 60  # cap however long the server claims to need
+# Cap however long the server claims to need, but generously - a real
+# production log showed mannco.store asking for 152 seconds, well above
+# the original 60s cap here, which meant the retry below waited only 61s
+# (min(152, 60) + 1) and was then guaranteed to fail, since it hadn't
+# actually waited out the real cooldown. Raised to match the same
+# philosophy as backpack.tf's own adaptive-backoff ceiling (also 300s,
+# see bptf_client.py) - generous enough for real observed values, still
+# bounded against something truly pathological.
+_RATE_LIMIT_MAX_WAIT_SECONDS = 300
 
 BASE_URL = "https://api.mannco.store"
 TF2_GAME_ID = 440
@@ -97,10 +130,12 @@ class ManncoClient:
 
     def _get(self, path, params=None, retry_on_auth_error=True):
         self.ensure_logged_in()
+        _throttle()
         resp = self.session.get(f"{BASE_URL}{path}", headers=self._headers(), params=params, timeout=30)
         if resp.status_code == 403 and retry_on_auth_error:
             log.warning("Got 403 from mannco.store, re-logging in and retrying once.")
             self.login()
+            _throttle()
             resp = self.session.get(f"{BASE_URL}{path}", headers=self._headers(), params=params, timeout=30)
         resp.raise_for_status()
         return resp.json()

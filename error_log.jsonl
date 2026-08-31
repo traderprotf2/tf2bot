@@ -1,3 +1,4 @@
 {"time": 1788122366.3174233, "level": "WARNING", "logger": "main", "message": "Startup sanity check found 1 issue(s): key_price_metal не определился вообще - конвертация металл→ключи сломана для ВСЕХ предметов в металле."}
 {"time": 1788122366.3276541, "level": "WARNING", "logger": "main", "message": "Startup sanity check found 1 issue(s): Загружено только 0 unusual-эффектов из схемы Steam (обычно 600+) - определение Unusual-предметов может работать не полностью."}
 {"time": 1788173974.9683568, "level": "WARNING", "logger": "matcher", "message": "No image mapping loaded at all - alerts will have no pictures until this is fixed."}
+{"time": 1788178309.0135067, "level": "WARNING", "logger": "main", "message": "DIAGNOSTIC SAMPLE (first team-coloured paint seen this run from mannco.store, 'Team Spirit') - raw paint object: {'name': 'Team Spirit', 'color': 'b8383b', 'team': 'red'}"}

@@ -180,13 +180,19 @@ DEFAULTS = {
     # This is what actually caps the SUSTAINED request rate over time - a
     # concurrency cap alone doesn't: 4 requests in flight, each finishing
     # quickly, can still add up to more than backpack.tf tolerates per
-    # second. Added after real logs showed the adaptive 429 backoff
-    # cycling through its full range (10s up to the 300s ceiling)
-    # repeatedly over 90+ minutes straight - concurrency capped but rate
-    # unthrottled looks exactly like that. No confirmed exact number for
-    # backpack.tf's real limit, so 0.4s (~2.5 requests/sec sustained) is
-    # a deliberately conservative starting point, not a measured one.
-    "bptf_min_request_interval_seconds": 0.4,
+    # second. Raised from an original 0.4s (~2.5 req/sec) after real logs
+    # showed sustained rate-limiting continuing even at that pace -
+    # repeated 429s cycling through the full adaptive backoff range (10s
+    # up to the 300s ceiling), with the bot spending most of a 5-minute
+    # window in cooldown and evaluating literally zero deals as a direct
+    # result. Still no confirmed exact number for backpack.tf's real
+    # limit, so 1.5s (~0.67 req/sec sustained) is a considerably more
+    # conservative starting point, chosen because the previous one was
+    # demonstrably still too fast, not because this one is measured
+    # correct either - if 429s keep recurring even at this pace, raise it
+    # further; if /stats and /errors show plenty of headroom, it's safe
+    # to lower.
+    "bptf_min_request_interval_seconds": 1.5,
 }
 
 

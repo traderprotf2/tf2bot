@@ -262,6 +262,30 @@ PAINT_NAME_TO_RGB = {
     "Zepheniah's Greed": (66, 79, 59),
 }
 
+# The 7 team-coloured paints, as (RED, BLU) RGB pairs. Confirmed by a
+# Steam Community reference guide cross-checked against these same
+# names being independently attributed to a named contributor on
+# Valve's own wiki (Paint Can page: "colors and names for Operator's
+# Overalls, Waterlogged Lab Coat, Balaclavas Are Forever, An Air of
+# Debonair, The Value of Teamwork, and Cream Spirit were provided by
+# Mnemo"). A single PAINTED ITEM has ONE fixed colour, not a value that
+# changes with whichever team currently has it equipped (confirmed by a
+# real backpack.tf forum post: a user's own item "shows as only the red
+# team spirit and not both") - so trying both RED and BLU as separate
+# searches is safe, not a repeat of the earlier team-colour mistake:
+# querying with the WRONG one of the two just returns no matching
+# listings from backpack.tf's own filter (an empty, honest result), it
+# can't return the WRONG item's data the way an unfiltered search did.
+TEAM_COLOR_PAINT_RGB = {
+    "An Air of Debonair": {"RED": (101, 71, 64), "BLU": (40, 57, 77)},
+    "Balaclavas Are Forever": {"RED": (59, 31, 35), "BLU": (24, 35, 61)},
+    "Cream Spirit": {"RED": (195, 108, 45), "BLU": (184, 128, 53)},
+    "Operator's Overalls": {"RED": (72, 56, 56), "BLU": (56, 66, 72)},
+    "Team Spirit": {"RED": (184, 56, 59), "BLU": (88, 133, 162)},
+    "The Value of Teamwork": {"RED": (128, 48, 32), "BLU": (37, 109, 141)},
+    "Waterlogged Lab Coat": {"RED": (168, 154, 140), "BLU": (131, 159, 163)},
+}
+
 
 def paint_rgb_decimal(paint_name: str):
     """
@@ -284,6 +308,25 @@ def paint_rgb_decimal(paint_name: str):
         return None
     r, g, b = rgb
     return r * 65536 + g * 256 + b
+
+
+def team_color_paint_decimals(paint_name: str):
+    """
+    Returns [RED_decimal, BLU_decimal] for one of the 7 team-coloured
+    paints (see TEAM_COLOR_PAINT_RGB above), or None if paint_name isn't
+    one of them. Two candidate values, not one, since a single painted
+    item has one fixed colour but which of the two isn't knowable from
+    the name alone - the caller tries both as separate searches (safe:
+    the wrong one just returns no matches, not wrong data - see
+    TEAM_COLOR_PAINT_RGB's own comment).
+    """
+    variants = TEAM_COLOR_PAINT_RGB.get(paint_name)
+    if variants is None:
+        return None
+    return [
+        variants["RED"][0] * 65536 + variants["RED"][1] * 256 + variants["RED"][2],
+        variants["BLU"][0] * 65536 + variants["BLU"][1] * 256 + variants["BLU"][2],
+    ]
 
 PRICES_URL = "https://backpack.tf/api/IGetPrices/v4"
 SNAPSHOT_URL = "https://backpack.tf/api/classifieds/listings/snapshot"
@@ -694,7 +737,7 @@ class BackpackTFPriceList:
 
     def _fetch_snapshot_prices(self, name: str, quality_name: str, particle_id, craftable, intent: str,
                                 spell=None, australium: bool = False, killstreak_tier=None, paint=None,
-                                killstreaker=None, sheen=None):
+                                killstreaker=None, sheen=None, paint_decimal_override=None):
         """
         Shared fetch for backpack.tf's classifieds snapshot, used for both
         sell listings (get_snapshot_min_other_keys) and buy orders
@@ -731,7 +774,15 @@ class BackpackTFPriceList:
         if _currently_rate_limited():
             return None
         name = strip_variant_prefixes(name)
-        paint_value = paint_rgb_decimal(paint) if paint else None
+        # An explicit override (one of the two RED/BLU decimals for a
+        # team-coloured paint - see team_color_paint_decimals) takes
+        # priority over resolving from the name, since team-coloured
+        # names have no single correct value to resolve to in the first
+        # place - the caller has already picked which of the two this
+        # particular attempt is trying.
+        paint_value = paint_decimal_override if paint_decimal_override is not None else (
+            paint_rgb_decimal(paint) if paint else None
+        )
         cache_key = (name, quality_name, particle_id, intent, spell, australium, killstreak_tier, paint_value,
                      killstreaker, sheen, craftable)
         cached = self._snapshot_cache.get(cache_key)
@@ -835,7 +886,7 @@ class BackpackTFPriceList:
     def get_snapshot_min_other_keys(self, name: str, quality_name: str, exclude_listing_id: str,
                                      particle_id=None, craftable=True, spell=None,
                                      australium: bool = False, killstreak_tier=None, paint=None,
-                                     killstreaker=None, sheen=None):
+                                     killstreaker=None, sheen=None, paint_decimal_override=None):
         """
         Queries backpack.tf's live classifieds snapshot for this exact item
         (same name/quality/effect/spell/australium/killstreak/paint) and
@@ -862,7 +913,8 @@ class BackpackTFPriceList:
         """
         prices = self._fetch_snapshot_prices(name, quality_name, particle_id, craftable, intent="sell",
                                               spell=spell, australium=australium, killstreak_tier=killstreak_tier,
-                                              paint=paint, killstreaker=killstreaker, sheen=sheen)
+                                              paint=paint, killstreaker=killstreaker, sheen=sheen,
+                                              paint_decimal_override=paint_decimal_override)
         if prices is None:
             return None, 0
 
@@ -874,7 +926,7 @@ class BackpackTFPriceList:
 
     def get_best_buy_order_keys(self, name: str, quality_name: str, particle_id=None, craftable=True,
                                  spell=None, australium: bool = False, killstreak_tier=None, paint=None,
-                                 killstreaker=None, sheen=None):
+                                 killstreaker=None, sheen=None, paint_decimal_override=None):
         """
         Highest current backpack.tf BUY order for this exact item, in
         keys - i.e. the best price someone is right now offering to pay
@@ -895,7 +947,8 @@ class BackpackTFPriceList:
         """
         prices = self._fetch_snapshot_prices(name, quality_name, particle_id, craftable, intent="buy",
                                               spell=spell, australium=australium, killstreak_tier=killstreak_tier,
-                                              paint=paint, killstreaker=killstreaker, sheen=sheen)
+                                              paint=paint, killstreaker=killstreaker, sheen=sheen,
+                                              paint_decimal_override=paint_decimal_override)
         if not prices:
             return None, 0
 

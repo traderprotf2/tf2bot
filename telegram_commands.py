@@ -410,6 +410,20 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
             detail_bits.append(f"{rejected_quality} не по качеству")
         if rejected_checks:
             detail_bits.append(f"{rejected_checks} отсеяно проверками точности")
+        # mannco.store-specific stages, added after a real gap in this
+        # display: 4854 received with 0 evaluated and none of the counts
+        # above accounting for it - traced to a rate-limited details
+        # lookup (now fixed with throttling, see mannco_client.py), but
+        # invisible here until these existed to show it.
+        details_failed = stats.get(f"{prefix}_details_failed", 0)
+        if details_failed:
+            detail_bits.append(f"{details_failed} не удалось получить детали предмета")
+        wrong_game = stats.get(f"{prefix}_wrong_game", 0)
+        if wrong_game:
+            detail_bits.append(f"{wrong_game} не TF2")
+        malformed = stats.get(f"{prefix}_malformed", 0)
+        if malformed:
+            detail_bits.append(f"{malformed} неполные данные")
         detail = f" ({', '.join(detail_bits)})" if detail_bits else ""
 
         lines.append(

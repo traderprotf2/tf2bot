@@ -168,6 +168,9 @@ def mannco_strange_parts(details: dict):
     return names
 
 
+_sampled_mannco_team_paint = False
+
+
 def mannco_paint(details: dict):
     """
     Same honesty caveat as mannco_spells() above, PLUS a hard game-logic
@@ -186,7 +189,16 @@ def mannco_paint(details: dict):
         return None
 
     if isinstance(raw, dict):
-        return raw.get("name")
+        name = raw.get("name")
+        global _sampled_mannco_team_paint
+        if name in bptf_client.TEAM_COLOR_PAINT_RGB and not _sampled_mannco_team_paint:
+            _sampled_mannco_team_paint = True
+            log.warning(
+                "DIAGNOSTIC SAMPLE (first team-coloured paint seen this run from mannco.store, "
+                "%r) - raw paint object: %r",
+                name, raw,
+            )
+        return name
     if isinstance(raw, str):
         return raw
     return None
@@ -730,6 +742,7 @@ class Watcher:
         price_cents = data.get("price") if event.get("event") == "listing_added" else data.get("newPrice")
 
         if item_id is None or price_cents is None or listing_id is None:
+            self.stats["mannco_malformed"] += 1
             return
         # Dedup key includes the price, not just the listing id - a price
         # CHANGE on an already-seen listing must still be evaluated fresh.
@@ -743,11 +756,24 @@ class Watcher:
             return
 
         details = await asyncio.to_thread(self.mannco.get_item_details, item_id)
-        if details is None or details.get("game") != 440:
+        if details is None:
+            # A real production log showed this bucket silently absorbing
+            # nearly an entire 5-minute window (4854 received, 0 reaching
+            # evaluation, with no specific reason accounting for the gap)
+            # - traced to mannco.store's own rate limiting on this exact
+            # call, now throttled (see mannco_client.py). Counted
+            # separately now so a repeat of that pattern is immediately
+            # visible in /stats instead of leaving another unexplained
+            # gap between received and evaluated.
+            self.stats["mannco_details_failed"] += 1
+            return
+        if details.get("game") != 440:
+            self.stats["mannco_wrong_game"] += 1
             return
 
         quality = (details.get("quality") or "").strip(" ;")
         if quality not in self.runtime.watched_qualities:
+            self.stats["mannco_rejected_quality"] += 1
             return
 
         particle_id = None
@@ -884,6 +910,23 @@ class Watcher:
         paint_obj = item.get("paint") or {}
         raw_paint = paint_obj.get("name") if isinstance(paint_obj, dict) else None
         paint = raw_paint if slot in COSMETIC_SLOTS else None
+
+        if paint and paint in bptf_client.TEAM_COLOR_PAINT_RGB and "bptf_team_paint" not in self._sampled_item_kinds:
+            self._sampled_item_kinds.add("bptf_team_paint")
+            # Real production evidence (a Steam econ-item parsing library,
+            # danocmx/node-tf2-item-format) shows Steam's OWN raw item
+            # description carries a single "Paint Color: <hex>" string per
+            # item, not two RED/BLU alternatives - meaning there may be a
+            # direct colour/hex field on THIS payload's paint object too,
+            # which would be the correct single value to search with
+            # instead of guessing between the two RGB variants (see
+            # team_color_paint_decimals in matcher.py's evaluate_listing).
+            # Logging the FULL raw object here, once, to find out.
+            log.warning(
+                "DIAGNOSTIC SAMPLE (first team-coloured paint seen this run, %r) - "
+                "raw paint object: %r",
+                paint, paint_obj,
+            )
         raw_killstreak_tier = item.get("killstreakTier")
         killstreak_tier = raw_killstreak_tier if slot in WEAPON_SLOTS else None
 

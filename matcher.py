@@ -35,6 +35,7 @@ from bptf_client import (
     strip_killstreak_prefix,
     strip_quality_prefix,
     strip_variant_prefixes,
+    team_color_paint_decimals,
 )
 
 log = logging.getLogger("matcher")
@@ -152,7 +153,7 @@ def filter_spells_for_category(spells, category: str):
 
 def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, spell, australium,
                                killstreak_tier, min_other_listings, exclude_listing_id="",
-                               paint=None, killstreaker=None, sheen=None):
+                               paint=None, killstreaker=None, sheen=None, paint_decimal_override=None):
     """
     Live-snapshot-ONLY reference price lookup. Used both for the item
     actually being evaluated, and (in check_killstreak_tier_pricing
@@ -177,6 +178,7 @@ def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, 
         particle_id=particle_id, craftable=craftable, spell=spell,
         australium=australium, killstreak_tier=killstreak_tier,
         paint=paint, killstreaker=killstreaker, sheen=sheen,
+        paint_decimal_override=paint_decimal_override,
     )
 
     if ref_keys is not None and other_count >= min_other_listings:
@@ -350,7 +352,13 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
     # Unusual-particle-id check above - costs missing this one item, but
     # protects both this item's own accuracy and the whole system's
     # request budget from a cascade like that repeating.
-    if listing.paint and paint_rgb_decimal(listing.paint) is None:
+    # Team-coloured paints (Team Spirit and 6 others) get a SEPARATE path
+    # below - a real production log showed these being common enough on
+    # real Unusual listings that skipping every one outright was costing
+    # a meaningful share of genuine opportunities, not just a rare edge
+    # case. Anything else unmapped still gets skipped exactly as before.
+    team_color_decimals = team_color_paint_decimals(listing.paint) if listing.paint else None
+    if listing.paint and team_color_decimals is None and paint_rgb_decimal(listing.paint) is None:
         log.warning(
             "Skipping %s (%s) - paint %r has no known RGB value, so it can't be filtered "
             "for in comparisons; proceeding without the filter risks comparing against the "
@@ -369,12 +377,38 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
     australium = lookup_name.startswith("Australium ")
 
     exclude_id = listing.listing_id if listing.source == "backpack.tf" else ""
-    ref_keys = _get_reference_price_keys(
-        bptf, lookup_name, listing.quality, listing.particle_id, listing.craftable,
-        spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
-        min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
-        paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
-    )
+
+    # A single painted item has ONE fixed colour (confirmed: a real user's
+    # own item "shows as only the red team spirit and not both" on a
+    # backpack.tf forum post), but which of RED/BLU isn't knowable from
+    # the paint name alone - try RED first, then BLU only if RED found
+    # nothing. Trying the wrong one first just costs one extra request
+    # (backpack.tf's own paint= filter returns no matches for the wrong
+    # colour, never wrong data - see TEAM_COLOR_PAINT_RGB's own comment),
+    # it can't produce a bad comparison the way skipping the filter
+    # entirely did. Whichever decimal succeeds here is reused for the
+    # buy-order lookup below too, so both numbers describe the same
+    # colour, not two different guesses.
+    winning_paint_decimal = None
+    if team_color_decimals:
+        for candidate in team_color_decimals:
+            ref_keys = _get_reference_price_keys(
+                bptf, lookup_name, listing.quality, listing.particle_id, listing.craftable,
+                spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
+                min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
+                paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
+                paint_decimal_override=candidate,
+            )
+            if ref_keys is not None:
+                winning_paint_decimal = candidate
+                break
+    else:
+        ref_keys = _get_reference_price_keys(
+            bptf, lookup_name, listing.quality, listing.particle_id, listing.craftable,
+            spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
+            min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
+            paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
+        )
 
     if ref_keys is None or ref_keys <= 0:
         return None
@@ -453,6 +487,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
         lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable,
         spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
         paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
+        paint_decimal_override=winning_paint_decimal,
     )
     flip_profit_keys = None
     if buy_order_keys is not None:
