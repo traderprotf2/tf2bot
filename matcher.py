@@ -38,6 +38,11 @@ from bptf_client import (
 
 log = logging.getLogger("matcher")
 
+# Set once by evaluate_listing the first time it finds no image mapping at
+# all loaded - see the image_url block below. Module-level (not per-Watcher-
+# instance) since matcher.py's functions are plain functions, not methods.
+_logged_no_image_mapping = False
+
 
 @dataclass
 class NormalizedListing:
@@ -269,6 +274,8 @@ def is_watched(listing: NormalizedListing, cfg: dict) -> bool:
         return False
     if listing.category not in cfg.get("watched_categories", ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"]):
         return False
+    if cfg.get("australium_only") and not (listing.name or "").startswith("Australium "):
+        return False
     if listing.extra_excluded_hint:
         return False
     item_type = (listing.item_type or "")
@@ -284,6 +291,21 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
     if not is_watched(listing, cfg):
         return None
     if listing.price_keys is None or listing.price_keys < cfg["min_price_keys"]:
+        return None
+
+    # Killstreak Kits/Fabricators are skipped entirely, before any API
+    # calls - the same limitation that already meant no search LINK could
+    # be generated for them (backpack.tf's own community confirms these
+    # need the special "Find recipes where the output item is used on
+    # this item" flow, not a normal item= search) very plausibly applies
+    # to the price-lookup snapshot API too, not just the webpage - and a
+    # real production log showed repeated failed snapshot requests
+    # specifically for Kit items. Rather than keep spending request
+    # budget (and contributing to rate-limit pressure for everything
+    # else) on a category whose pricing can't be trusted to begin with,
+    # this is skipped outright until there's real evidence of a working
+    # way to price Kits specifically.
+    if listing.category == "killstreak_kit":
         return None
 
     # Unusuals need a resolved particle id to compare like-for-like - EXCEPT
@@ -388,23 +410,16 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
     # already puts the exact listing that triggered the alert first, and
     # dropping the steamid filter shows the surrounding market too.
     #
-    # Killstreak Kits/Fabricators are the one category this link can't
-    # serve: backpack.tf doesn't allow a normal item= search for them at
-    # all - the community's own guidance is to use the classifieds filter
-    # modal's "Find recipes where the output item is used on this item"
-    # flow instead, which has no URL-parameter equivalent. Showing a
-    # normal-looking link that quietly returns nothing would be worse
-    # than no link, so this case is skipped rather than guessed at.
-    if listing.category == "killstreak_kit":
-        backpacktf_search_link = None
-    else:
-        backpacktf_search_link = build_classifieds_url(
-            lookup_name, listing.quality, listing.particle_id,
-            killstreak_tier=listing.killstreak_tier,
-            australium=australium, spell=primary_spell,
-            paint=listing.paint, craftable=listing.craftable,
-            killstreaker=listing.killstreaker, sheen=listing.sheen,
-        )
+    # (Killstreak Kits/Fabricators never reach this point at all now - see
+    # the early return near the top of this function - so no special-case
+    # is needed here anymore.)
+    backpacktf_search_link = build_classifieds_url(
+        lookup_name, listing.quality, listing.particle_id,
+        killstreak_tier=listing.killstreak_tier,
+        australium=australium, spell=primary_spell,
+        paint=listing.paint, craftable=listing.craftable,
+        killstreaker=listing.killstreaker, sheen=listing.sheen,
+    )
 
     # Real item picture for the Telegram alert, straight from Valve's own
     # schema (confirmed OK to hotlink directly - see steam_schema.py).
@@ -418,6 +433,24 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
     if name_to_image_url:
         bare_name_for_image = strip_variant_prefixes(lookup_name)
         image_url = name_to_image_url.get(lookup_name) or name_to_image_url.get(bare_name_for_image)
+        if image_url is None:
+            log.warning(
+                "No image found for %s - tried %r and %r against %d loaded names. If this "
+                "keeps happening for real items, the schema's name format may not match either "
+                "of these.",
+                listing.name, lookup_name, bare_name_for_image, len(name_to_image_url),
+            )
+    elif listing.source != "stntrading.eu":
+        # stntrading.eu genuinely has no schema-backed name resolution path
+        # here, so staying silent for it is correct - but any OTHER source
+        # having no mapping at all usually means steam_api_key is missing
+        # or the schema fetch failed. Logged once (not per-item, which
+        # would spam identically on every single alert if the key is
+        # simply not configured) so it's still discoverable via /errors.
+        global _logged_no_image_mapping
+        if not _logged_no_image_mapping:
+            _logged_no_image_mapping = True
+            log.warning("No image mapping loaded at all - alerts will have no pictures until this is fixed.")
 
     # Priority flag - Unusuals are the most liquid and highest-margin
     # category, worth calling out so they're not lost in a busy chat;

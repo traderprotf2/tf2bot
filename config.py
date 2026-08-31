@@ -65,7 +65,7 @@ DEFAULTS = {
 
     # Item types to always ignore (case-insensitive substring match against
     # the item's "type" field returned by Mannco.store).
-    "excluded_types": ["War Paint"],
+    "excluded_types": ["War Paint", "Badge"],
 
     # Minimum item value to bother alerting on, expressed in TF2 keys.
     "min_price_keys": 5,
@@ -131,10 +131,21 @@ DEFAULTS = {
     "max_days_since_price_update": 90,
 
     # --- Operational settings ---
-    # How often (seconds) to refresh the backpack.tf price list and the
-    # mannco.store key exchange rate. Price data doesn't change second to
-    # second, so every 10-15 minutes is plenty.
+    # How often (seconds) to refresh backpack.tf's whole price list -
+    # this genuinely does change often enough to need re-checking every
+    # 10-15 minutes (unlike the key price below, which is its own,
+    # separate, much slower cadence).
     "price_refresh_seconds": 900,
+
+    # How often (seconds) to refresh the mannco.store key USD price
+    # specifically - separate from the line above on purpose, per direct
+    # feedback that this was refreshing every 15 minutes despite the
+    # key's own price being stable week to week, and each attempt is a
+    # real mannco.store API round-trip that can fail on its own (adding
+    # log noise for no benefit). Defaults to once a week; the last
+    # successfully-fetched value is kept and reused between refreshes,
+    # including if a given weekly attempt fails.
+    "key_price_refresh_seconds": 7 * 24 * 3600,
 
     # How often (seconds) to re-check the mannco.store login (JWT) is valid.
     "jwt_refresh_seconds": 3600,

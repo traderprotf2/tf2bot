@@ -9,7 +9,7 @@
 
   "watched_qualities": ["Unusual", "Strange", "Unique"],
   "watched_categories": ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"],
-  "excluded_types": ["War Paint"],
+  "excluded_types": ["War Paint", "Badge"],
   "min_price_keys": 5,
   "discount_threshold_percent": 5,
   "min_other_listings": 1,
@@ -23,6 +23,7 @@
   "stntrading_poll_seconds": 300,
 
   "price_refresh_seconds": 900,
+  "key_price_refresh_seconds": 604800,
   "jwt_refresh_seconds": 3600,
   "seen_listings_max": 20000,
   "snapshot_cache_seconds": 20,

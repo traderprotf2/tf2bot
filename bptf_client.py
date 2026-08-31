@@ -407,8 +407,15 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
         params["quality"] = quality_id
     if particle_id is not None:
         params["particle"] = particle_id
-    if spell:
-        params["spell"] = spell
+    # Always present, not just when there IS a spell - confirmed directly
+    # by the user testing backpack.tf's own spell filter and sharing the
+    # resulting URL: "spell=None" (literally that string) is the real
+    # sentinel for "must have no spell", the same convention as
+    # australium=-1/killstreak_tier=0 below. Before this, an item with no
+    # spell just omitted the param entirely, which doesn't tell
+    # backpack.tf's search to exclude spelled listings - only including
+    # spell=None does that.
+    params["spell"] = spell if spell else "None"
     if killstreaker:
         params["killstreaker"] = killstreaker
     if sheen:
@@ -692,8 +699,14 @@ class BackpackTFPriceList:
             params["quality"] = quality_id
         if particle_id is not None:
             params["particle"] = particle_id
-        if spell:
-            params["spell"] = spell
+        # Same "always present" reasoning as build_classifieds_url above -
+        # spell=None (confirmed real by testing the site's own filter) is
+        # the correct way to ask for "no spell", now that this is known.
+        # The client-side filter a few lines below this call (checking
+        # each returned listing's own spell data) is kept as a defensive
+        # backup regardless - cheap insurance if this param is ever
+        # ignored or behaves unexpectedly, not a sign it's not trusted.
+        params["spell"] = spell if spell else "None"
         if paint_value is not None:
             params["paint"] = paint_value
         if killstreaker:
@@ -722,6 +735,25 @@ class BackpackTFPriceList:
             price_keys = self.currencies_to_keys(currencies)
             if price_keys is None:
                 continue
+            if not spell:
+                # We asked for "no particular spell" (spell=None omits the
+                # filter entirely) - but per backpack.tf's own forum, there
+                # is no confirmed way to tell their search "must have NO
+                # spell" the way australium=-1/killstreak_tier=0 mean "not
+                # applicable" for those - the only documented way to
+                # exclude spelled items is the next.backpack.tf interactive
+                # filter UI, which (like everything else there) doesn't
+                # translate to a URL param. So when evaluating a spell-less
+                # item, a returned listing that DOES carry a spell has to be
+                # dropped here, client-side - otherwise a spell-less item's
+                # reference/buy-order price can get contaminated by a
+                # spelled listing's (often much higher) price, exactly a
+                # real report: a buy order that was actually for a SPELLED
+                # copy got shown as if it applied to a plain one.
+                listing_item = listing.get("item") or {}
+                listing_spells = listing_item.get("spells")
+                if listing_spells:
+                    continue
             prices.append((listing_id, price_keys))
 
         self._snapshot_cache[cache_key] = (now, prices)

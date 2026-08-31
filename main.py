@@ -287,6 +287,8 @@ class Watcher:
 
     def refresh_prices(self):
         self.bptf.refresh()
+
+    def refresh_mannco_key_price(self):
         rate = self.mannco.get_key_price_usd_cents()
         if rate:
             self.mannco_key_usd_cents = rate
@@ -301,6 +303,25 @@ class Watcher:
             except Exception:
                 log.exception("Price refresh failed, will retry next cycle.")
             await asyncio.sleep(self.cfg["price_refresh_seconds"])
+
+    async def key_price_refresh_loop(self):
+        """
+        The mannco.store key price gets its own, much slower refresh
+        cadence, separate from price_refresh_loop above - a real
+        complaint that this was refreshing every 15 minutes (the same
+        cadence as backpack.tf's whole price list, which genuinely does
+        need to be that fresh) despite the key's own USD price being
+        stable week to week. Each attempt is a full mannco.store API
+        round-trip (auth + request) that can fail on its own and was
+        contributing repeated identical warnings to the logs for no real
+        benefit - see key_price_refresh_seconds in config.py.
+        """
+        while True:
+            try:
+                await asyncio.to_thread(self.refresh_mannco_key_price)
+            except Exception:
+                log.exception("mannco.store key price refresh failed, will retry next cycle.")
+            await asyncio.sleep(self.cfg.get("key_price_refresh_seconds", 7 * 24 * 3600))
 
     async def health_check_loop(self):
         """
@@ -915,12 +936,16 @@ class Watcher:
             if command in ("menu", "settings", "start"):
                 menu_text, keyboard = telegram_commands.build_main_menu(self.runtime)
                 await asyncio.to_thread(self.telegram.send, menu_text, keyboard)
+            elif command == "errors":
+                # Sent WITH a keyboard (pagination buttons) - unlike the
+                # other typed commands below, which are plain text.
+                errors_text, keyboard = telegram_commands.build_errors_view(_error_buffer.recent(100))
+                await asyncio.to_thread(self.telegram.send, errors_text, keyboard)
             else:
                 reply = telegram_commands.handle_command(
                     text, self.runtime, has_stn_key=bool(self.cfg.get("stntrading_api_key")),
                     stats=self.stats, stats_since=self.stats_since,
                     currently_rate_limited=bptf_client.is_rate_limited(),
-                    error_entries=_error_buffer.recent(50),
                 )
                 log.info("Telegram command: %r -> %s", text, reply.splitlines()[0])
                 await asyncio.to_thread(self.telegram.send, reply)
@@ -932,7 +957,9 @@ class Watcher:
                     self.stats_since = time.time()
 
         elif event["type"] == "callback_query":
-            menu_text, keyboard = telegram_commands.handle_callback(event["data"], self.runtime)
+            menu_text, keyboard = telegram_commands.handle_callback(
+                event["data"], self.runtime, error_entries=_error_buffer.recent(100)
+            )
             log.info("Telegram button: %r", event["data"])
             # Answer first so Telegram clears the button's loading spinner
             # even if the edit below is slow or fails.
@@ -1005,10 +1032,20 @@ class Watcher:
             # rather than crash-and-let-systemd-restart over it.
             log.exception("Initial price load failed - continuing anyway, will retry on schedule.")
 
+        try:
+            # Fetched once immediately here too (not just on
+            # key_price_refresh_loop's own, much slower schedule) so a
+            # price is available right away at startup, rather than
+            # leaving mannco_key_usd_cents unset for up to a week.
+            await asyncio.to_thread(self.refresh_mannco_key_price)
+        except Exception:
+            log.exception("Initial mannco.store key price load failed - continuing anyway, will retry on schedule.")
+
         await self._startup_sanity_check()
 
         await asyncio.gather(
             self.price_refresh_loop(),
+            self.key_price_refresh_loop(),
             self.telegram_command_loop(),
             self.health_check_loop(),
             self.marketplacetf_poll_loop(),

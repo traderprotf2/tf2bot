@@ -138,12 +138,30 @@ class ManncoClient:
         """
         try:
             data = self._get(f"/item/pricing/{item_identifier}")
-        except requests.HTTPError as e:
+        except Exception as e:
+            # Was requests.HTTPError only - broadened to catch everything
+            # (including a RuntimeError from login() failing outright, or
+            # any other unexpected failure) after a real production log
+            # showed this failing silently and *consistently* for hours,
+            # with none of the expected log messages appearing - meaning
+            # whatever went wrong wasn't even reaching the code below to
+            # be diagnosed. Catching broadly here at least guarantees SOME
+            # log line for every failure mode, not just HTTP-level ones.
             log.warning("Failed to fetch pricing for %s: %s", item_identifier, e)
             return None
-        if not data.get("success"):
+        if not isinstance(data, dict) or not data.get("success"):
+            log.warning(
+                "mannco.store pricing for %s came back unsuccessful - raw response: %r",
+                item_identifier, data,
+            )
             return None
-        return data["content"].get("pricing")
+        pricing = (data.get("content") or {}).get("pricing")
+        if not pricing:
+            log.warning(
+                "mannco.store pricing for %s had no 'pricing' field - raw content: %r",
+                item_identifier, data.get("content"),
+            )
+        return pricing
 
     def get_key_price_usd_cents(self):
         """
@@ -159,4 +177,9 @@ class ManncoClient:
             value = pricing.get(field)
             if value:
                 return value
+        log.warning(
+            "mannco.store key pricing had none of the expected fields (lowest_sale_price/"
+            "suggested_price/steam_price) - raw pricing dict: %r",
+            pricing,
+        )
         return None

@@ -49,6 +49,7 @@ HELP_TEXT = (
     "/liquidity [число] — игнорировать предметы без переоценки цены дольше N дней\n"
     "/qualities, /addquality Название, /removequality Название\n"
     "/categories, /addcategory weapon|cosmetic|taunt|killstreak_kit|other, /removecategory ...\n"
+    "/australium — переключить режим \"только Australium-оружие\" (в меню: кнопка внутри Категорий)\n"
     "/watchstn Название, /unwatchstn Название, /stnwatchlist — точечно следить за "
     "предметом на stntrading.eu (нужен STN Premium, иначе просто ничего не найдёт)\n"
     "/help — это сообщение"
@@ -166,7 +167,9 @@ def build_categories_menu(runtime):
         "weapon = оружие, cosmetic = шапки/аксессуары, taunt = насмешки,\n"
         "killstreak_kit = наборы киллстриков (обычно Unique-качества — "
         "включи ещё и Unique в /qualities, иначе они не пройдут фильтр "
-        "по качеству), other = всё остальное"
+        "по качеству), other = всё остальное\n\n"
+        f"Только Australium-оружие: {'✅ включено' if runtime.australium_only else '⬜ выключено'} "
+        "(если включено, показывает только Australium, игнорируя категории/качества выше)"
     )
     keyboard = []
     row = []
@@ -178,6 +181,8 @@ def build_categories_menu(runtime):
             row = []
     if row:
         keyboard.append(row)
+    australium_mark = "✅" if runtime.australium_only else "⬜"
+    keyboard.append([{"text": f"{australium_mark} Только Australium", "callback_data": "t:australium"}])
     keyboard.append([{"text": "⬅️ Назад", "callback_data": "m:main"}])
     return text, keyboard
 
@@ -255,10 +260,16 @@ def build_liquidity_menu(runtime):
     return text, keyboard
 
 
-def handle_callback(data: str, runtime):
+def handle_callback(data: str, runtime, error_entries=None):
     """Applies one button tap and returns (text, keyboard) for the menu
     screen to show afterwards (the caller edits the tapped message in
     place with this)."""
+    if data.startswith("e:p:"):
+        try:
+            page = int(data[4:])
+        except ValueError:
+            page = 0
+        return build_errors_view(error_entries or [], page)
     if data == "m:main":
         return build_main_menu(runtime)
     if data == "m:qual":
@@ -292,6 +303,11 @@ def handle_callback(data: str, runtime):
             runtime.watched_categories.remove(category)
         elif category in VALID_CATEGORIES:
             runtime.watched_categories.append(category)
+        runtime.save()
+        return build_categories_menu(runtime)
+
+    if data == "t:australium":
+        runtime.australium_only = not runtime.australium_only
         runtime.save()
         return build_categories_menu(runtime)
 
@@ -405,36 +421,58 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
     return header + "\n".join(lines)
 
 
-def _format_errors(error_entries) -> str:
-    """
-    Shows the most recent WARNING+ log entries captured by
-    error_log.TelegramErrorBuffer - so "something looks wrong" can be
-    checked directly in Telegram instead of needing SSH+journalctl every
-    time (that still has the full, unfiltered log if more context is
-    needed - this is specifically the filtered subset worth attention).
-    Newest first, since that's usually what you want when checking in
-    right after noticing a problem.
+ERRORS_PAGE_SIZE = 15
 
-    Capped to the last 15 regardless of how many are passed in - even at
-    the buffer's full 100-entry capacity, showing all of them at ~220
-    chars each could exceed Telegram's 4096-char message limit.
-    """
-    if not error_entries:
-        return "Ошибок и предупреждений не было (или бот только что запущен)."
 
+def build_errors_view(error_entries, page: int = 0):
+    """
+    Paginated /errors view - text + an inline keyboard with ◀️/▶️ buttons.
+    Page 0 is the newest ERRORS_PAGE_SIZE entries; higher page numbers go
+    further back in time. error_entries is oldest-first (as stored by
+    error_log.TelegramErrorBuffer), so page 0 is the END of that list.
+    """
     import datetime
 
-    shown = list(error_entries)[-15:]
-    lines = [f"⚠️ <b>Последние {len(shown)} из {len(error_entries)} предупреждений/ошибок</b> (сначала новые):\n"]
+    if not error_entries:
+        return "Ошибок и предупреждений не было (или бот только что запущен).", []
+
+    total = len(error_entries)
+    total_pages = max(1, (total + ERRORS_PAGE_SIZE - 1) // ERRORS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+
+    end = total - page * ERRORS_PAGE_SIZE
+    start = max(0, end - ERRORS_PAGE_SIZE)
+    shown = error_entries[start:end]
+
+    lines = [
+        f"⚠️ <b>Предупреждения/ошибки {start + 1}-{end} из {total}</b> "
+        f"(стр. {page + 1}/{total_pages}, сначала новые):\n"
+    ]
     for entry in reversed(shown):
-        ts = datetime.datetime.fromtimestamp(entry.get("time", 0)).strftime("%H:%M:%S")
+        ts = datetime.datetime.fromtimestamp(entry.get("time", 0)).strftime("%d.%m %H:%M:%S")
         level = entry.get("level", "?")
         logger_name = entry.get("logger", "?")
         message = entry.get("message", "")
         if len(message) > 220:
             message = message[:220] + "…"
         lines.append(f"[{ts}] <b>{level}</b> {logger_name}: {message}")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+
+    nav_row = []
+    if page < total_pages - 1:
+        nav_row.append({"text": "◀️ Старее", "callback_data": f"e:p:{page + 1}"})
+    if page > 0:
+        nav_row.append({"text": "Новее ▶️", "callback_data": f"e:p:{page - 1}"})
+    keyboard = [nav_row] if nav_row else []
+    return text, keyboard
+
+
+def _format_errors(error_entries) -> str:
+    """Kept for any caller still wanting a plain-text version (e.g. a
+    non-Telegram context) - the real /errors command now uses
+    build_errors_view above for pagination."""
+    text, _ = build_errors_view(list(error_entries) if error_entries else [], page=0)
+    return text
 
 
 def handle_command(text: str, runtime, has_stn_key: bool = False, stats=None, stats_since=None,
@@ -456,6 +494,7 @@ def handle_command(text: str, runtime, has_stn_key: bool = False, stats=None, st
 
     if command == "status":
         state = "⏸ на паузе" if runtime.paused else "▶️ работает"
+        australium_line = "\nТолько Australium: ✅ включено" if runtime.australium_only else ""
         return (
             f"{state}\n"
             f"Минимальная цена: {runtime.min_price_keys:g} ключей\n"
@@ -463,7 +502,14 @@ def handle_command(text: str, runtime, has_stn_key: bool = False, stats=None, st
             f"Порог ликвидности: {runtime.max_days_since_price_update:g} дн.\n"
             f"Качества: {', '.join(runtime.watched_qualities) or '(пусто)'}\n"
             f"Категории: {', '.join(runtime.watched_categories) or '(пусто)'}"
+            f"{australium_line}"
         )
+
+    if command == "australium":
+        runtime.australium_only = not runtime.australium_only
+        runtime.save()
+        state = "включён - показываю только Australium-оружие" if runtime.australium_only else "выключен"
+        return f"Режим \"только Australium\" {state}."
 
     if command == "pause":
         runtime.paused = True

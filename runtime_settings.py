@@ -28,8 +28,9 @@ STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_s
 class RuntimeSettings:
     def __init__(self, min_price_keys, watched_qualities, watched_categories,
                  discount_threshold_percent, max_days_since_price_update,
-                 stn_watchlist=None, paused=False):
+                 stn_watchlist=None, paused=False, australium_only=False):
         self.paused = paused
+        self.australium_only = australium_only
         self.min_price_keys = min_price_keys
         self.watched_qualities = list(watched_qualities)
         self.watched_categories = list(watched_categories)
@@ -60,6 +61,7 @@ class RuntimeSettings:
                 with open(STATE_PATH, "r", encoding="utf-8") as f:
                     saved = json.load(f)
                 settings.paused = bool(saved.get("paused", settings.paused))
+                settings.australium_only = bool(saved.get("australium_only", settings.australium_only))
                 settings.min_price_keys = float(saved.get("min_price_keys", settings.min_price_keys))
                 settings.watched_qualities = list(saved.get("watched_qualities", settings.watched_qualities))
                 watched_categories = list(saved.get("watched_categories", settings.watched_categories))
@@ -84,6 +86,7 @@ class RuntimeSettings:
         with self._lock:
             data = {
                 "paused": self.paused,
+                "australium_only": self.australium_only,
                 "min_price_keys": self.min_price_keys,
                 "watched_qualities": self.watched_qualities,
                 "watched_categories": self.watched_categories,
