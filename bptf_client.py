@@ -43,6 +43,50 @@ log = logging.getLogger("bptf")
 MAX_CONCURRENT_REQUESTS = 4
 _request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
 
+# A cap on CONCURRENT requests alone doesn't cap the SUSTAINED rate over
+# time - 4 requests in flight, each finishing quickly and immediately
+# replaced by the next one queued, can still add up to well more than
+# backpack.tf tolerates per second, minute after minute. A real
+# production log showed sustained 429s cycling through the entire
+# adaptive backoff range (10s doubling up to the 300s ceiling) repeatedly
+# over 90+ minutes straight - not occasional bursts, a continuous
+# pattern - which is exactly what "concurrency capped but rate
+# unthrottled" looks like. This enforces a minimum gap between when each
+# request STARTS, smoothing the actual request rate directly instead of
+# just hoping a low concurrency cap implies a low enough rate. No
+# confirmed exact number for backpack.tf's real limit, so this is a
+# deliberately conservative starting point - see _throttle_request_rate.
+_MIN_REQUEST_INTERVAL_SECONDS = 0.4
+_last_request_started_lock = threading.Lock()
+_last_request_started_at = 0.0
+
+
+def configure_request_pacing(max_concurrent: int, min_interval_seconds: float):
+    """
+    Called once at startup (see main.py) with cfg["bptf_max_concurrent_
+    requests"] / cfg["bptf_min_request_interval_seconds"], so these are
+    tunable from config.json without editing this file - both were
+    hardcoded here originally; exposed after real, repeated rate-limit
+    troubleshooting made clear these are exactly the kind of knob worth
+    adjusting without a code change. Safe to call before any real
+    request has been made (which is when main.py calls it) - rebuilds
+    the semaphore at the new capacity, not just relabels the constant.
+    """
+    global MAX_CONCURRENT_REQUESTS, _request_semaphore, _MIN_REQUEST_INTERVAL_SECONDS
+    MAX_CONCURRENT_REQUESTS = max_concurrent
+    _request_semaphore = threading.Semaphore(max_concurrent)
+    _MIN_REQUEST_INTERVAL_SECONDS = min_interval_seconds
+
+
+def _throttle_request_rate():
+    global _last_request_started_at
+    with _last_request_started_lock:
+        now = time.time()
+        wait = _last_request_started_at + _MIN_REQUEST_INTERVAL_SECONDS - now
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_started_at = time.time()
+
 # On top of capping concurrency, back off entirely for a bit once
 # backpack.tf actually returns 429 - real production logs showed repeated
 # 429s in quick succession right as they started, meaning concurrency
@@ -127,12 +171,14 @@ def _get_with_retry(session, url, params, timeout=20):
     for what might just be a one-second blip.
     """
     with _request_semaphore:
+        _throttle_request_rate()
         resp = session.get(url, params=params, timeout=timeout)
     if resp.status_code == 429:
         _note_rate_limited()
     elif resp.status_code >= 500:
         time.sleep(1.5)
         with _request_semaphore:
+            _throttle_request_rate()
             resp = session.get(url, params=params, timeout=timeout)
         if resp.status_code == 429:
             _note_rate_limited()
@@ -178,9 +224,19 @@ VALID_SHEENS = [
 # decimal here would make the search link look precise while actually
 # filtering to the wrong colour, worse than not filtering at all, so
 # this was worth re-verifying properly rather than trusting one source.
-# Team-coloured paints (different RGB per RED/BLU) are left out - which
-# team a listing is on isn't something this project tracks, and picking
-# the wrong one would be worse than not filtering by paint at all.
+# Team-coloured paints (different RGB per RED/BLU) are left out - not
+# because they're unmapped, but because a SINGLE RGB value genuinely
+# doesn't exist for them: the colour shown depends on which team the
+# CURRENT wearer is on during gameplay, not a fixed value chosen when
+# the paint was applied - there's no "one correct decimal" to encode for
+# an item sitting in a listing. Confirmed complete, not partial: Valve's
+# own wiki states Paint Cans come in exactly 29 colours total; this
+# table's 22 entries plus the 7 team-coloured ones (An Air of Debonair,
+# Balaclavas Are Forever, Cream Spirit, Operator's Overalls, Team
+# Spirit, The Value of Teamwork, Waterlogged Lab Coat) account for all
+# 29 - there is nothing missing here to "add", the 7 are correctly
+# excluded on principle (evaluate_listing skips rather than guesses at
+# them - see the paint_rgb_decimal() check there), not a gap.
 PAINT_NAME_TO_RGB = {
     "A Color Similar to Slate": (47, 79, 79),
     "A Deep Commitment to Purple": (125, 64, 113),
@@ -677,7 +733,7 @@ class BackpackTFPriceList:
         name = strip_variant_prefixes(name)
         paint_value = paint_rgb_decimal(paint) if paint else None
         cache_key = (name, quality_name, particle_id, intent, spell, australium, killstreak_tier, paint_value,
-                     killstreaker, sheen)
+                     killstreaker, sheen, craftable)
         cached = self._snapshot_cache.get(cache_key)
         now = time.time()
         if cached and (now - cached[0]) < self.snapshot_cache_seconds:
@@ -735,6 +791,24 @@ class BackpackTFPriceList:
             price_keys = self.currencies_to_keys(currencies)
             if price_keys is None:
                 continue
+
+            listing_item = listing.get("item") or {}
+
+            # Verify craftable status client-side too, not just via the
+            # `craftable` request param above - same reasoning as the
+            # spell check below: a real report showed buy orders for
+            # CRAFTABLE Flip-Flops being used as if they applied to a
+            # NON-Craftable listing, right after the same kind of gap was
+            # found and fixed for spells. Rather than assume this one
+            # request param is reliably honored by backpack.tf's search
+            # (spell's very existence as a param didn't mean "omit it"
+            # correctly excluded spelled items either), checking each
+            # returned listing's own craftable flag directly is a small,
+            # cheap way to be sure rather than hope.
+            listing_craftable = listing_item.get("craftable")
+            if listing_craftable is not None and bool(listing_craftable) != bool(craftable):
+                continue
+
             if not spell:
                 # We asked for "no particular spell" (spell=None omits the
                 # filter entirely) - but per backpack.tf's own forum, there
@@ -750,7 +824,6 @@ class BackpackTFPriceList:
                 # spelled listing's (often much higher) price, exactly a
                 # real report: a buy order that was actually for a SPELLED
                 # copy got shown as if it applied to a plain one.
-                listing_item = listing.get("item") or {}
                 listing_spells = listing_item.get("spells")
                 if listing_spells:
                     continue
@@ -880,7 +953,7 @@ class BackpackTFPriceList:
         simply comes back empty and callers skip the feature - it won't
         silently show a wrong number for the wrong effect.
         """
-        cache_key = (name, quality_name, particle_id)
+        cache_key = (name, quality_name, particle_id, craftable)
         cached = self._history_cache.get(cache_key)
         now = time.time()
         if cached and (now - cached[0]) < self.snapshot_cache_seconds:

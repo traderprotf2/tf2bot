@@ -195,6 +195,10 @@ def mannco_paint(details: dict):
 class Watcher:
     def __init__(self, cfg):
         self.cfg = cfg
+        bptf_client.configure_request_pacing(
+            cfg.get("bptf_max_concurrent_requests", 4),
+            cfg.get("bptf_min_request_interval_seconds", 0.4),
+        )
         self.bptf = bptf_client.BackpackTFPriceList(
             cfg["backpacktf_api_key"],
             cfg.get("backpacktf_token", ""),

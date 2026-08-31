@@ -31,6 +31,7 @@ from bptf_client import (
     build_classifieds_url,
     is_rate_limited,
     name_for_killstreak_tier,
+    paint_rgb_decimal,
     strip_killstreak_prefix,
     strip_quality_prefix,
     strip_variant_prefixes,
@@ -327,6 +328,36 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
         return None
 
     lookup_name = strip_quality_prefix(listing.name, listing.quality)
+
+    # A painted item whose exact colour we can't resolve to RGB must NOT
+    # proceed with an unfiltered comparison - the paint param would
+    # silently get omitted from every downstream query, comparing this
+    # specific painted item's price against an undifferentiated pool
+    # (every OTHER colour, plus unpainted) instead of the same colour
+    # specifically. A real production incident showed exactly this
+    # cascade: several differently-painted copies of the same cosmetic
+    # (one of them "Team Spirit", a team-coloured paint with no single
+    # universal RGB value - team-coloured paints are excluded from the
+    # table on purpose, see PAINT_NAME_TO_RGB) all landed on nearly
+    # identical, wrong reference/buy-order numbers because none of them
+    # were actually being paint-filtered - flooding alerts with false
+    # "discounts" and, because every one of those still burned a full
+    # round of API calls, contributing to backpack.tf's rate limit
+    # escalating all the way to its 300s ceiling, which then starved
+    # everything ELSE of a fair chance to be evaluated too. Skipping here
+    # - the same "can't safely compare, so don't guess" principle as the
+    # Unusual-particle-id check above - costs missing this one item, but
+    # protects both this item's own accuracy and the whole system's
+    # request budget from a cascade like that repeating.
+    if listing.paint and paint_rgb_decimal(listing.paint) is None:
+        log.warning(
+            "Skipping %s (%s) - paint %r has no known RGB value, so it can't be filtered "
+            "for in comparisons; proceeding without the filter risks comparing against the "
+            "wrong (unfiltered) pool.",
+            listing.name, listing.source, listing.paint,
+        )
+        return None
+
     spells = filter_spells_for_category(listing.spells, listing.category)
     # backpack.tf's search only takes one spell value - a real, confirmed
     # search the user built by hand includes `spell=<name>` and it's this

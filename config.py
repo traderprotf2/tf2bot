@@ -15,12 +15,16 @@ DEFAULTS = {
     # --- API keys (required) ---
     "backpacktf_api_key": "",       # https://next.backpack.tf/account/api-access
     # backpack.tf USER TOKEN (separate from the API key above) - needed to
-    # compare against backpack.tf's own LIVE listings (not just the static
-    # community price list). Get it from the same page as the API key
-    # above: https://next.backpack.tf/account/api-access . Expires after
-    # ~90 days and needs 2FA to renew - see README. Without it, the
-    # watcher still works, just using the slower-moving community-
-    # suggested price as the reference instead of live listings.
+    # compare against backpack.tf's own LIVE listings. Get it from the
+    # same page as the API key above: https://next.backpack.tf/account/
+    # api-access . Expires after ~90 days and needs 2FA to renew - see
+    # README. REQUIRED for meaningful comparisons: this project no longer
+    # falls back to the slower-moving community-suggested price when live
+    # listings are insufficient (removed after repeated real reports of
+    # that fallback showing stale/wrong numbers) - without a live
+    # snapshot to compare against, an item is now skipped rather than
+    # guessed at, so a missing/expired token means most things get
+    # skipped, not silently mispriced.
     "backpacktf_token": "",
     "mannco_api_key": "",           # https://mannco.store/seller
     "telegram_bot_token": "",       # from @BotFather
@@ -161,6 +165,28 @@ DEFAULTS = {
     # one item, so a burst of updates for the same item doesn't hammer the
     # snapshot endpoint.
     "snapshot_cache_seconds": 20,
+
+    # --- backpack.tf request pacing ---
+    # How many backpack.tf requests (snapshot + price-history) can be in
+    # flight at once. Lower is safer against rate-limiting, higher means
+    # a burst of qualifying items clears faster. Real production logs
+    # showed sustained 429s even at 4, so this is deliberately
+    # conservative - raise it only if /stats and /errors show plenty of
+    # spare headroom, not by default assumption.
+    "bptf_max_concurrent_requests": 4,
+
+    # Minimum time (seconds) between the START of any two backpack.tf
+    # requests, regardless of how many are concurrently allowed above.
+    # This is what actually caps the SUSTAINED request rate over time - a
+    # concurrency cap alone doesn't: 4 requests in flight, each finishing
+    # quickly, can still add up to more than backpack.tf tolerates per
+    # second. Added after real logs showed the adaptive 429 backoff
+    # cycling through its full range (10s up to the 300s ceiling)
+    # repeatedly over 90+ minutes straight - concurrency capped but rate
+    # unthrottled looks exactly like that. No confirmed exact number for
+    # backpack.tf's real limit, so 0.4s (~2.5 requests/sec sustained) is
+    # a deliberately conservative starting point, not a measured one.
+    "bptf_min_request_interval_seconds": 0.4,
 }
 
 

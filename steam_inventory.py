@@ -14,6 +14,7 @@ rate-limited on if hit too often.
 """
 
 import logging
+import threading
 import time
 
 import requests
@@ -21,6 +22,29 @@ import requests
 log = logging.getLogger("steam_inventory")
 
 INVENTORY_URL_TEMPLATE = "https://steamcommunity.com/inventory/{steamid}/440/2"
+
+# Same reasoning as bptf_client's request throttle - a real production log
+# showed this endpoint's own 429s recurring alongside backpack.tf's, and
+# this endpoint has no separate concurrency cap the way backpack.tf's
+# requests do (each inventory check runs in its own asyncio.to_thread
+# call), so a burst of sellers being checked in quick succession could
+# hit Steam's limit with no smoothing at all. A conservative minimum gap
+# between request starts, shared across every SteamInventoryChecker
+# instance (there's only ever one in practice, but module-level state
+# keeps this correct even if that changes).
+_MIN_REQUEST_INTERVAL_SECONDS = 0.5
+_last_request_started_at = 0.0
+_throttle_lock = threading.Lock()
+
+
+def _throttle():
+    global _last_request_started_at
+    with _throttle_lock:
+        now = time.time()
+        wait = _last_request_started_at + _MIN_REQUEST_INTERVAL_SECONDS - now
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_started_at = time.time()
 
 
 class SteamInventoryChecker:
@@ -46,6 +70,7 @@ class SteamInventoryChecker:
 
         url = INVENTORY_URL_TEMPLATE.format(steamid=steamid)
         try:
+            _throttle()
             resp = self.session.get(url, params={"l": "english", "count": 1}, timeout=10)
         except requests.RequestException:
             log.warning("Inventory check request failed for %s (network error).", steamid)

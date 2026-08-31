@@ -27,5 +27,7 @@
   "jwt_refresh_seconds": 3600,
   "seen_listings_max": 20000,
   "snapshot_cache_seconds": 20,
+  "bptf_max_concurrent_requests": 4,
+  "bptf_min_request_interval_seconds": 0.4,
   "inventory_cache_seconds": 900
 }
