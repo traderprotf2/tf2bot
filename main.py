@@ -108,6 +108,19 @@ def classify_category(name, slot=None, mannco_type=None):
             return "weapon"
         if slot in COSMETIC_SLOTS:
             return "cosmetic"
+        # Badges/medals/pins equip in their own dedicated slot, distinct
+        # from head/misc cosmetics - confirmed via the official TF2 wiki's
+        # own description of the item type ("equip in the medal equip
+        # region"), not guessed. Given a direct request to stop wasting
+        # requests on badges (illiquid, not real trading interest) and
+        # that item_type/name-based exclusion alone was unreliable for
+        # backpack.tf specifically (item_type is never populated for that
+        # source - see handle_bptf_event - so exclusion fell back to
+        # matching "badge" against the item NAME, which many real badges
+        # don't literally contain), this is a second, independent,
+        # slot-based signal that doesn't depend on the name at all.
+        if slot == "medal":
+            return "badge"
         return "other"
 
     if mannco_type is not None:
@@ -209,7 +222,7 @@ class Watcher:
         self.cfg = cfg
         bptf_client.configure_request_pacing(
             cfg.get("bptf_max_concurrent_requests", 4),
-            cfg.get("bptf_min_request_interval_seconds", 0.4),
+            cfg.get("bptf_min_request_interval_seconds", 1.5),
         )
         self.bptf = bptf_client.BackpackTFPriceList(
             cfg["backpacktf_api_key"],
@@ -270,6 +283,12 @@ class Watcher:
         # display_name, particle, paint, killstreaker, sheen) -> last
         # alert timestamp.
         self.item_type_last_alerted = {}
+        # Caches item_ids confirmed NOT TF2 (game != 440) - see
+        # handle_mannco_event, which skips the details fetch entirely for
+        # any item_id already in here. An item's game never changes, so
+        # this is safe to keep for the whole run without expiring it the
+        # way the recent-listings dedup cache does.
+        self._known_non_tf2_item_ids = set()
 
         # Which "kinds" of item structure we've already logged a raw
         # sample of since startup - see the sampling calls in
@@ -341,13 +360,31 @@ class Watcher:
         round-trip (auth + request) that can fail on its own and was
         contributing repeated identical warnings to the logs for no real
         benefit - see key_price_refresh_seconds in config.py.
+
+        RETRY-SOONER ON FAILURE: a real /stats report showed mannco.store
+        AND marketplace.tf both going completely silent for 5+ hours
+        straight (both depend on this same USD-per-key rate for price
+        conversion), with the mannco.store key price stuck unavailable
+        the whole time. At a weekly cadence with no retry, a single
+        failed attempt - which does happen, mannco.store's own login has
+        hit real rate limits before - would otherwise leave TWO sources
+        completely dead for up to a week before the next scheduled try.
+        This retries much sooner after any failure, and only settles
+        into the full weekly cadence once a refresh has actually
+        succeeded.
         """
+        retry_seconds = 300  # 5 minutes - only used while no value has been obtained yet
         while True:
             try:
                 await asyncio.to_thread(self.refresh_mannco_key_price)
             except Exception:
                 log.exception("mannco.store key price refresh failed, will retry next cycle.")
-            await asyncio.sleep(self.cfg.get("key_price_refresh_seconds", 7 * 24 * 3600))
+            if self.mannco_key_usd_cents:
+                await asyncio.sleep(self.cfg.get("key_price_refresh_seconds", 7 * 24 * 3600))
+            else:
+                log.warning("mannco.store key price still unavailable - retrying in %ss instead of "
+                             "waiting for the full weekly cycle.", retry_seconds)
+                await asyncio.sleep(retry_seconds)
 
     async def health_check_loop(self):
         """
@@ -417,7 +454,25 @@ class Watcher:
             await asyncio.sleep(poll_seconds)
 
     async def _check_marketplacetf_deals(self, client):
-        if self.runtime.paused or not self.mannco_key_usd_cents:
+        if self.runtime.paused:
+            return
+        if not self.mannco_key_usd_cents:
+            # Same root cause and same fix as mannco.store's own
+            # no-key-price return (see handle_mannco_event) - this
+            # source depends on the SAME mannco.store USD-per-key rate
+            # for its own price conversion, and a real /stats report
+            # showed marketplace.tf reporting a flat "0 events" for 5+
+            # hours straight with nothing in /errors explaining why -
+            # traced to this exact return having no counter or log
+            # message either, on a SEPARATE source from the one that
+            # first exposed the same gap.
+            if "mptf_no_key_price" not in self._sampled_item_kinds:
+                self._sampled_item_kinds.add("mptf_no_key_price")
+                log.warning(
+                    "marketplace.tf polling is skipped - mannco.store key price is unavailable "
+                    "(needed for USD-to-keys conversion) - will resume once it refreshes."
+                )
+            self.stats["mptf_no_key_price"] += 1
             return
         if not self.defindex_to_name:
             return  # can't safely resolve item names - see __init__ warning
@@ -755,6 +810,20 @@ class Watcher:
             self.stats["mannco_deduped"] += 1
             return
 
+        # Skip the details fetch ENTIRELY for an item_id already known to
+        # be a different game - direct feedback that other-game items
+        # were being fetched and "messing up parsing" (each one is a real
+        # mannco.store API call that only gets discarded afterward at the
+        # game!=440 check below). mannco.store's own catalog item ids are
+        # apparently shared across all 5 games it supports (440/730/570/
+        # 252490/753), and the SAME popular CS2/Dota2/Rust item type
+        # tends to generate many repeat listing events, so remembering
+        # "this item_id isn't TF2" the first time avoids paying for that
+        # same lookup again and again for the rest of this run.
+        if item_id in self._known_non_tf2_item_ids:
+            self.stats["mannco_wrong_game"] += 1
+            return
+
         details = await asyncio.to_thread(self.mannco.get_item_details, item_id)
         if details is None:
             # A real production log showed this bucket silently absorbing
@@ -768,6 +837,7 @@ class Watcher:
             self.stats["mannco_details_failed"] += 1
             return
         if details.get("game") != 440:
+            self._known_non_tf2_item_ids.add(item_id)
             self.stats["mannco_wrong_game"] += 1
             return
 
@@ -789,6 +859,24 @@ class Watcher:
                     particle_id = self.particle_name_to_id_normalized.get(particle_name.strip().lower())
 
         if not self.mannco_key_usd_cents:
+            # A real /stats report showed a large, completely unexplained
+            # gap between received and every other counted bucket for
+            # mannco.store (9392 received, only 3665 accounted for across
+            # every other reason) - traced to this exact return having no
+            # counter at all. Given the key price now only refreshes
+            # weekly (see key_price_refresh_loop in this file), a single
+            # failed refresh can leave mannco_key_usd_cents unset - and
+            # therefore every qualifying mannco.store item silently
+            # dropped here - for up to a week, not just a brief blip.
+            # Logged once per run (not per item) so a real, ongoing
+            # outage is visible in /errors without flooding it.
+            if "mannco_no_key_price" not in self._sampled_item_kinds:
+                self._sampled_item_kinds.add("mannco_no_key_price")
+                log.warning(
+                    "mannco.store key price is unavailable - every qualifying mannco.store item "
+                    "will be skipped until the next successful key-price refresh."
+                )
+            self.stats["mannco_no_key_price"] += 1
             return
         price_keys = price_cents / self.mannco_key_usd_cents
 
@@ -910,6 +998,17 @@ class Watcher:
         paint_obj = item.get("paint") or {}
         raw_paint = paint_obj.get("name") if isinstance(paint_obj, dict) else None
         paint = raw_paint if slot in COSMETIC_SLOTS else None
+
+        if slot == "medal" and "bptf_medal_slot" not in self._sampled_item_kinds:
+            self._sampled_item_kinds.add("bptf_medal_slot")
+            # Confirms the slot value classify_category() now checks for
+            # (see there) against a real payload, the same way every
+            # other slot/field assumption in this project has been
+            # verified - the official wiki describes badges as equipping
+            # "in the medal equip region", and this is the first real
+            # listing to actually confirm (or contradict) that the raw
+            # slot string backpack.tf sends is literally "medal".
+            log.warning("DIAGNOSTIC SAMPLE (first slot='medal' item seen this run) - name: %r", item.get("name"))
 
         if paint and paint in bptf_client.TEAM_COLOR_PAINT_RGB and "bptf_team_paint" not in self._sampled_item_kinds:
             self._sampled_item_kinds.add("bptf_team_paint")

@@ -274,12 +274,23 @@ def check_killstreak_tier_pricing(bptf, listing: "NormalizedListing", lookup_nam
 
 
 def is_watched(listing: NormalizedListing, cfg: dict) -> bool:
-    if listing.quality not in cfg["watched_qualities"]:
-        return False
-    if listing.category not in cfg.get("watched_categories", ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"]):
-        return False
-    if cfg.get("australium_only") and not (listing.name or "").startswith("Australium "):
-        return False
+    # "Australium only" is ADDITIVE, not exclusive - a real, direct
+    # correction after an earlier version got this backwards (it made
+    # australium_only require watched_qualities/watched_categories to
+    # ALSO separately include Strange/weapon, and reject everything else
+    # once on). The actual intent: pressing this button should surface
+    # Australium weapons WITHOUT needing to separately enable Strange
+    # quality or the weapon category - and everything else already being
+    # watched via watched_qualities/watched_categories must keep working
+    # completely unaffected, never suppressed by this toggle being on.
+    is_australium_weapon = listing.category == "weapon" and (listing.name or "").startswith("Australium ")
+    covered_by_australium_toggle = cfg.get("australium_only") and is_australium_weapon
+
+    if not covered_by_australium_toggle:
+        if listing.quality not in cfg["watched_qualities"]:
+            return False
+        if listing.category not in cfg.get("watched_categories", ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"]):
+            return False
     if listing.extra_excluded_hint:
         return False
     item_type = (listing.item_type or "")

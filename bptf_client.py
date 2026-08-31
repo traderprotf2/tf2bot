@@ -821,12 +821,29 @@ class BackpackTFPriceList:
         if sheen:
             params["sheen"] = sheen
 
+        resp = None
         try:
             resp = _get_with_retry(self.session, SNAPSHOT_URL, params)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
-            log.exception("backpack.tf snapshot request failed for %s (%s, intent=%s)", name, quality_name, intent)
+            # Status code (and a short body snippet) logged EXPLICITLY,
+            # up front in the message text itself - not left to whatever
+            # of the exception's own text happens to survive truncation
+            # in the /errors display. A real report showed a run of
+            # snapshot failures with NO accompanying "rate limit (429)"
+            # line, meaning these weren't 429s and (given _get_with_retry
+            # already retries 5xx once) very possibly weren't a plain 5xx
+            # either - something else was going wrong, and there was no
+            # way to tell what from the log as it stood. resp stays None
+            # if the failure was a connection-level exception (no
+            # response ever received) rather than a bad status code.
+            status = resp.status_code if resp is not None else "no response (connection-level failure)"
+            body_snippet = resp.text[:200] if resp is not None else ""
+            log.exception(
+                "backpack.tf snapshot request failed for %s (%s, intent=%s) - HTTP status: %s, body: %r",
+                name, quality_name, intent, status, body_snippet,
+            )
             return None
 
         listings = data.get("listings", data.get(intent, []))
@@ -860,6 +877,52 @@ class BackpackTFPriceList:
             if listing_craftable is not None and bool(listing_craftable) != bool(craftable):
                 continue
 
+            # Same defense-in-depth reasoning as craftable/spell above,
+            # now extended to killstreak tier, australium, and Unusual
+            # particle - a real report showed the EXACT same wrong buy
+            # order (70.41 keys) recurring for the item that originally
+            # exposed the spell-contamination bug, well after that fix
+            # shipped - meaning spell wasn't the only unguarded dimension
+            # for that listing. Rather than assume killstreak_tier=0 /
+            # australium=-1 (both have a "proper", documented sentinel
+            # value, unlike spell) are actually honored by backpack.tf's
+            # search just because the convention looks more official,
+            # every dimension that can silently misprice an item now gets
+            # the same client-side check as craftable and spell already
+            # had - trust the request param less, verify what actually
+            # came back.
+            #
+            # Checked at BOTH the listing level and nested under "item" -
+            # unlike spell (confirmed at the listing level by a real
+            # scraping library's own field list), there's no equally
+            # direct confirmation for exactly where backpack.tf puts
+            # killstreakTier/particle specifically, so this checks
+            # whichever of the two locations actually has a value rather
+            # than betting on one guess - cheap insurance against the
+            # exact kind of wrong-nesting bug that just caused spell's
+            # check to silently do nothing for who knows how long.
+            listing_killstreak_tier = listing_item.get("killstreakTier")
+            if listing_killstreak_tier is None:
+                listing_killstreak_tier = listing.get("killstreakTier")
+            wanted_tier = killstreak_tier or 0
+            if listing_killstreak_tier is not None and int(listing_killstreak_tier) != wanted_tier:
+                continue
+
+            listing_name = listing_item.get("name") or listing.get("name") or ""
+            listing_is_australium = listing_name.startswith("Australium ")
+            if listing_name and listing_is_australium != bool(australium):
+                continue
+
+            if particle_id is not None:
+                listing_particle_obj = listing_item.get("particle") or listing.get("particle") or {}
+                listing_particle_id = (
+                    listing_particle_obj.get("id") if isinstance(listing_particle_obj, dict)
+                    else (listing_item.get("particleId") or listing_item.get("particle_id")
+                          or listing.get("particleId") or listing.get("particle_id"))
+                )
+                if listing_particle_id is not None and int(listing_particle_id) != int(particle_id):
+                    continue
+
             if not spell:
                 # We asked for "no particular spell" (spell=None omits the
                 # filter entirely) - but per backpack.tf's own forum, there
@@ -875,7 +938,19 @@ class BackpackTFPriceList:
                 # spelled listing's (often much higher) price, exactly a
                 # real report: a buy order that was actually for a SPELLED
                 # copy got shown as if it applied to a plain one.
-                listing_spells = listing_item.get("spells")
+                # CRITICAL FIX: was reading listing_item.get("spells")
+                # (nested under "item") - direct, empirical user
+                # confirmation (checked backpack.tf directly: an 80-key
+                # buy order existed ONLY on a spelled copy, never on a
+                # plain one) proved this check was never actually
+                # matching anything, letting the exact contamination it
+                # was meant to prevent through the whole time. A real
+                # scraping library (Preport/getBackpackTFListings) that
+                # independently confirmed "details" sits at the LISTING
+                # level (not nested under "item") shows the SAME thing
+                # for spells/parts/sheen/killstreaker - all listing-level
+                # fields, siblings of "item", not properties of it.
+                listing_spells = listing.get("spells")
                 if listing_spells:
                     continue
             prices.append((listing_id, price_keys))
@@ -1024,12 +1099,21 @@ class BackpackTFPriceList:
         if particle_id is not None:
             params["priceindex"] = particle_id
 
+        resp = None
         try:
             resp = _get_with_retry(self.session, HISTORY_URL, params)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
-            log.warning("backpack.tf price history request failed for %s (%s)", name, quality_name)
+            # Same reasoning as the snapshot endpoint's own fix above -
+            # explicit status code and body snippet, not left to
+            # whatever survives truncation in the /errors display.
+            status = resp.status_code if resp is not None else "no response (connection-level failure)"
+            body_snippet = resp.text[:200] if resp is not None else ""
+            log.warning(
+                "backpack.tf price history request failed for %s (%s) - HTTP status: %s, body: %r",
+                name, quality_name, status, body_snippet,
+            )
             return None
 
         response = data.get("response", {})

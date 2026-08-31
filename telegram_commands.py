@@ -168,8 +168,10 @@ def build_categories_menu(runtime):
         "killstreak_kit = наборы киллстриков (обычно Unique-качества — "
         "включи ещё и Unique в /qualities, иначе они не пройдут фильтр "
         "по качеству), other = всё остальное\n\n"
-        f"Только Australium-оружие: {'✅ включено' if runtime.australium_only else '⬜ выключено'} "
-        "(если включено, показывает только Australium, игнорируя категории/качества выше)"
+        f"+ Australium-оружие: {'✅ включено' if runtime.australium_only else '⬜ выключено'} "
+        "(добавляет Australium-оружие в поиск ДОПОЛНИТЕЛЬНО, не требуя отдельно "
+        "включать weapon и Strange выше — остальные категории/качества продолжают "
+        "работать как обычно, ничего не отключается)"
     )
     keyboard = []
     row = []
@@ -182,7 +184,7 @@ def build_categories_menu(runtime):
     if row:
         keyboard.append(row)
     australium_mark = "✅" if runtime.australium_only else "⬜"
-    keyboard.append([{"text": f"{australium_mark} Только Australium", "callback_data": "t:australium"}])
+    keyboard.append([{"text": f"{australium_mark} + Australium-оружие", "callback_data": "t:australium"}])
     keyboard.append([{"text": "⬅️ Назад", "callback_data": "m:main"}])
     return text, keyboard
 
@@ -399,6 +401,13 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
         if received == 0 and evaluated == 0:
             if prefix == "stn":
                 lines.append(f"<b>{label}</b>: список наблюдения пуст или ключ не задан")
+            elif prefix == "mptf" and stats.get("mptf_no_key_price", 0):
+                # A real report showed this saying "0 событий - проверь
+                # подключение" while the actual cause (no mannco.store
+                # key price - see _check_marketplacetf_deals) had nothing
+                # to do with the connection at all, sending troubleshooting
+                # in the wrong direction entirely.
+                lines.append(f"<b>{label}</b>: ждёт цену ключа mannco.store (сама по себе не подключение)")
             else:
                 lines.append(f"<b>{label}</b>: 0 событий - проверь подключение (см. журнал)")
             continue
@@ -424,6 +433,9 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
         malformed = stats.get(f"{prefix}_malformed", 0)
         if malformed:
             detail_bits.append(f"{malformed} неполные данные")
+        no_key_price = stats.get(f"{prefix}_no_key_price", 0)
+        if no_key_price:
+            detail_bits.append(f"{no_key_price} нет цены ключа")
         detail = f" ({', '.join(detail_bits)})" if detail_bits else ""
 
         lines.append(
