@@ -67,6 +67,7 @@ class NormalizedListing:
     killstreak_tier: Optional[int] = None                # narrows the backpack.tf search link further
     killstreaker: Optional[str] = None                    # Professional Killstreak only - the eye-particle effect
     sheen: Optional[str] = None                           # Specialized/Professional Killstreak - the kill-flash colour
+    seller_note: Optional[str] = None                     # the seller's own comment on the listing, if any
 
 
 def clean_display_name(listing: NormalizedListing) -> str:
@@ -287,7 +288,7 @@ def is_watched(listing: NormalizedListing, cfg: dict) -> bool:
     return True
 
 
-def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_url=None):
+def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_url=None, stn_client=None):
     """Returns a deal dict if this listing qualifies, otherwise None."""
     if not is_watched(listing, cfg):
         return None
@@ -410,6 +411,32 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
     avg_keys = bptf.get_average_price_keys(lookup_name, listing.quality, listing.particle_id,
                                             craftable=listing.craftable)
 
+    # Community-suggested price, shown as PURELY INFORMATIONAL context
+    # alongside the live comparison - never used to gate or compute the
+    # discount itself (that's live-listings-only, see _get_reference_
+    # price_keys above; a real, repeated correction made clear a
+    # suggested price must never drive the actual decision). This is
+    # free - get_price_keys reads the already-loaded bulk price list, no
+    # extra network call - and gives the user the same side-by-side view
+    # a real report showed being genuinely useful on a similar bot
+    # elsewhere: live data AND the community number together, clearly
+    # labeled, so a big gap between them is visible rather than hidden.
+    suggested_keys = bptf.get_price_keys(lookup_name, listing.quality, listing.particle_id)
+
+    # STN.Trading's own buy order, shown alongside backpack.tf's as
+    # another independent data point - same "informational only, never
+    # decision-relevant" treatment as suggested_keys above. Only
+    # attempted when a client was actually supplied (main.py only passes
+    # one when stntrading_api_key is configured) and wrapped defensively
+    # - this is a nice-to-have on an already-qualifying deal, so any
+    # failure here must never cost the alert itself.
+    stn_buy_keys = None
+    if stn_client is not None:
+        try:
+            stn_buy_keys = stn_client.get_item_buy_price_keys(lookup_name, bptf.key_price_metal)
+        except Exception:
+            log.warning("STN buy-order lookup failed for %s - showing the alert without it.", lookup_name)
+
     # Best current buy order - "could I flip this for an instant, guaranteed
     # profit". Also only fetched now, same reasoning as the average price.
     #
@@ -511,6 +538,9 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
         "price_usd": listing.price_usd,
         "previous_low_keys": ref_keys,
         "average_keys": avg_keys,
+        "suggested_keys": suggested_keys,
+        "stn_buy_keys": stn_buy_keys,
+        "suggested_updated_days_ago": days_since_update,
         "buy_order_keys": buy_order_keys,
         "buy_order_count": buy_order_count,
         "flip_profit_keys": flip_profit_keys,
@@ -518,5 +548,6 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
         "discount_percent": discount_percent,
         "link": listing.link,
         "seller_id": listing.seller_steamid or listing.listing_id,
+        "seller_note": listing.seller_note,
         "backpacktf_search_link": backpacktf_search_link,
     }

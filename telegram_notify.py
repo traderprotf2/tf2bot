@@ -55,7 +55,7 @@ class TelegramNotifier:
             return result["result"]["message_id"]
         return None
 
-    def send_photo(self, photo_url: str, caption: str):
+    def send_photo(self, photo_url: str, caption: str, keyboard=None):
         """
         Sends a photo (hotlinked by URL, not uploaded) with an HTML
         caption. Telegram caption length is capped at 1024 characters -
@@ -75,6 +75,8 @@ class TelegramNotifier:
             "caption": caption,
             "parse_mode": "HTML",
         }
+        if keyboard:
+            payload["reply_markup"] = {"inline_keyboard": keyboard}
         result = self._post("sendPhoto", payload)
         return bool(result and result.get("ok"))
 

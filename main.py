@@ -205,6 +205,16 @@ class Watcher:
             cfg["snapshot_cache_seconds"],
         )
         self.mannco = mannco_client.ManncoClient(cfg["mannco_api_key"], cfg["jwt_refresh_seconds"])
+        # Persistent (not re-created per call) so the same client can be
+        # reused both by the watchlist poll loop below AND by the
+        # per-deal STN-buy-order context lookup in evaluate_listing -
+        # None when no key is configured, which every caller already
+        # treats as "skip this source" (stntrading_client.py's own
+        # methods return None/empty on a missing key too).
+        self.stn_client = (
+            stntrading_client.STNTradingClient(cfg["stntrading_api_key"])
+            if cfg.get("stntrading_api_key") else None
+        )
         self.telegram = telegram_notify.TelegramNotifier(cfg["telegram_bot_token"], cfg["telegram_chat_id"])
         self.particle_name_to_id = steam_schema.fetch_particle_name_to_id(cfg.get("steam_api_key", ""))
         self.particle_id_to_name = {v: k for k, v in self.particle_name_to_id.items()}
@@ -452,7 +462,7 @@ class Watcher:
                 link=f"https://marketplace.tf/items/tf2/{raw['sku']}",
             )
             self.stats["mptf_evaluated"] += 1
-            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url)
+            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url, self.stn_client)
             if deal:
                 self.stats["mptf_alerts"] += 1
                 await self.send_deal(deal)
@@ -464,7 +474,7 @@ class Watcher:
     async def stntrading_poll_loop(self):
         if not self.cfg.get("stntrading_api_key"):
             return  # nothing to check without a key - skip the loop entirely
-        client = stntrading_client.STNTradingClient(self.cfg["stntrading_api_key"])
+        client = self.stn_client
         poll_seconds = self.cfg.get("stntrading_poll_seconds", 300)
         log.info("Polling stntrading.eu watchlist every %ss (when non-empty)", poll_seconds)
         while True:
@@ -512,12 +522,40 @@ class Watcher:
                 link="https://stntrading.eu/tf2",
             )
             self.stats["stn_evaluated"] += 1
-            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url)
+            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url, self.stn_client)
             if deal:
                 self.stats["stn_alerts"] += 1
                 await self.send_deal(deal)
             else:
                 self.stats["stn_rejected_by_checks"] += 1
+
+    def _build_alert_keyboard(self, deal: dict):
+        """
+        Inline URL buttons for the alert - Trade/Buy and the classifieds
+        search link as actual tappable buttons instead of plain text
+        links in the message body, closer to how a real, well-regarded
+        Discord alert bot presents the same kind of information (real
+        example seen: Trade URL / Classifieds / Item History / Steam
+        Profile as buttons under the embed). Telegram buttons need a
+        real https URL, so anything without one (e.g. a closed-inventory
+        listing with no direct trade link) is simply omitted from the
+        row rather than shown as a dead button.
+        """
+        buttons = []
+        if deal.get("trade_closed"):
+            if deal.get("profile_link"):
+                buttons.append({"text": "👤 Профиль продавца", "url": deal["profile_link"]})
+        elif deal.get("link"):
+            buy_labels = {
+                "mannco.store": "🔗 Купить",
+                "backpack.tf": "🔗 Трейд с продавцом",
+                "marketplace.tf": "🔗 Купить",
+                "stntrading.eu": "🔗 Открыть stntrading.eu",
+            }
+            buttons.append({"text": buy_labels.get(deal["source"], "🔗 Открыть"), "url": deal["link"]})
+        if deal.get("backpacktf_search_link"):
+            buttons.append({"text": "📋 Объявления на backpack.tf", "url": deal["backpacktf_search_link"]})
+        return [buttons] if buttons else None
 
     def format_alert(self, deal: dict) -> str:
         effect = f" ({deal['particle_name']})" if deal["particle_name"] else ""
@@ -543,6 +581,18 @@ class Watcher:
         if deal["average_keys"] is not None:
             avg_line = f"\nСредняя цена (~30 дней): {deal['average_keys']:.2f} ключей"
 
+        suggested_line = ""
+        if deal.get("suggested_keys") is not None:
+            date_part = ""
+            days_ago = deal.get("suggested_updated_days_ago")
+            if days_ago is not None:
+                import datetime
+                updated_date = (datetime.datetime.now() - datetime.timedelta(days=days_ago)).strftime("%d.%m.%Y")
+                date_part = f" — {updated_date}"
+            suggested_line = (
+                f"\n💬 Справочная цена (community): {deal['suggested_keys']:.2f} ключей{date_part}"
+            )
+
         buy_order_line = ""
         if deal.get("buy_order_keys") is not None:
             profit = deal.get("flip_profit_keys")
@@ -554,26 +604,45 @@ class Watcher:
                 f"({deal.get('buy_order_count', 0)} шт.){profit_note}"
             )
 
+        stn_buy_line = ""
+        if deal.get("stn_buy_keys") is not None:
+            stn_buy_line = f"\n🏦 Buy order на STN.Trading: {deal['stn_buy_keys']:.2f} ключей"
+
         liquidity_line = ""
         days_since = deal.get("days_since_price_update")
         if days_since is not None:
             liquidity_line = f"\n📊 Последняя переоценка цены: {days_since:.0f} дн. назад"
 
-        link_lines = []
-        if deal.get("trade_closed"):
-            link_lines.append(f"👤 Профиль продавца: {deal['profile_link']}")
-        elif deal["link"]:
-            buy_labels = {
-                "mannco.store": "Купить",
-                "backpack.tf": "Трейд с продавцом",
-                "marketplace.tf": "Купить",
-                "stntrading.eu": "Открыть stntrading.eu",
-            }
-            buy_label = buy_labels.get(deal["source"], "Открыть")
-            link_lines.append(f"🔗 {buy_label}: {deal['link']}")
-        if deal.get("backpacktf_search_link"):
-            link_lines.append(f"📋 Объявление на backpack.tf: {deal['backpacktf_search_link']}")
-        links_block = ("\n" + "\n".join(link_lines)) if link_lines else ""
+        seller_note_line = ""
+        if deal.get("seller_note"):
+            import html
+            # Real, confirmed field (see the listing construction in
+            # handle_bptf_event) - the seller's own comment on their
+            # listing, shown verbatim like the "Description" field in the
+            # Discord example this was modeled on. HTML-escaped since
+            # it's arbitrary user text being dropped into an HTML-parsed
+            # message - an unescaped "<" or "&" in someone's note would
+            # otherwise break the whole message's formatting.
+            seller_note_line = f"\n📝 Продавец пишет: <i>{html.escape(deal['seller_note'])}</i>"
+
+        # Only called out when true - "this seller's had this item up
+        # before" is the unremarkable default and doesn't need a line of
+        # its own, similar to how the Discord example this was modeled
+        # on treats "first time listing" as the notable case worth a
+        # History field, not "seen before". Uses the SAME per-seller
+        # identity tracking that already powers the cooldown in
+        # send_deal - not a new signal, just surfacing an existing one.
+        history_line = ""
+        if deal.get("is_first_time_seller_item"):
+            history_line = "\n🆕 Впервые видим этот лот от этого продавца"
+
+        # Trade/classifieds links are now buttons under the message (see
+        # _build_alert_keyboard), not text in the body - keeps the body
+        # focused on data, actions live in the buttons, closer to how the
+        # real Discord example this was modeled on separates the two.
+        # (The closed-inventory note itself is already shown via
+        # special_lines above - no need to repeat it here.)
+        links_block = ""
 
         priority_prefix = "⭐ ПРИОРИТЕТ (ликвидно/хайп) ⭐\n" if deal.get("is_priority") else ""
         return (
@@ -584,8 +653,12 @@ class Watcher:
             f"Цена в объявлении: <b>{deal['price_keys']:.2f} ключей</b>{usd}\n"
             f"Было: {deal['previous_low_keys']:.2f} ключей"
             f"{avg_line}"
+            f"{suggested_line}"
             f"{buy_order_line}"
+            f"{stn_buy_line}"
             f"{liquidity_line}"
+            f"{seller_note_line}"
+            f"{history_line}"
             f"{links_block}"
         )
 
@@ -617,6 +690,13 @@ class Watcher:
             self.stats["suppressed_item_cooldown"] += 1
             return
         self.item_type_last_alerted[identity_key] = now
+        # Surfaced in the alert itself (see format_alert's history_line) -
+        # not just used internally for the cooldown above. Genuinely
+        # "first time" only when this exact seller+item combo has never
+        # been seen before at all (last_alerted was None going into the
+        # check above) - a re-list that passed the cooldown because
+        # enough time had elapsed is a real re-list, not a first sighting.
+        deal["is_first_time_seller_item"] = last_alerted is None
 
         log.info(
             "DEAL [%s]: %s - %.2f keys vs %.2f keys before (%.0f%% off)",
@@ -624,6 +704,7 @@ class Watcher:
             deal["price_keys"], deal["previous_low_keys"], deal["discount_percent"],
         )
         alert_text = self.format_alert(deal)
+        keyboard = self._build_alert_keyboard(deal)
         image_url = deal.get("image_url")
         sent_as_photo = False
         if image_url:
@@ -632,9 +713,9 @@ class Watcher:
             # (plain messages allow 4096) - falls straight through to the
             # normal text-only send below either way, so a long alert or a
             # dead/blocked image URL never costs the alert itself.
-            sent_as_photo = await asyncio.to_thread(self.telegram.send_photo, image_url, alert_text)
+            sent_as_photo = await asyncio.to_thread(self.telegram.send_photo, image_url, alert_text, keyboard)
         if not sent_as_photo:
-            await asyncio.to_thread(self.telegram.send, alert_text)
+            await asyncio.to_thread(self.telegram.send, alert_text, keyboard)
 
     # -- mannco.store side ------------------------------------------------
 
@@ -711,7 +792,7 @@ class Watcher:
         )
 
         self.stats["mannco_evaluated"] += 1
-        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url)
+        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url, self.stn_client)
         if deal:
             self.stats["mannco_alerts"] += 1
             await self.send_deal(deal)
@@ -881,10 +962,19 @@ class Watcher:
             killstreak_tier=killstreak_tier,
             killstreaker=killstreaker,
             sheen=sheen,
+            # "details" is at the LISTING level (sibling of id/steamid/
+            # price), not nested under "item" - confirmed independently
+            # by two real sources reading/writing this exact field:
+            # a GitHub library that parses live backpack.tf listings
+            # ("details: string // Comment below the listing") and the
+            # unofficial BackpackTF PyPI wrapper's create_listing
+            # ("details - the listing comment, max 200 characters") -
+            # both agree on the name, from opposite ends (read vs write).
+            seller_note=(payload.get("details") or "").strip() or None,
         )
 
         self.stats["bptf_evaluated"] += 1
-        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url)
+        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url, self.stn_client)
         if not deal:
             self.stats["bptf_rejected_by_checks"] += 1
             return

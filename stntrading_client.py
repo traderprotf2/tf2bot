@@ -69,24 +69,9 @@ class STNTradingClient:
         stntrading.eu is not itself used as a keys/metal exchange rate
         source).
         """
-        if not self.api_key:
+        item = self._get_item_data(item_name)
+        if item is None:
             return None, None
-        try:
-            resp = self.session.get(
-                f"{API_BASE}/items/{item_name}",
-                params={"apiKey": self.api_key},
-                timeout=20,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception:
-            log.warning("stntrading.eu item lookup failed for %r", item_name)
-            return None, None
-
-        if not data.get("success"):
-            return None, None
-
-        item = data.get("item") or data.get("result", {}).get("item") or {}
         pricing = item.get("pricing", {})
         sell = pricing.get("sell", {})
         stock = (item.get("stock") or {}).get("level")
@@ -98,3 +83,55 @@ class STNTradingClient:
 
         price_keys = keys + (metal / key_price_metal if key_price_metal else 0)
         return price_keys, stock
+
+    def get_item_buy_price_keys(self, item_name: str, key_price_metal: float):
+        """
+        Returns STN's own BUY price (what they'd pay to acquire the item,
+        the mirror of get_item_price_keys' sell side above) in keys, or
+        None if unavailable. Shown as pure additional context alongside
+        backpack.tf's own buy order - never used to gate or compute a
+        discount, same reasoning as the community-suggested price (see
+        matcher.py) - just another data point the user can weigh.
+
+        HONESTY NOTE: the "buy" side of pricing wasn't independently
+        confirmed the way "sell" was (see get_item_price_keys' history) -
+        inferred from the same pricing object's structure being
+        symmetric (real examples confirmed a "sell" sub-object shaped
+        exactly like this; "buy" is assumed to mirror it, not separately
+        verified). If this turns out wrong, the failure mode is simply
+        "no STN buy order shown" (None), not a wrong number used
+        anywhere decision-relevant.
+        """
+        item = self._get_item_data(item_name)
+        if item is None:
+            return None
+        pricing = item.get("pricing", {})
+        buy = pricing.get("buy", {})
+        keys = buy.get("keys", 0) or 0
+        metal = buy.get("metal", 0) or 0
+        if not keys and not metal:
+            return None
+        return keys + (metal / key_price_metal if key_price_metal else 0)
+
+    def _get_item_data(self, item_name: str):
+        """Shared raw fetch for both price directions above - one HTTP
+        call covers both sell and buy, no separate caching layer (STN is
+        only ever queried for a handful of items per cycle - the
+        explicit /watchstn list, or optionally per-deal for the buy-order
+        context - not the high-volume path the way backpack.tf is)."""
+        if not self.api_key:
+            return None
+        try:
+            resp = self.session.get(
+                f"{API_BASE}/items/{item_name}",
+                params={"apiKey": self.api_key},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            log.warning("stntrading.eu item lookup failed for %r", item_name)
+            return None
+        if not data.get("success"):
+            return None
+        return data.get("item") or data.get("result", {}).get("item") or {}
