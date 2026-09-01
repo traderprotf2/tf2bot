@@ -196,16 +196,26 @@ class ManncoClient:
             log.warning("Bulk item-id prefetch for game %s failed.", game)
             return None
 
-        # Response shape not independently confirmed - try the most
-        # plausible structures and log the raw shape if none match, the
-        # same "don't guess silently" approach used elsewhere in this
-        # project when a field/endpoint's exact format isn't verified.
-        content = data.get("content") if isinstance(data, dict) else None
-        items = None
-        if isinstance(content, list):
-            items = content
-        elif isinstance(content, dict):
-            items = content.get("items") or content.get("prices")
+        # Response shape corrected against a REAL captured response - a
+        # real production log showed the previous guess (data wrapped in
+        # {"content": [...]}) was wrong: the actual response is a LIST
+        # of item dicts directly, e.g. [{'name': 'The Ambassador',
+        # 'craftable': 0, 'effect': '', 'url': '440-uncraftable-the-
+        # ambassador', 'assetcount': 20, 'price': 1...}, ...] - both
+        # shapes are now handled, in case this or a related endpoint
+        # varies.
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            content = data.get("content")
+            if isinstance(content, list):
+                items = content
+            elif isinstance(content, dict):
+                items = content.get("items") or content.get("prices")
+            else:
+                items = None
+        else:
+            items = None
         if not isinstance(items, list):
             log.warning(
                 "Bulk item-id prefetch for game %s returned an unexpected shape - "
@@ -215,18 +225,35 @@ class ManncoClient:
             return None
 
         ids = set()
+        # The one real captured entry (see the shape note above) had NO
+        # numeric "id"/"item_id" field visible in the (truncated) sample
+        # - only a "url" slug like "440-uncraftable-the-ambassador".
+        # Every plausible id-bearing field name is tried; if truly none
+        # of them are present anywhere in the response, that's logged
+        # explicitly (the full key set of one real entry, not just "0
+        # ids parsed") so a future report can settle this for good
+        # instead of another guess.
+        id_fields = ("item_id", "id", "itemId", "item_hash_name", "hash_name")
         for entry in items:
             if isinstance(entry, dict):
-                item_id = entry.get("item_id") or entry.get("id")
+                item_id = next((entry[f] for f in id_fields if entry.get(f) is not None), None)
                 if item_id is not None:
                     ids.add(item_id)
             elif isinstance(entry, (int, str)):
                 ids.add(entry)
         if not ids:
+            # Shows the FULL key set of one real entry (not just a
+            # truncated repr of the whole response, which can cut off
+            # before revealing whether an id-like field exists under a
+            # name not yet tried) - directly answers "is there really no
+            # id field at all, or was the field name just guessed wrong
+            # again" for whoever reads this next.
+            sample_keys = sorted(items[0].keys()) if items and isinstance(items[0], dict) else None
             log.warning(
                 "Bulk item-id prefetch for game %s parsed 0 ids from a non-empty-shaped "
-                "response - raw response (truncated): %r",
-                game, str(data)[:500],
+                "response - tried fields %r, first entry's actual keys: %r, first entry "
+                "(truncated): %r",
+                game, id_fields, sample_keys, str(items[0])[:300] if items else None,
             )
             return None
         log.info("Prefetched %d known item ids for game %s from mannco.store.", len(ids), game)

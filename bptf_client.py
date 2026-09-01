@@ -23,6 +23,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 
 import requests
 
@@ -912,7 +913,19 @@ class LocalListingStore:
                     {"key": list(key), "bucket": bucket}
                     for key, bucket in self._entries.items()
                 ]
-            tmp_path = path + ".tmp"
+            # Unique per call (pid + a random suffix), not a fixed
+            # "path + .tmp" - a real production error showed os.replace
+            # failing with FileNotFoundError, traced to exactly this: the
+            # periodic save (local_store_snapshot_loop, every 90s) and
+            # the graceful-shutdown save (Watcher.run(), on SIGTERM) can
+            # both call this within moments of each other during a
+            # restart, and with a SHARED temp filename, whichever finishes
+            # first renames it away from under the other - the second
+            # save's own os.replace then finds nothing there to rename.
+            # A unique name per call means two concurrent saves can never
+            # collide on the same temp file, regardless of which finishes
+            # first.
+            tmp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(serializable, f)
             os.replace(tmp_path, path)

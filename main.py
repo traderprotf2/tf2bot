@@ -1408,7 +1408,28 @@ class Watcher:
 
         while True:
             try:
-                events = await asyncio.to_thread(listener.get_updates)
+                # Uses the SAME dedicated small thread pool as
+                # _run_telegram's own sends (see run() for the full
+                # reasoning) - NOT the shared default pool this used to
+                # go through. A real report of the Telegram bot going
+                # completely unresponsive traced to exactly this gap:
+                # this fix's earlier version only moved outgoing sends
+                # (_run_telegram) to a dedicated pool, but get_updates()
+                # itself - a LONG-POLLING call that occupies a worker
+                # thread for the whole poll cycle, called in a tight
+                # while True loop - was still going through the shared
+                # default pool the same way evaluate_listing does. Under
+                # the real event volume this project handles, that
+                # shared pool being busy meant polling itself couldn't
+                # get a thread promptly, so the bot could go a long time
+                # without even checking for new messages - not a crash,
+                # just total unresponsiveness that looked exactly like one.
+                loop = asyncio.get_running_loop()
+                executor = getattr(self, "_telegram_executor", None)
+                if executor is not None:
+                    events = await loop.run_in_executor(executor, listener.get_updates)
+                else:
+                    events = await asyncio.to_thread(listener.get_updates)
             except Exception:
                 log.exception("Telegram command polling error, retrying in 5s...")
                 await asyncio.sleep(5)
@@ -1536,7 +1557,7 @@ class Watcher:
         # pool to be huge at all - see _run_telegram below, used
         # everywhere self.telegram.* used to go through plain
         # asyncio.to_thread.
-        self._telegram_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+        self._telegram_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
         # Restores whatever the local listing store had saved right
         # before this run started (or a previous one, if this is the
