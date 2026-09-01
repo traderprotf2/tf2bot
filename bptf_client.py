@@ -787,17 +787,21 @@ class LocalListingStore:
     def _max_age_for(self, intent):
         return self._buy_max_age_seconds if intent == "buy" else self._max_age_seconds
 
-    def _fresh_values(self, identity_key, intent, exclude_listing_id=None):
+    def _fresh_entries(self, identity_key, intent, exclude_listing_id=None, max_age=None):
         now = time.time()
-        max_age = self._max_age_for(intent)
+        if max_age is None:
+            max_age = self._max_age_for(intent)
         with self._lock:
             bucket = list(self._entries.get(identity_key, ()))
         return [
-            e["price_keys"] for e in bucket
+            e for e in bucket
             if e["intent"] == intent
             and e["listing_id"] != exclude_listing_id
             and (now - e["ts"]) <= max_age
         ]
+
+    def _fresh_values(self, identity_key, intent, exclude_listing_id=None, max_age=None):
+        return [e["price_keys"] for e in self._fresh_entries(identity_key, intent, exclude_listing_id, max_age)]
 
     def get_min_sell_price(self, identity_key, exclude_listing_id=None):
         """Mirrors get_snapshot_min_other_keys's old return shape:
@@ -809,8 +813,36 @@ class LocalListingStore:
             return None, 0
         return min(trustworthy), len(trustworthy)
 
+    # How recent a buy order needs to be to count as "high confidence" -
+    # see get_max_buy_price below. Deliberately much shorter than the
+    # full buy freshness window (10x the sell one by default): taking
+    # the single HIGHEST value among everything in a long window is
+    # exactly the aggregation most vulnerable to one old, since-
+    # fulfilled-or-cancelled order lingering for hours before this
+    # project ever sees the matching listing-delete event (if one even
+    # arrives) - a real report showed a buy order divergence pattern
+    # consistent with this. "min" (used for sell listings) doesn't have
+    # the same risk in reverse - a stale HIGH sell listing just gets
+    # ignored by min() automatically, but a stale HIGH buy order is
+    # exactly what max() would pick out.
+    HIGH_CONFIDENCE_BUY_WINDOW_SECONDS = 2 * 3600
+
     def get_max_buy_price(self, identity_key):
-        """Mirrors get_best_buy_order_keys's old return shape."""
+        """
+        Mirrors get_best_buy_order_keys's old return shape. Prefers
+        recent data: tries the highest trustworthy value seen within
+        HIGH_CONFIDENCE_BUY_WINDOW_SECONDS first, only reaching into the
+        full (much longer) buy freshness window if nothing that recent
+        exists - giving the best of both without the single-stale-
+        outlier risk of just taking max() over the whole long window
+        unconditionally. See HIGH_CONFIDENCE_BUY_WINDOW_SECONDS above
+        for why this asymmetry exists between buy and sell.
+        """
+        recent_values = self._fresh_values(identity_key, "buy", max_age=self.HIGH_CONFIDENCE_BUY_WINDOW_SECONDS)
+        recent_trustworthy = _filter_price_outliers(recent_values, floor_fraction=0.3, ceiling_fraction=3.0)
+        if recent_trustworthy:
+            return max(recent_trustworthy), len(recent_trustworthy)
+
         values = self._fresh_values(identity_key, "buy")
         trustworthy = _filter_price_outliers(values, floor_fraction=0.3, ceiling_fraction=3.0)
         if not trustworthy:

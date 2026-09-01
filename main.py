@@ -25,6 +25,8 @@ import asyncio
 import collections
 import concurrent.futures
 import logging
+import os
+import signal
 import time
 
 import bptf_client
@@ -298,7 +300,7 @@ class Watcher:
         self.particle_name_to_id_normalized = {
             name.strip().lower(): pid for name, pid in self.particle_name_to_id.items()
         }
-        self.defindex_to_name, self.name_to_image_url = steam_schema.fetch_defindex_to_name(
+        self.defindex_to_name = steam_schema.fetch_defindex_to_name(
             cfg.get("steam_api_key", "")
         )
         if not self.defindex_to_name:
@@ -658,7 +660,7 @@ class Watcher:
                 link=f"https://marketplace.tf/items/tf2/{raw['sku']}",
             )
             self.stats["mptf_evaluated"] += 1
-            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url, self.stn_client)
+            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.stn_client, self.stats)
             if deal:
                 self.stats["mptf_alerts"] += 1
                 await self.send_deal(deal)
@@ -718,7 +720,7 @@ class Watcher:
                 link="https://stntrading.eu/tf2",
             )
             self.stats["stn_evaluated"] += 1
-            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url, self.stn_client)
+            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.stn_client, self.stats)
             if deal:
                 self.stats["stn_alerts"] += 1
                 await self.send_deal(deal)
@@ -819,7 +821,7 @@ class Watcher:
             # it's arbitrary user text being dropped into an HTML-parsed
             # message - an unescaped "<" or "&" in someone's note would
             # otherwise break the whole message's formatting.
-            seller_note_line = f"\n📝 Продавец пишет: <i>{html.escape(deal['seller_note'])}</i>"
+            seller_note_line = f"\n📝 Продавец пишет: [<i>{html.escape(deal['seller_note'])}</i>]"
 
         # Only called out when true - "this seller's had this item up
         # before" is the unremarkable default and doesn't need a line of
@@ -901,17 +903,7 @@ class Watcher:
         )
         alert_text = self.format_alert(deal)
         keyboard = self._build_alert_keyboard(deal)
-        image_url = deal.get("image_url")
-        sent_as_photo = False
-        if image_url:
-            # send_photo itself refuses (returns False, doesn't raise) if
-            # the caption is over Telegram's 1024-char photo-caption limit
-            # (plain messages allow 4096) - falls straight through to the
-            # normal text-only send below either way, so a long alert or a
-            # dead/blocked image URL never costs the alert itself.
-            sent_as_photo = await self._run_telegram(self.telegram.send_photo, image_url, alert_text, keyboard)
-        if not sent_as_photo:
-            await self._run_telegram(self.telegram.send, alert_text, keyboard)
+        await self._run_telegram(self.telegram.send, alert_text, keyboard)
 
     # -- mannco.store side ------------------------------------------------
 
@@ -990,6 +982,18 @@ class Watcher:
             self.stats["mannco_rejected_quality"] += 1
             return
 
+        # Checked right alongside quality, before particle resolution and
+        # the key-price check below - same reasoning as backpack.tf's own
+        # identical move above, though the saving here is smaller (the
+        # expensive part for this source, get_item_details itself, has
+        # already happened by this point either way - mannco.store's own
+        # websocket event carries no category/type info at all until
+        # after that fetch).
+        category = classify_category(details.get("name"), mannco_type=details.get("type"))
+        if category not in self.runtime.watched_categories:
+            self.stats["mannco_rejected_category"] += 1
+            return
+
         particle_id = None
         particle_name = None
         if quality == "Unusual":
@@ -1037,7 +1041,7 @@ class Watcher:
             name=details.get("name") or "",
             quality=quality,
             item_type=(details.get("type") or ""),
-            category=classify_category(details.get("name"), mannco_type=details.get("type")),
+            category=category,
             particle_id=particle_id,
             particle_name=particle_name,
             craftable=bool(details.get("craftable", True)),
@@ -1051,7 +1055,7 @@ class Watcher:
         )
 
         self.stats["mannco_evaluated"] += 1
-        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url, self.stn_client)
+        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.stn_client, self.stats)
         if deal:
             self.stats["mannco_alerts"] += 1
             await self.send_deal(deal)
@@ -1101,6 +1105,21 @@ class Watcher:
 
         name = item.get("name") or item.get("marketName") or item.get("baseName")
         if not name:
+            return
+
+        # Category checked HERE, right alongside quality above and before
+        # any of the more expensive extraction below (particle/paint/
+        # spell/killstreak parsing) - per a direct request to stop that
+        # work being done at all for a category that isn't even watched
+        # (weapons specifically called out as the highest-volume category
+        # on backpack.tf). This mirrors is_watched()'s own category check
+        # in matcher.py - kept there too (not removed) since that
+        # function is shared by every source, not just this one; this is
+        # purely a fast-path duplicate for backpack.tf specifically,
+        # where the volume is highest.
+        category = classify_category(name, item.get("slot"))
+        if category not in self.runtime.watched_categories:
+            self.stats["bptf_rejected_category"] += 1
             return
 
         if quality == "Unusual" and "bptf_unusual" not in self._sampled_item_kinds:
@@ -1305,7 +1324,7 @@ class Watcher:
             listing_id=str(listing_id),
             name=name,
             quality=quality,
-            category=classify_category(name, slot=slot),
+            category=category,
             particle_id=particle_id,
             particle_name=particle_name,
             craftable=bool(craftable),
@@ -1333,7 +1352,7 @@ class Watcher:
         )
 
         self.stats["bptf_evaluated"] += 1
-        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.name_to_image_url, self.stn_client)
+        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.stn_client, self.stats)
         if not deal:
             self.stats["bptf_rejected_by_checks"] += 1
             return
@@ -1533,7 +1552,36 @@ class Watcher:
 
         await self._startup_sanity_check()
 
-        await asyncio.gather(
+        # Graceful-shutdown handling: saves the local listing store
+        # (see LocalListingStore.save_to_disk / local_store_snapshot_loop
+        # above) the MOMENT the process is asked to stop, not just on
+        # local_store_snapshot_loop's own 90-second timer. Direct
+        # feedback made clear why the timer alone isn't enough: this bot
+        # gets restarted often during active development (an update is
+        # exactly a restart), and if that restart happens to land before
+        # the periodic loop's first save (up to 90 seconds after
+        # startup, worst case), everything collected in that window was
+        # simply lost when the process exited - not "written but stale",
+        # never written at all. `systemctl restart`/`stop` send SIGTERM;
+        # Ctrl+C / KeyboardInterrupt is SIGINT - both are handled the
+        # same way here so either kind of stop triggers one last save
+        # before the process actually exits, regardless of how much (or
+        # how little) time has passed since the last periodic save.
+        shutdown_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, shutdown_event.set)
+            except NotImplementedError:
+                # add_signal_handler isn't available on every platform
+                # (e.g. Windows) - not expected for this project's real
+                # deployment target (a Linux VPS under systemd), but
+                # shouldn't crash startup if it's ever run somewhere it
+                # isn't supported. KeyboardInterrupt still works via the
+                # try/except around asyncio.run() in main() either way.
+                pass
+
+        main_tasks = asyncio.gather(
             self.price_refresh_loop(),
             self.key_price_refresh_loop(),
             self.telegram_command_loop(),
@@ -1546,6 +1594,42 @@ class Watcher:
             mannco_ws.stream_listing_events(self.handle_mannco_event),
             bptf_ws.stream_listing_events(self.handle_bptf_event),
         )
+        shutdown_waiter = asyncio.create_task(shutdown_event.wait())
+
+        await asyncio.wait([main_tasks, shutdown_waiter], return_when=asyncio.FIRST_COMPLETED)
+
+        if shutdown_event.is_set():
+            log.info("Shutdown signal received - saving local listing store before exiting...")
+            try:
+                await asyncio.to_thread(self.bptf.local_listings.save_to_disk, bptf_client.LOCAL_LISTINGS_STATE_PATH)
+                log.info("Final save complete.")
+            except Exception:
+                log.exception("Final save on shutdown failed.")
+            main_tasks.cancel()
+            try:
+                await main_tasks
+            except (asyncio.CancelledError, Exception):
+                pass
+        else:
+            # main_tasks finished FIRST, and not because of a shutdown
+            # signal - meaning one of the loops inside it actually
+            # raised (every real loop in this project is `while True`,
+            # so ordinary completion never happens on its own). Do the
+            # same emergency save a real shutdown would (whatever data
+            # has been collected is still worth keeping), then
+            # deliberately let the original exception propagate out of
+            # run() instead of swallowing it - systemd's restart policy
+            # is what's supposed to bring the process back up after a
+            # real crash, and it can only do that if the process
+            # actually exits with the failure visible, the same as
+            # before this shutdown-handling code existed at all.
+            shutdown_waiter.cancel()
+            log.warning("A core loop exited unexpectedly - saving local listing store before the crash propagates...")
+            try:
+                await asyncio.to_thread(self.bptf.local_listings.save_to_disk, bptf_client.LOCAL_LISTINGS_STATE_PATH)
+            except Exception:
+                log.exception("Emergency save before crash failed.")
+            await main_tasks
 
 
 def main():

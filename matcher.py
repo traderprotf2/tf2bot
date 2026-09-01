@@ -40,11 +40,6 @@ from bptf_client import (
 
 log = logging.getLogger("matcher")
 
-# Set once by evaluate_listing the first time it finds no image mapping at
-# all loaded - see the image_url block below. Module-level (not per-Watcher-
-# instance) since matcher.py's functions are plain functions, not methods.
-_logged_no_image_mapping = False
-
 
 @dataclass
 class NormalizedListing:
@@ -315,12 +310,38 @@ def is_watched(listing: NormalizedListing, cfg: dict) -> bool:
     return True
 
 
-def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_url=None, stn_client=None):
-    """Returns a deal dict if this listing qualifies, otherwise None."""
+def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stn_client=None, stats=None):
+    """
+    Returns a deal dict if this listing qualifies, otherwise None.
+    `stats` (a collections.Counter, typically main.py's self.stats) is
+    optional and purely diagnostic - when given, specific rejection
+    reasons get their own counter, incremented on the way to returning
+    None, rather than every rejection collapsing into one "rejected by
+    accuracy checks" bucket. Added after a real /stats report (263558
+    received, 23610 evaluated, only 31 found) where that single bucket
+    made it impossible to tell "this item genuinely isn't discounted"
+    apart from "this item has no comparable live data yet" (the local
+    store's own cold-start reality, not a bug) - two very different
+    situations that call for very different responses (nothing to do
+    about the first; possibly loosen min_other_listings or wait longer
+    for the second) but were indistinguishable in the numbers as they
+    stood.
+    """
+    _STATS_SOURCE_PREFIX = {
+        "backpack.tf": "bptf", "mannco.store": "mannco",
+        "marketplace.tf": "mptf", "stntrading.eu": "stn",
+    }
+
+    def reject(reason):
+        if stats is not None:
+            prefix = _STATS_SOURCE_PREFIX.get(listing.source, listing.source)
+            stats[f"{prefix}_rejected_{reason}"] += 1
+        return None
+
     if not is_watched(listing, cfg):
         return None
     if listing.price_keys is None or listing.price_keys < cfg["min_price_keys"]:
-        return None
+        return reject("min_price")
 
     # Killstreak Kits/Fabricators are skipped entirely, before any API
     # calls - the same limitation that already meant no search LINK could
@@ -335,7 +356,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
     # this is skipped outright until there's real evidence of a working
     # way to price Kits specifically.
     if listing.category == "killstreak_kit":
-        return None
+        return reject("kit_category")
 
     # Unusuals need a resolved particle id to compare like-for-like - EXCEPT
     # "Unusualifier" tools, which are a genuinely different case: they GRANT
@@ -353,7 +374,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
             "If this keeps happening, the effect-name lookup for this source may need a fix.",
             listing.name, listing.source, listing.particle_name,
         )
-        return None
+        return reject("no_particle_id")
 
     lookup_name = strip_quality_prefix(listing.name, listing.quality)
 
@@ -390,7 +411,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
             "wrong (unfiltered) pool.",
             listing.name, listing.source, listing.paint,
         )
-        return None
+        return reject("unmapped_paint")
 
     spells = filter_spells_for_category(listing.spells, listing.category)
     # backpack.tf's search only takes one spell value - a real, confirmed
@@ -451,11 +472,23 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
         )
 
     if ref_keys is None or ref_keys <= 0:
-        return None
+        # THE key distinction a real /stats report couldn't make: no
+        # comparable live SELL data has been self-collected yet for this
+        # EXACT identity (name+quality+particle+paint+craftable+spell+
+        # killstreak+australium - see LocalListingStore/listing_identity_
+        # key in bptf_client.py) - not "this item isn't discounted", but
+        # "there's nothing to compare it against yet". Inherent to a
+        # cold-started, self-collected store for a specific-enough
+        # identity combination that hasn't recurred yet in the current
+        # window, not necessarily a bug.
+        return reject("no_reference_data")
 
     discount_percent = (ref_keys - listing.price_keys) / ref_keys * 100
     if discount_percent < cfg["discount_threshold_percent"]:
-        return None
+        # The OTHER half of that same distinction: there WAS comparable
+        # live data, and this listing simply isn't priced low enough
+        # relative to it - a genuine "not a deal", not a data gap.
+        return reject("discount_too_small")
 
     # Price-boost sanity check across the whole killstreak tier ladder
     # (0=plain through 3=Professional) - applies even to a plain item
@@ -464,7 +497,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
     # data for the whole item looks unreliable right now, whichever tier
     # triggered the alert - see check_killstreak_tier_pricing().
     if not check_killstreak_tier_pricing(bptf, listing, lookup_name, ref_keys, cfg):
-        return None
+        return reject("tier_inconsistency")
 
     # Liquidity check: skip items whose price hasn't been revised by the
     # community in a long time - a big discount on something nobody's
@@ -575,35 +608,6 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
 
     # Real item picture for the Telegram alert, straight from Valve's own
     # schema (confirmed OK to hotlink directly - see steam_schema.py).
-    # Tries the same name in two forms: first as backpack.tf/mannco.store
-    # display it (only quality stripped) in case Valve's schema happens to
-    # index australium/non-craftable variants under that fuller name too
-    # (as IGetPrices does), then the fully bare base name as a fallback -
-    # not certain which convention the schema itself uses, so both are
-    # tried rather than guessing one and missing pictures for no reason.
-    image_url = None
-    if name_to_image_url:
-        bare_name_for_image = strip_variant_prefixes(lookup_name)
-        image_url = name_to_image_url.get(lookup_name) or name_to_image_url.get(bare_name_for_image)
-        if image_url is None:
-            log.warning(
-                "No image found for %s - tried %r and %r against %d loaded names. If this "
-                "keeps happening for real items, the schema's name format may not match either "
-                "of these.",
-                listing.name, lookup_name, bare_name_for_image, len(name_to_image_url),
-            )
-    elif listing.source != "stntrading.eu":
-        # stntrading.eu genuinely has no schema-backed name resolution path
-        # here, so staying silent for it is correct - but any OTHER source
-        # having no mapping at all usually means steam_api_key is missing
-        # or the schema fetch failed. Logged once (not per-item, which
-        # would spam identically on every single alert if the key is
-        # simply not configured) so it's still discoverable via /errors.
-        global _logged_no_image_mapping
-        if not _logged_no_image_mapping:
-            _logged_no_image_mapping = True
-            log.warning("No image mapping loaded at all - alerts will have no pictures until this is fixed.")
-
     # Priority flag - Unusuals are the most liquid and highest-margin
     # category, worth calling out so they're not lost in a busy chat;
     # cfg["priority_item_names"] adds specific well-known "hype" items on
@@ -620,7 +624,6 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
         "source": listing.source,
         "is_priority": is_priority,
         "display_name": clean_display_name(listing),
-        "image_url": image_url,
         "variant_label": detect_special_variant(listing.name),
         "particle_name": listing.particle_name,
         "killstreaker": listing.killstreaker,

@@ -75,30 +75,26 @@ def fetch_particle_name_to_id(steam_api_key: str):
 
 def fetch_defindex_to_name(steam_api_key: str, max_pages: int = 20):
     """
-    Returns ({defindex: item_name}, {item_name: image_url}) for every item
-    in the TF2 schema (a much bigger fetch than the particle overview -
-    paginated by Valve's API via a `next` cursor). The name mapping is
-    needed to correctly split marketplace.tf's combined "<effect> <item
-    name>" display text back into its real components - see the module
-    docstring. The image mapping is for attaching a real picture of the
-    item to each Telegram alert instead of a generic link preview -
-    confirmed directly on Valve's own wiki page for this endpoint: "You
-    are welcome to use the backpack images provided by image_url and
-    image_url_large directly" - an explicit, first-party grant to hotlink
-    these, not a guess at an undocumented CDN path.
+    Returns {defindex: item_name} for every item in the TF2 schema (a
+    much bigger fetch than the particle overview - paginated by Valve's
+    API via a `next` cursor). Needed to correctly split marketplace.tf's
+    combined "<effect> <item name>" display text back into its real
+    components - see the module docstring.
 
-    Returns ({}, {}) on any failure or if no key is given - caller
-    (main.py) treats a missing name mapping as "can't safely process
+    Per-alert images were removed on explicit request, to cut every bit
+    of load associated with them - this function no longer builds an
+    image mapping at all (not just "unused", genuinely not fetched or
+    assembled), only the name mapping marketplace.tf actually needs.
+
+    Returns {} on any failure or if no key is given - caller (main.py)
+    treats a missing name mapping as "can't safely process
     marketplace.tf listings" (not a fatal error - skipping that source
-    beats guessing at a name split), and a missing image mapping as
-    simply "no picture available for this alert" (falls back to text-only,
-    also not a fatal error).
+    beats guessing at a name split).
     """
     if not steam_api_key:
-        return {}, {}
+        return {}
 
     name_mapping = {}
-    image_mapping = {}
     start = None
     try:
         for _ in range(max_pages):
@@ -115,9 +111,6 @@ def fetch_defindex_to_name(steam_api_key: str, max_pages: int = 20):
                 defindex = item.get("defindex")
                 if name is not None and defindex is not None:
                     name_mapping[int(defindex)] = name
-                image_url = item.get("image_url_large") or item.get("image_url")
-                if name is not None and image_url:
-                    image_mapping.setdefault(name, image_url)
             start = result.get("next")
             if not start:
                 break
@@ -135,10 +128,8 @@ def fetch_defindex_to_name(steam_api_key: str, max_pages: int = 20):
                 "response: %r",
                 data,
             )
-        log.info("Loaded %d defindex->name mappings (%d with images) from Steam schema.",
-                  len(name_mapping), len(image_mapping))
-        return name_mapping, image_mapping
+        log.info("Loaded %d defindex->name mappings from Steam schema.", len(name_mapping))
+        return name_mapping
     except Exception:
-        log.exception("Could not fetch full Steam TF2 item schema; marketplace.tf listings will be "
-                       "skipped and alerts will have no item images.")
-        return name_mapping, image_mapping
+        log.exception("Could not fetch full Steam TF2 item schema; marketplace.tf listings will be skipped.")
+        return name_mapping

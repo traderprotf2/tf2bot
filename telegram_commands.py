@@ -12,6 +12,7 @@ Only events from the configured telegram_chat_id are ever acted on -
 anyone else who happens to message the bot is silently ignored.
 """
 
+import html
 import logging
 import time
 
@@ -395,6 +396,7 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
         alerts = stats.get(f"{prefix}_alerts", 0)
         deduped = stats.get(f"{prefix}_deduped", 0)
         rejected_quality = stats.get(f"{prefix}_rejected_quality", 0)
+        rejected_category = stats.get(f"{prefix}_rejected_category", 0)
         rejected_checks = stats.get(f"{prefix}_rejected_by_checks", 0)
         total_alerts += alerts
 
@@ -417,8 +419,29 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
             detail_bits.append(f"{deduped} повтор(ов)")
         if rejected_quality:
             detail_bits.append(f"{rejected_quality} не по качеству")
+        if rejected_category:
+            detail_bits.append(f"{rejected_category} не по категории")
         if rejected_checks:
             detail_bits.append(f"{rejected_checks} отсеяно проверками точности")
+        # Breaks that single bucket down further - see evaluate_listing's
+        # own reject() helper in matcher.py for why: a real /stats report
+        # (263558 received, 23610 evaluated, only 31 found for
+        # backpack.tf) made clear that one aggregate number couldn't
+        # answer the actual question - was this "genuinely not a deal"
+        # (discount_too_small) or "nothing to compare it against yet"
+        # (no_reference_data, the local store's own cold-start reality
+        # for this exact item, not a bug)? These two are usually the
+        # overwhelming majority of rejected_checks, so they're shown
+        # separately; smaller-volume reasons (min_price, kit_category,
+        # no_particle_id, unmapped_paint, tier_inconsistency) stay folded
+        # into the aggregate above rather than cluttering this line
+        # further.
+        no_ref_data = stats.get(f"{prefix}_rejected_no_reference_data", 0)
+        if no_ref_data:
+            detail_bits.append(f"{no_ref_data} нет данных для сравнения")
+        too_small = stats.get(f"{prefix}_rejected_discount_too_small", 0)
+        if too_small:
+            detail_bits.append(f"{too_small} скидка меньше порога")
         # mannco.store-specific stages, added after a real gap in this
         # display: 4854 received with 0 evaluated and none of the counts
         # above accounting for it - traced to a rate-limited details
@@ -489,7 +512,21 @@ def build_errors_view(error_entries, page: int = 0):
         message = entry.get("message", "")
         if len(message) > 220:
             message = message[:220] + "…"
-        lines.append(f"[{ts}] <b>{level}</b> {logger_name}: {message}")
+        # Escaped before going into this HTML-parse_mode message - a
+        # real, persistent failure of /errors itself traced to this:
+        # some logged messages legitimately contain raw HTML (e.g. an
+        # HTTP error page's body, logged verbatim by this project's own
+        # status-code diagnostics for backpack.tf's deprecated endpoint -
+        # a 503 response can come back as an actual <html>...</html>
+        # error page, not JSON). Left unescaped, that raw markup breaks
+        # the ENTIRE Telegram message as invalid HTML, and the person
+        # never even sees an error about it - the one tool meant to
+        # surface exactly this kind of problem was the one silently
+        # disabled by it. logger_name is also escaped defensively, even
+        # though logger names in this project are all hardcoded, plain
+        # identifiers - message content is the one field that can
+        # contain genuinely anything.
+        lines.append(f"[{ts}] <b>{html.escape(level)}</b> {html.escape(logger_name)}: {html.escape(message)}")
     text = "\n".join(lines)
 
     nav_row = []

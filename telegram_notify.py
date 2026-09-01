@@ -55,31 +55,6 @@ class TelegramNotifier:
             return result["result"]["message_id"]
         return None
 
-    def send_photo(self, photo_url: str, caption: str, keyboard=None):
-        """
-        Sends a photo (hotlinked by URL, not uploaded) with an HTML
-        caption. Telegram caption length is capped at 1024 characters -
-        shorter than the 4096 a plain text message allows - so this
-        returns False (not raising) when the caption is too long, and
-        the caller (main.py's send_deal) falls back to a plain send()
-        instead rather than having Telegram silently reject an
-        over-length caption. Returns True on success, False on any
-        failure (bad/dead image URL included) - callers should fall back
-        to plain send() either way, not treat this as fatal.
-        """
-        if len(caption) > 1024:
-            return False
-        payload = {
-            "chat_id": self.chat_id,
-            "photo": photo_url,
-            "caption": caption,
-            "parse_mode": "HTML",
-        }
-        if keyboard:
-            payload["reply_markup"] = {"inline_keyboard": keyboard}
-        result = self._post("sendPhoto", payload)
-        return bool(result and result.get("ok"))
-
     def edit_message(self, message_id, text: str, keyboard=None):
         """Updates an existing message's text/keyboard in place (used to
         make button menus feel like a live panel instead of a new
