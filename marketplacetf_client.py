@@ -140,11 +140,22 @@ class MarketplaceTFClient:
         callers should treat a fetch problem as "nothing new this round",
         not as an error to crash on (this source polls repeatedly, so a
         transient failure is recovered on the next round)."""
+        resp = None
         try:
             resp = self.session.get(DEALS_URL, timeout=20)
             resp.raise_for_status()
         except Exception:
-            log.warning("marketplace.tf deals page request failed.")
+            # Same reasoning as backpack.tf's own status-code logging fix -
+            # a plain "request failed" with no status code or body gave no
+            # way to tell a genuine connection problem apart from
+            # marketplace.tf itself returning something unexpected (a 403,
+            # a maintenance page, a changed URL, etc.).
+            status = resp.status_code if resp is not None else "no response (connection-level failure)"
+            body_snippet = resp.text[:200] if resp is not None else ""
+            log.warning(
+                "marketplace.tf deals page request failed - HTTP status: %s, body: %r",
+                status, body_snippet,
+            )
             return []
 
         try:

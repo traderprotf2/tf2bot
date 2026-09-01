@@ -661,6 +661,127 @@ def _iter_price_entries(craft_block):
                     yield particle_id, entry
 
 
+class LocalListingStore:
+    """
+    Self-collected market data, built from the SAME websocket stream
+    already being consumed for new-listing detection - NOT a call to
+    backpack.tf's own API. This exists because the entire prior
+    reference-price/buy-order mechanism (get_snapshot_min_other_keys,
+    get_best_buy_order_keys below) was built on /classifieds/listings/
+    snapshot, which backpack.tf's OWN Developer Centre changelog states
+    plainly: "v1 listing APIs have been deprecated and rate limited, as
+    they are slated for removal. Please use v2." - and as of the most
+    recent community discussion found (June 2026), there is still no v2
+    endpoint for general market search at all: "still no v2 endpoint for
+    classifieds or listings, just relying on websocket events and
+    collected data." This class IS that "collected data" approach - the
+    only currently-viable one.
+
+    Every incoming listing this project sees (regardless of whether it
+    itself qualifies as a discount) is recorded here, keyed by an EXACT
+    identity tuple built from this project's own already-validated
+    parsing (see listing_identity_key below) - not from trusting an
+    external endpoint's filtering. This means the exact contamination
+    bugs found and fixed earlier this session (spell/paint/craftable/
+    killstreak-tier listings bleeding into each other via an unreliable
+    external filter) cannot happen here by construction: a listing only
+    ever lands in the bucket matching precisely what was parsed for it,
+    and a query only ever reads from that same exact bucket.
+
+    Thread-safe (a plain lock) since listings are recorded from the
+    asyncio event loop thread but read from worker threads via
+    asyncio.to_thread(evaluate_listing, ...).
+    """
+
+    def __init__(self, max_age_seconds=3600, max_entries_per_key=300):
+        self._entries = {}  # identity_key -> list of {listing_id, seller_id, price_keys, ts, intent}
+        self._max_age_seconds = max_age_seconds
+        self._max_entries_per_key = max_entries_per_key
+        self._lock = threading.Lock()
+
+    def record(self, identity_key, listing_id, seller_id, price_keys, intent, timestamp=None):
+        if price_keys is None or price_keys <= 0:
+            return
+        ts = timestamp if timestamp is not None else time.time()
+        with self._lock:
+            bucket = self._entries.setdefault(identity_key, [])
+            # Replace any existing entry for the same listing_id (a
+            # price change or re-list bump) instead of accumulating
+            # duplicates for what's really the same listing over time.
+            bucket[:] = [e for e in bucket if e["listing_id"] != listing_id]
+            bucket.append({
+                "listing_id": listing_id, "seller_id": seller_id,
+                "price_keys": price_keys, "ts": ts, "intent": intent,
+            })
+            if len(bucket) > self._max_entries_per_key:
+                bucket.sort(key=lambda e: e["ts"])
+                del bucket[:len(bucket) - self._max_entries_per_key]
+
+    def _fresh_values(self, identity_key, intent, exclude_listing_id=None):
+        now = time.time()
+        with self._lock:
+            bucket = list(self._entries.get(identity_key, ()))
+        return [
+            e["price_keys"] for e in bucket
+            if e["intent"] == intent
+            and e["listing_id"] != exclude_listing_id
+            and (now - e["ts"]) <= self._max_age_seconds
+        ]
+
+    def get_min_sell_price(self, identity_key, exclude_listing_id=None):
+        """Mirrors get_snapshot_min_other_keys's old return shape:
+        (min_price_in_keys, count), or (None, 0) if not enough fresh,
+        trustworthy data has been collected yet for this exact item."""
+        values = self._fresh_values(identity_key, "sell", exclude_listing_id)
+        trustworthy = _filter_price_outliers(values, floor_fraction=0.3, ceiling_fraction=3.0)
+        if not trustworthy:
+            return None, 0
+        return min(trustworthy), len(trustworthy)
+
+    def get_max_buy_price(self, identity_key):
+        """Mirrors get_best_buy_order_keys's old return shape."""
+        values = self._fresh_values(identity_key, "buy")
+        trustworthy = _filter_price_outliers(values, floor_fraction=0.3, ceiling_fraction=3.0)
+        if not trustworthy:
+            return None, 0
+        return max(trustworthy), len(trustworthy)
+
+    def prune_expired(self):
+        """Called periodically (see main.py) to bound memory - the
+        per-read freshness filtering above already ignores stale entries
+        on its own, this just actually removes them so the store doesn't
+        grow without bound over a long-running process."""
+        now = time.time()
+        with self._lock:
+            for key in list(self._entries.keys()):
+                bucket = self._entries[key]
+                bucket[:] = [e for e in bucket if (now - e["ts"]) <= self._max_age_seconds]
+                if not bucket:
+                    del self._entries[key]
+
+    def entry_count(self):
+        with self._lock:
+            return sum(len(b) for b in self._entries.values())
+
+
+def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftable,
+                          spell, killstreak_tier, australium):
+    """
+    The exact tuple LocalListingStore keys entries by. Every field here
+    is something this project ALREADY extracts and validates itself from
+    the raw websocket payload (see main.py's handle_bptf_event) - paint_
+    decimal in particular should be the precise value from paint.color
+    when available (confirmed real for both mannco.store and backpack.tf
+    - see the DIAGNOSTIC SAMPLE-driven fixes earlier this session), not
+    a guessed one, so two listings only share a bucket when they are
+    genuinely the same exact item in every tracked dimension.
+    """
+    return (
+        strip_variant_prefixes(name), quality_name, particle_id, paint_decimal,
+        bool(craftable), spell or None, killstreak_tier or 0, bool(australium),
+    )
+
+
 class BackpackTFPriceList:
     def __init__(self, api_key: str, token: str = "", snapshot_cache_seconds: int = 20):
         self.api_key = api_key
@@ -672,6 +793,7 @@ class BackpackTFPriceList:
         self.session = requests.Session()
         self._snapshot_cache = {}  # (name, quality_id, particle_id, intent) -> (timestamp, [(listing_id, price_keys)])
         self._history_cache = {}  # (name, quality_id, particle_id) -> (timestamp, history_list)
+        self.local_listings = LocalListingStore()
 
     def refresh(self):
         log.info("Refreshing backpack.tf price list...")
@@ -966,6 +1088,58 @@ class BackpackTFPriceList:
                 if listing_particle_id is not None and int(listing_particle_id) != int(particle_id):
                     continue
 
+            # MISSED in the earlier pass that added the checks above -
+            # paint had NO client-side verification at all, despite
+            # being requested via the exact same "trust but verify"
+            # request param as spell/killstreak_tier/etc. Direct,
+            # repeated evidence this was a real gap: the identical 80.42
+            # key buy order kept recurring for the same base item across
+            # SEVERAL different, individually-mapped paints (not team-
+            # coloured, not unmapped - paints that should each resolve
+            # to one specific, correct RGB value) - the one thing that
+            # explains the SAME number regardless of which paint was
+            # actually being evaluated is the paint filter never
+            # actually excluding anything, the exact shape of the
+            # spell bug found and fixed earlier. Checked at both
+            # possible locations (paint object with a "color" hex, or a
+            # raw numeric value) and both listing/item levels, same
+            # "don't bet on one guess" reasoning as killstreak_tier/
+            # particle above - there's no equally direct, independent
+            # confirmation of exactly where/how backpack.tf represents
+            # paint on a search RESULT specifically (as opposed to the
+            # original listing event, where this project does have that
+            # confirmation).
+            if paint_value is not None:
+                listing_paint_obj = listing_item.get("paint") or listing.get("paint")
+                listing_paint_decimal = None
+                if isinstance(listing_paint_obj, dict):
+                    raw_color = listing_paint_obj.get("color")
+                    if isinstance(raw_color, str):
+                        try:
+                            listing_paint_decimal = int(raw_color.lstrip("#"), 16)
+                        except ValueError:
+                            listing_paint_decimal = None
+                    if listing_paint_decimal is None and listing_paint_obj.get("id") is not None:
+                        # Paint can defindex, not an RGB decimal - not
+                        # comparable to paint_value directly, but its
+                        # mere presence still confirms this listing IS
+                        # painted, which is enough to catch the clearest
+                        # contamination case (an unpainted listing's
+                        # price leaking into a painted item's average).
+                        listing_paint_decimal = "has_paint_but_unknown_decimal"
+                elif isinstance(listing_paint_obj, (int, float)):
+                    listing_paint_decimal = int(listing_paint_obj)
+
+                if listing_paint_decimal is not None and listing_paint_decimal != "has_paint_but_unknown_decimal":
+                    if listing_paint_decimal != paint_value:
+                        continue
+                elif listing_paint_obj is None:
+                    # Asked for a specific paint but this listing shows
+                    # no paint data at all (e.g. genuinely unpainted) -
+                    # exclude it, the same way asking for spell=None
+                    # excludes anything WITH a spell.
+                    continue
+
             if not spell:
                 # We asked for "no particular spell" (spell=None omits the
                 # filter entirely) - but per backpack.tf's own forum, there
@@ -1006,28 +1180,60 @@ class BackpackTFPriceList:
                                      australium: bool = False, killstreak_tier=None, paint=None,
                                      killstreaker=None, sheen=None, paint_decimal_override=None):
         """
-        Queries backpack.tf's live classifieds snapshot for this exact item
-        (same name/quality/effect/spell/australium/killstreak/paint) and
-        returns
-        (min_price_in_keys_among_OTHER_active_sell_listings, count_of_other_listings)
-        or (None, 0) if unavailable (no token configured, request failed,
-        or no other listings exist).
+        Returns (min_price_in_keys_among_OTHER_sell_listings,
+        count_of_other_listings), or (None, 0) if not enough fresh,
+        trustworthy data has been self-collected yet for this exact item
+        (same name/quality/effect/spell/australium/killstreak/paint).
 
-        This is the "real market price" signal: what are people *actually*
-        asking for this exact item right now, excluding the listing we're
-        currently evaluating. Before taking the minimum, listings priced
-        suspiciously far below the rest of the pack are dropped (see
-        _filter_price_outliers) - the same principle the community's
-        bptf-autopricer project uses ("Filters Outliers... removes
-        listings with prices that deviate too much from the average") to
-        stop a single troll/mistake/scam-bait listing from corrupting the
-        reference price for everyone else. The returned count reflects
-        the listings actually used (post-filter), since that's what
-        min_other_listings should be trusting.
+        Reads from self.local_listings (see LocalListingStore's own
+        docstring for why this replaced a direct backpack.tf API call:
+        the endpoint this used to query is backpack.tf's own deprecated
+        v1 listings API, confirmed via their Developer Centre changelog,
+        with no v2 replacement for general market search as of the most
+        recent community discussion found). "Live" now means "seen
+        recently via the websocket stream this project already
+        consumes" rather than "queried on demand" - the accuracy
+        principle (never fall back to a stale/community price, skip
+        rather than guess when data is thin) is unchanged, only the
+        SOURCE of the live data is different.
+        """
+        paint_value = paint_decimal_override if paint_decimal_override is not None else (
+            paint_rgb_decimal(paint) if paint else None
+        )
+        key = listing_identity_key(name, quality_name, particle_id, paint_value, craftable,
+                                    spell, killstreak_tier, australium)
+        return self.local_listings.get_min_sell_price(key, exclude_listing_id=exclude_listing_id)
 
-        Requires a backpack.tf user token (separate from the API key - see
-        README). Results are cached briefly per item to avoid hammering the
-        endpoint when several listings for the same item update in a row.
+    def get_best_buy_order_keys(self, name: str, quality_name: str, particle_id=None, craftable=True,
+                                 spell=None, australium: bool = False, killstreak_tier=None, paint=None,
+                                 killstreaker=None, sheen=None, paint_decimal_override=None):
+        """
+        Highest current self-collected BUY-intent price for this exact
+        item, in keys, along with how many fresh buy-intent listings
+        that reflects. Returns (None, 0) if nothing fresh has been
+        collected yet. Same LocalListingStore reasoning as
+        get_snapshot_min_other_keys above - not excluding any particular
+        listing_id here (unlike the sell-side reference) since this
+        isn't evaluating one specific listing, just asking "what's on
+        offer right now for this exact item".
+        """
+        paint_value = paint_decimal_override if paint_decimal_override is not None else (
+            paint_rgb_decimal(paint) if paint else None
+        )
+        key = listing_identity_key(name, quality_name, particle_id, paint_value, craftable,
+                                    spell, killstreak_tier, australium)
+        return self.local_listings.get_max_buy_price(key)
+
+    def _unused_get_snapshot_min_other_keys_OLD(self, name: str, quality_name: str, exclude_listing_id: str,
+                                     particle_id=None, craftable=True, spell=None,
+                                     australium: bool = False, killstreak_tier=None, paint=None,
+                                     killstreaker=None, sheen=None, paint_decimal_override=None):
+        """
+        DEAD CODE, kept only for reference during the transition -
+        queried backpack.tf's now-confirmed-deprecated v1 snapshot
+        endpoint directly. No longer called anywhere. Safe to delete in
+        a later cleanup pass once the local-store approach above has
+        been running long enough to trust fully.
         """
         prices = self._fetch_snapshot_prices(name, quality_name, particle_id, craftable, intent="sell",
                                               spell=spell, australium=australium, killstreak_tier=killstreak_tier,
@@ -1041,40 +1247,6 @@ class BackpackTFPriceList:
             return None, 0
         trustworthy = _filter_price_outliers(others)
         return min(trustworthy), len(trustworthy)
-
-    def get_best_buy_order_keys(self, name: str, quality_name: str, particle_id=None, craftable=True,
-                                 spell=None, australium: bool = False, killstreak_tier=None, paint=None,
-                                 killstreaker=None, sheen=None, paint_decimal_override=None):
-        """
-        Highest current backpack.tf BUY order for this exact item, in
-        keys - i.e. the best price someone is right now offering to pay
-        for it. Returns (best_buy_price_keys, count_of_buy_orders), or
-        (None, 0) if unavailable (no token, request failed, or nobody's
-        currently buying).
-
-        This is what tells you whether a cheap listing can be flipped for
-        an immediate, guaranteed profit rather than just held hoping to
-        resell later. Filtered both floor AND ceiling (see
-        _filter_price_outliers) - a single implausibly-high fake buy
-        order would otherwise make a flip look more profitable than it
-        really is, which matters more here than for sell listings since
-        this number directly implies "you could get X for it right now".
-        Not excluding any particular order (unlike the sell-side
-        reference) since we're not evaluating a specific buy order, just
-        asking "what's on offer".
-        """
-        prices = self._fetch_snapshot_prices(name, quality_name, particle_id, craftable, intent="buy",
-                                              spell=spell, australium=australium, killstreak_tier=killstreak_tier,
-                                              paint=paint, killstreaker=killstreaker, sheen=sheen,
-                                              paint_decimal_override=paint_decimal_override)
-        if not prices:
-            return None, 0
-
-        values = [p for (_lid, p) in prices]
-        trustworthy = _filter_price_outliers(values, floor_fraction=0.3, ceiling_fraction=3.0)
-        if not trustworthy:
-            return None, 0
-        return max(trustworthy), len(trustworthy)
 
     # -- liquidity (best-effort, via price-suggestion recency) ------------
 

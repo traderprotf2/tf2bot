@@ -379,6 +379,20 @@ class Watcher:
     def refresh_prices(self):
         self.bptf.refresh()
 
+    async def _run_telegram(self, func, *args):
+        """Runs a self.telegram.* call on its own small, dedicated
+        thread pool (see run() for why) instead of the shared default
+        pool asyncio.to_thread() would use. Falls back to the default
+        pool if the dedicated one hasn't been set up yet (e.g. anything
+        that calls send_deal directly without going through run() first,
+        such as tests) - a slower path is fine there, correctness isn't
+        affected either way."""
+        executor = getattr(self, "_telegram_executor", None)
+        if executor is None:
+            return await asyncio.to_thread(func, *args)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(executor, func, *args)
+
     def refresh_mannco_key_price(self):
         rate = self.mannco.get_key_price_usd_cents()
         if rate:
@@ -431,6 +445,20 @@ class Watcher:
                 log.warning("mannco.store key price still unavailable - retrying in %ss instead of "
                              "waiting for the full weekly cycle.", retry_seconds)
                 await asyncio.sleep(retry_seconds)
+
+    async def local_store_prune_loop(self):
+        """Periodically removes expired entries from
+        self.bptf.local_listings (see LocalListingStore in
+        bptf_client.py) so a long-running process doesn't accumulate
+        unbounded memory - the per-read freshness filtering already
+        ignores stale entries on its own, this just actually frees
+        them."""
+        while True:
+            await asyncio.sleep(600)
+            try:
+                await asyncio.to_thread(self.bptf.local_listings.prune_expired)
+            except Exception:
+                log.exception("Local listing store prune failed, will retry next cycle.")
 
     async def health_check_loop(self):
         """
@@ -826,9 +854,9 @@ class Watcher:
             # (plain messages allow 4096) - falls straight through to the
             # normal text-only send below either way, so a long alert or a
             # dead/blocked image URL never costs the alert itself.
-            sent_as_photo = await asyncio.to_thread(self.telegram.send_photo, image_url, alert_text, keyboard)
+            sent_as_photo = await self._run_telegram(self.telegram.send_photo, image_url, alert_text, keyboard)
         if not sent_as_photo:
-            await asyncio.to_thread(self.telegram.send, alert_text, keyboard)
+            await self._run_telegram(self.telegram.send, alert_text, keyboard)
 
     # -- mannco.store side ------------------------------------------------
 
@@ -1141,6 +1169,36 @@ class Watcher:
         if price_keys is None:
             return
 
+        intent = payload.get("intent")
+
+        # Record EVERY listing this project sees (both sell AND buy
+        # intent, now that bptf_ws.py passes buy-intent events through
+        # too) into the self-collected local store - see LocalListingStore's
+        # own docstring in bptf_client.py for why this replaced querying
+        # backpack.tf's own (confirmed deprecated) snapshot endpoint.
+        # This has to happen for EVERY listing, not just ones that end up
+        # qualifying as a deal - a listing that isn't itself a bargain is
+        # still exactly the kind of "what's the going rate" comparison
+        # data a LATER listing of the same exact item needs.
+        paint_value_for_identity = paint_decimal_hint if paint_decimal_hint is not None else (
+            bptf_client.paint_rgb_decimal(paint) if paint else None
+        )
+        identity_key = bptf_client.listing_identity_key(
+            name, quality, particle_id, paint_value_for_identity, bool(craftable),
+            spells[0] if spells else None, killstreak_tier, name.startswith("Australium "),
+        )
+        self.bptf.local_listings.record(
+            identity_key, str(listing_id), seller_steamid, price_keys, intent,
+        )
+
+        if intent != "sell":
+            # Buy-intent listings only ever feed the local store above -
+            # there's no "deal" to evaluate or alert on for an offer to
+            # BUY something, only a data point for pricing SELL listings
+            # of the same item later.
+            self.stats["bptf_buy_recorded"] += 1
+            return
+
         # Direct, pre-filled Steam trade-offer link straight to the seller
         # - the fastest way to actually buy - when backpack.tf exposes one
         # publicly for them. The "view the offer on backpack.tf itself"
@@ -1212,7 +1270,7 @@ class Watcher:
         listener = telegram_commands.TelegramCommandListener(
             self.cfg["telegram_bot_token"], self.cfg["telegram_chat_id"]
         )
-        await asyncio.to_thread(self.telegram.register_commands, telegram_commands.BOT_COMMANDS)
+        await self._run_telegram(self.telegram.register_commands, telegram_commands.BOT_COMMANDS)
         log.info("Listening for Telegram commands and button taps...")
 
         while True:
@@ -1237,12 +1295,12 @@ class Watcher:
             command = text.split(maxsplit=1)[0].lower().lstrip("/").split("@")[0]
             if command in ("menu", "settings", "start"):
                 menu_text, keyboard = telegram_commands.build_main_menu(self.runtime)
-                await asyncio.to_thread(self.telegram.send, menu_text, keyboard)
+                await self._run_telegram(self.telegram.send, menu_text, keyboard)
             elif command == "errors":
                 # Sent WITH a keyboard (pagination buttons) - unlike the
                 # other typed commands below, which are plain text.
                 errors_text, keyboard = telegram_commands.build_errors_view(_error_buffer.recent(100))
-                await asyncio.to_thread(self.telegram.send, errors_text, keyboard)
+                await self._run_telegram(self.telegram.send, errors_text, keyboard)
             else:
                 reply = telegram_commands.handle_command(
                     text, self.runtime, has_stn_key=bool(self.cfg.get("stntrading_api_key")),
@@ -1250,7 +1308,7 @@ class Watcher:
                     currently_rate_limited=bptf_client.is_rate_limited(),
                 )
                 log.info("Telegram command: %r -> %s", text, reply.splitlines()[0])
-                await asyncio.to_thread(self.telegram.send, reply)
+                await self._run_telegram(self.telegram.send, reply)
                 if command == "stats":
                     # Each /stats read shows "since last time you checked",
                     # not a lifetime total - reset right after sending so
@@ -1265,9 +1323,9 @@ class Watcher:
             log.info("Telegram button: %r", event["data"])
             # Answer first so Telegram clears the button's loading spinner
             # even if the edit below is slow or fails.
-            await asyncio.to_thread(self.telegram.answer_callback_query, event["id"])
+            await self._run_telegram(self.telegram.answer_callback_query, event["id"])
             if event["message_id"] is not None:
-                await asyncio.to_thread(self.telegram.edit_message, event["message_id"], menu_text, keyboard)
+                await self._run_telegram(self.telegram.edit_message, event["message_id"], menu_text, keyboard)
 
     async def _startup_sanity_check(self):
         """
@@ -1319,33 +1377,33 @@ class Watcher:
         message = "⚠️ <b>Проверка при запуске нашла возможные проблемы:</b>\n\n" + "\n\n".join(
             f"• {p}" for p in problems
         )
-        await asyncio.to_thread(self.telegram.send, message)
+        await self._run_telegram(self.telegram.send, message)
 
     async def run(self):
-        # CRITICAL: Python's asyncio.to_thread() shares one small
-        # thread pool by default (min(32, cpu_count+4), often ~32-36
-        # threads) across EVERY use of it anywhere in the process - not
-        # just backpack.tf/mannco.store evaluations, but also every
-        # Telegram send/reply/callback-answer (see telegram_command_loop
-        # and send_deal below), Steam inventory checks, and more. Once
-        # listing events started being dispatched concurrently (see
-        # bptf_ws.py/mannco_ws.py's _dispatch_semaphore, up to 60+60
-        # potentially "in flight" at once) instead of one at a time, each
-        # evaluate_listing() call can hold onto a worker thread for its
-        # entire throttled request chain (up to tens of seconds of
-        # time.sleep() inside the account pool's throttle) - direct
-        # feedback confirmed this: with that many long-lived threads
-        # competing for a ~32-thread pool, Telegram's OWN to_thread calls
-        # (a completely unrelated concern) were queuing up behind them,
-        # making the bot feel laggy for commands that have nothing to do
-        # with pricing at all. Set once, explicitly, before anything else
-        # in this process uses to_thread - large enough that the busiest
-        # realistic combination of concurrent evaluations plus normal
-        # Telegram/inventory/other usage never has to wait for a free
-        # worker.
-        asyncio.get_running_loop().set_default_executor(
-            concurrent.futures.ThreadPoolExecutor(max_workers=200)
-        )
+        # Telegram gets its OWN small, dedicated thread pool, separate
+        # from the one asyncio.to_thread() uses by default for
+        # everything else (evaluate_listing, Steam inventory checks,
+        # etc.) - NOT just a bigger shared pool. A real report showed
+        # Telegram commands lagging once listing events started being
+        # dispatched concurrently (bptf_ws.py/mannco_ws.py's
+        # _dispatch_semaphore, up to 60+60 potentially "in flight" at
+        # once, each holding a worker thread for its entire throttled
+        # request chain - tens of seconds of time.sleep() inside the
+        # account pool's throttle) - Telegram's own to_thread calls were
+        # queuing up behind all of that on the SAME small default pool.
+        # The first fix here simply made the shared pool much bigger
+        # (200 workers) - but a second, separate report then showed
+        # something worse: 100% of evaluations failing right after that
+        # change, on a small VPS (real hostname seen elsewhere: "vm-
+        # nano") - 200 real OS threads is a real, sometimes-too-heavy
+        # resource ask on a box that small, however roomy it looks on
+        # paper. A dedicated small pool for Telegram specifically (it
+        # only ever needs a handful of threads - calls are quick and
+        # infrequent) solves the ORIGINAL lag without needing the shared
+        # pool to be huge at all - see _run_telegram below, used
+        # everywhere self.telegram.* used to go through plain
+        # asyncio.to_thread.
+        self._telegram_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
         log.info("Starting up: loading initial prices...")
         try:
@@ -1375,6 +1433,7 @@ class Watcher:
             self.key_price_refresh_loop(),
             self.telegram_command_loop(),
             self.health_check_loop(),
+            self.local_store_prune_loop(),
             self.marketplacetf_poll_loop(),
             self.stntrading_poll_loop(),
             mannco_ws.stream_listing_events(self.handle_mannco_event),

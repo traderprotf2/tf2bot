@@ -53,6 +53,19 @@ def fetch_particle_name_to_id(steam_api_key: str):
             pid = p.get("id")
             if name is not None and pid is not None:
                 mapping[name] = int(pid)
+        if not mapping:
+            # A real /stats report showed 0 effects loaded with NO
+            # accompanying exception anywhere in /errors - meaning the
+            # request itself succeeded (200 OK, valid JSON) but the
+            # expected data wasn't in it, which the try/except below
+            # can't catch since nothing actually raised. Most likely
+            # cause: an invalid/expired Steam API key still returns 200
+            # with an empty or error-shaped body rather than a 4xx here.
+            # Logging the raw response is the only way to tell which.
+            log.warning(
+                "Steam schema request succeeded but yielded 0 particle effects - raw response: %r",
+                data,
+            )
         log.info("Loaded %d unusual particle effects from Steam schema.", len(mapping))
         return mapping
     except Exception:
@@ -108,6 +121,20 @@ def fetch_defindex_to_name(steam_api_key: str, max_pages: int = 20):
             start = result.get("next")
             if not start:
                 break
+        if not name_mapping:
+            # Same reasoning as fetch_particle_name_to_id's identical
+            # fix - a real report showed both this and that function
+            # returning 0 items with no exception anywhere to explain
+            # why, meaning the request itself succeeded but the expected
+            # data wasn't there. Logging the first page's raw response
+            # (not every page - this could run for up to 20 pages) is
+            # enough to tell whether it's an auth problem, a genuinely
+            # empty result, or something else entirely.
+            log.warning(
+                "Steam schema items request succeeded but yielded 0 items - raw first-page "
+                "response: %r",
+                data,
+            )
         log.info("Loaded %d defindex->name mappings (%d with images) from Steam schema.",
                   len(name_mapping), len(image_mapping))
         return name_mapping, image_mapping

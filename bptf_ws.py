@@ -120,7 +120,17 @@ async def stream_listing_events(on_event):
                             continue
                         if payload.get("appid") != 440:
                             continue
-                        if payload.get("intent") != "sell":
+                        # BOTH intents now passed through - a real, major
+                        # finding: buy-intent events used to be dropped
+                        # right here, meaning this project's own "buy
+                        # order" numbers NEVER came from anything seen on
+                        # this websocket at all, only from the (now-
+                        # confirmed-deprecated, see bptf_client.py's
+                        # LocalListingStore docstring) snapshot API call.
+                        # main.py's handle_bptf_event records "buy"
+                        # events into the local store without running the
+                        # full sell-side deal evaluation on them.
+                        if payload.get("intent") not in ("sell", "buy"):
                             continue
                         if payload.get("status") not in (None, "active"):
                             continue
