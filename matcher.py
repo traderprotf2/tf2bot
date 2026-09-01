@@ -29,7 +29,6 @@ from typing import List, Optional
 
 from bptf_client import (
     build_classifieds_url,
-    is_rate_limited,
     name_for_killstreak_tier,
     paint_rgb_decimal,
     strip_killstreak_prefix,
@@ -179,23 +178,28 @@ def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, 
 
     if ref_keys is not None and other_count >= min_other_listings:
         log.info(
-            "Reference for %s: %.2f keys from LIVE snapshot (%d other listing(s)).",
+            "Reference for %s: %.2f keys from self-collected live data (%d other listing(s)).",
             name, ref_keys, other_count,
         )
         return ref_keys
 
-    if is_rate_limited():
-        log.info(
-            "Skipping %s - backpack.tf rate-limit cooldown is active, so 'not enough live "
-            "listings' can't be trusted as genuine right now.",
-            name,
-        )
-    else:
-        log.info(
-            "Skipping %s - only %s live listing(s) found, needed >= %d. Not falling back to "
-            "the community-suggested price - only live listings count here.",
-            name, other_count if ref_keys is not None else 0, min_other_listings,
-        )
+    # No longer branches on is_rate_limited() - that check made sense
+    # back when this queried backpack.tf's API live and a 429 cooldown
+    # was a real, distinct reason "no data" could mean "we didn't even
+    # ask" rather than "genuinely nothing there". Now that this reads
+    # purely from the self-collected local store (no HTTP call in this
+    # path at all - see LocalListingStore in bptf_client.py),
+    # backpack.tf's rate-limit state is unrelated to whether enough of
+    # THIS exact item has been seen via the websocket - branching on it
+    # here risked blaming a rate limit (possibly active for a completely
+    # different reason, like the optional price-history fetch) for what
+    # is actually just "not enough self-collected data yet".
+    log.info(
+        "Skipping %s - only %s listing(s) self-collected so far (needed >= %d) for "
+        "this exact item. Not a stale/community price - genuinely no comparable live "
+        "data collected yet.",
+        name, other_count if ref_keys is not None else 0, min_other_listings,
+    )
     return None
 
 

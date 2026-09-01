@@ -442,6 +442,30 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
         too_small = stats.get(f"{prefix}_rejected_discount_too_small", 0)
         if too_small:
             detail_bits.append(f"{too_small} скидка меньше порога")
+        # The REST of evaluate_listing's own reject() reasons (see
+        # matcher.py) - added after a real report where only 107 of 494
+        # rejected-by-checks items were accounted for by the two bits
+        # above, leaving 387 with no visibility into why at all. These
+        # are lower-volume in the common case (most rejections are one
+        # of the two above), which is why they were folded into the
+        # aggregate originally - but "usually low volume" isn't the same
+        # as "never worth seeing", and there was no way to tell the two
+        # apart without this.
+        min_price = stats.get(f"{prefix}_rejected_min_price", 0)
+        if min_price:
+            detail_bits.append(f"{min_price} ниже мин. цены")
+        kit_cat = stats.get(f"{prefix}_rejected_kit_category", 0)
+        if kit_cat:
+            detail_bits.append(f"{kit_cat} killstreak kit")
+        no_particle = stats.get(f"{prefix}_rejected_no_particle_id", 0)
+        if no_particle:
+            detail_bits.append(f"{no_particle} не разрешён эффект")
+        unmapped_paint = stats.get(f"{prefix}_rejected_unmapped_paint", 0)
+        if unmapped_paint:
+            detail_bits.append(f"{unmapped_paint} неизвестная краска")
+        tier_inconsistent = stats.get(f"{prefix}_rejected_tier_inconsistency", 0)
+        if tier_inconsistent:
+            detail_bits.append(f"{tier_inconsistent} нестабильные тиры")
         # mannco.store-specific stages, added after a real gap in this
         # display: 4854 received with 0 evaluated and none of the counts
         # above accounting for it - traced to a rate-limited details
