@@ -1,6 +1,7 @@
 config.json
 webhook_secret.txt
 runtime_state.json
+local_listings_state.json
 error_log.jsonl
 __pycache__/
 *.pyc

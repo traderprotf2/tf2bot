@@ -494,6 +494,27 @@ class Watcher:
             except Exception:
                 log.exception("Local listing store prune failed, will retry next cycle.")
 
+    async def local_store_snapshot_loop(self):
+        """
+        Periodically saves self.bptf.local_listings to disk (see
+        LocalListingStore.save_to_disk) so the data isn't lost on every
+        restart - a real, direct point made clear that updating the bot
+        (which happens often) was wiping the store's entire accumulated
+        knowledge each time, undermining the accuracy this whole
+        architecture exists for right when it mattered most. Every 90
+        seconds is a deliberate middle ground: frequent enough that a
+        restart loses at most that much of the very latest data, rare
+        enough that the disk write (done off the event loop, via
+        to_thread, so it never costs any processing speed) isn't
+        happening on anything like a per-event basis.
+        """
+        while True:
+            await asyncio.sleep(90)
+            try:
+                await asyncio.to_thread(self.bptf.local_listings.save_to_disk, bptf_client.LOCAL_LISTINGS_STATE_PATH)
+            except Exception:
+                log.exception("Local listing store snapshot save failed, will retry next cycle.")
+
     async def health_check_loop(self):
         """
         Proactively pings Telegram only when something looks worth
@@ -1040,6 +1061,15 @@ class Watcher:
     # -- backpack.tf side ---------------------------------------------------
 
     async def handle_bptf_event(self, payload: dict):
+        if payload.get("_bptf_event_type") == "delete":
+            # Processed regardless of pause state - keeping the local
+            # store accurate is a separate concern from whether alerts
+            # are currently being sent, and costs nothing to do anyway.
+            listing_id = payload.get("id")
+            if listing_id is not None:
+                self.bptf.local_listings.remove_listing(str(listing_id))
+            return
+
         if self.runtime.paused:
             return
         self.stats["bptf_received"] += 1
@@ -1468,6 +1498,18 @@ class Watcher:
         # asyncio.to_thread.
         self._telegram_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
+        # Restores whatever the local listing store had saved right
+        # before this run started (or a previous one, if this is the
+        # first run since a save) - see LocalListingStore.load_from_disk
+        # and local_store_snapshot_loop below for why this exists: a
+        # real, direct point that restarting for every update (routine
+        # during active development) was otherwise wiping out everything
+        # the store had learned each time. Done before anything else
+        # touches self.bptf.local_listings, so the very first real
+        # listing evaluated after a restart already has recent
+        # comparison data available, not an empty store.
+        await asyncio.to_thread(self.bptf.local_listings.load_from_disk, bptf_client.LOCAL_LISTINGS_STATE_PATH)
+
         log.info("Starting up: loading initial prices...")
         try:
             await asyncio.to_thread(self.refresh_prices)
@@ -1497,6 +1539,7 @@ class Watcher:
             self.telegram_command_loop(),
             self.health_check_loop(),
             self.local_store_prune_loop(),
+            self.local_store_snapshot_loop(),
             self.known_tf2_ids_refresh_loop(),
             self.marketplacetf_poll_loop(),
             self.stntrading_poll_loop(),

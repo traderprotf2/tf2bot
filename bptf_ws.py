@@ -113,7 +113,24 @@ async def stream_listing_events(on_event):
                         events = [events]
 
                     for e in events:
-                        if e.get("event") != "listing-update":
+                        event_type = e.get("event")
+                        if event_type == "listing-delete":
+                            # Real, confirmed event type (backpack.tf's
+                            # own developer docs) - lets the local store
+                            # (see bptf_client.py's LocalListingStore)
+                            # drop a listing immediately instead of
+                            # waiting for it to time out of its
+                            # freshness window naturally. Payload here is
+                            # much smaller than an update's (just an id,
+                            # not a full item) - dispatched with an
+                            # explicit marker so handle_bptf_event can
+                            # tell the two apart without guessing from
+                            # shape alone.
+                            delete_payload = e.get("payload") or {}
+                            delete_payload["_bptf_event_type"] = "delete"
+                            asyncio.create_task(_dispatch_event(on_event, delete_payload))
+                            continue
+                        if event_type != "listing-update":
                             continue
                         payload = e.get("payload")
                         if not payload:

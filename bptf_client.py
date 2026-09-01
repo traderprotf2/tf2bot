@@ -18,7 +18,9 @@ the key (in refined metal) is used to convert its metal-denominated prices
 into keys.
 """
 
+import json
 import logging
+import os
 import threading
 import time
 
@@ -372,6 +374,12 @@ def team_color_paint_decimals(paint_name: str):
 
 PRICES_URL = "https://backpack.tf/api/IGetPrices/v4"
 SNAPSHOT_URL = "https://backpack.tf/api/classifieds/listings/snapshot"
+
+# Same directory-relative convention as runtime_settings.py's own
+# STATE_PATH - where LocalListingStore's save_to_disk/load_from_disk
+# persist across restarts (see main.py's local_store_snapshot_loop and
+# Watcher.run()).
+LOCAL_LISTINGS_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_listings_state.json")
 HISTORY_URL = "https://backpack.tf/api/IGetPriceHistory/v1"
 # NOTE: the three API endpoints above are on the stable `backpack.tf/api`
 # base - confirmed current via backpack.tf's own live OpenAPI/Swagger spec
@@ -723,9 +731,25 @@ class LocalListingStore:
     asyncio.to_thread(evaluate_listing, ...).
     """
 
-    def __init__(self, max_age_seconds=3600, max_entries_per_key=300):
+    def __init__(self, max_age_seconds=3600, buy_max_age_seconds=None, max_entries_per_key=300):
         self._entries = {}  # identity_key -> list of {listing_id, seller_id, price_keys, ts, intent}
         self._max_age_seconds = max_age_seconds
+        # Buy orders get their own, MUCH longer freshness window by
+        # default (10x the sell-side one) - per direct feedback that
+        # requiring buy orders to be re-seen within the same short
+        # window as sell listings was starving alerts of profit-flip
+        # info far more than necessary. A sell listing genuinely can
+        # vanish (sold to someone else) at any moment, so a short window
+        # there is the right caution - but a BUY order is a standing
+        # offer that stays live until its owner cancels it; it doesn't
+        # need to be "re-bumped" recently to still be real. Confirmed via
+        # backpack.tf's own websocket docs that listing-update only fires
+        # on an actual create/update (no periodic re-announce), so an
+        # existing buy order that hasn't changed simply won't generate a
+        # new event for a long time - a short window would mean re-
+        # "forgetting" it before this project ever gets a chance to see
+        # it again.
+        self._buy_max_age_seconds = buy_max_age_seconds if buy_max_age_seconds is not None else max_age_seconds * 10
         self._max_entries_per_key = max_entries_per_key
         self._lock = threading.Lock()
 
@@ -747,15 +771,32 @@ class LocalListingStore:
                 bucket.sort(key=lambda e: e["ts"])
                 del bucket[:len(bucket) - self._max_entries_per_key]
 
+    def remove_listing(self, listing_id):
+        """Removes a specific listing by id from every bucket it might be
+        in, immediately - called on backpack.tf's own "listing-delete"
+        websocket event (a real, confirmed event type, see main.py),
+        rather than waiting for it to time out of the freshness window
+        naturally. Doesn't know which bucket a listing_id lives in
+        without the full identity key, so this scans - acceptable since
+        deletes are far rarer than the records happening constantly, and
+        each bucket is small (capped at max_entries_per_key)."""
+        with self._lock:
+            for bucket in self._entries.values():
+                bucket[:] = [e for e in bucket if e["listing_id"] != listing_id]
+
+    def _max_age_for(self, intent):
+        return self._buy_max_age_seconds if intent == "buy" else self._max_age_seconds
+
     def _fresh_values(self, identity_key, intent, exclude_listing_id=None):
         now = time.time()
+        max_age = self._max_age_for(intent)
         with self._lock:
             bucket = list(self._entries.get(identity_key, ()))
         return [
             e["price_keys"] for e in bucket
             if e["intent"] == intent
             and e["listing_id"] != exclude_listing_id
-            and (now - e["ts"]) <= self._max_age_seconds
+            and (now - e["ts"]) <= max_age
         ]
 
     def get_min_sell_price(self, identity_key, exclude_listing_id=None):
@@ -780,18 +821,76 @@ class LocalListingStore:
         """Called periodically (see main.py) to bound memory - the
         per-read freshness filtering above already ignores stale entries
         on its own, this just actually removes them so the store doesn't
-        grow without bound over a long-running process."""
+        grow without bound over a long-running process. Each entry is
+        checked against ITS OWN intent's freshness window (buy orders
+        live much longer than sell listings - see __init__)."""
         now = time.time()
         with self._lock:
             for key in list(self._entries.keys()):
                 bucket = self._entries[key]
-                bucket[:] = [e for e in bucket if (now - e["ts"]) <= self._max_age_seconds]
+                bucket[:] = [e for e in bucket if (now - e["ts"]) <= self._max_age_for(e["intent"])]
                 if not bucket:
                     del self._entries[key]
 
     def entry_count(self):
         with self._lock:
             return sum(len(b) for b in self._entries.values())
+
+    def save_to_disk(self, path):
+        """
+        Snapshots the entire store to a JSON file - see load_from_disk
+        and main.py's local_store_snapshot_loop for why this exists: a
+        real, direct point made clear that restarting for every update
+        (which happens often during active development) was wiping out
+        everything this store had learned each time, meaning the
+        project's own accuracy - the whole reason it exists - kept
+        resetting to zero right when it was needed most. Called
+        periodically from a background loop, not on every record() -
+        writing a whole file per event would be real, needless overhead
+        on the hot path; a snapshot every minute or two loses at most
+        that much of the MOST recent data on a restart, not everything.
+        Identity-key tuples become JSON-compatible lists here - see
+        load_from_disk for the reverse.
+        """
+        try:
+            with self._lock:
+                serializable = [
+                    {"key": list(key), "bucket": bucket}
+                    for key, bucket in self._entries.items()
+                ]
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(serializable, f)
+            os.replace(tmp_path, path)
+        except Exception:
+            log.exception("Could not save local listing store to disk.")
+
+    def load_from_disk(self, path):
+        """
+        Restores a previous save_to_disk snapshot, if one exists -
+        called once at startup, before the websocket listeners begin,
+        so evaluations can use recently-collected data immediately after
+        a restart instead of starting completely cold. Deliberately does
+        NOT special-case staleness here: entries loaded from an old
+        snapshot go through the exact same freshness-window check
+        (_fresh_values) as any other entry - if the snapshot itself is
+        old enough that its entries have expired, they're correctly
+        ignored the normal way, not because loading did anything special
+        for them.
+        """
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                serializable = json.load(f)
+            with self._lock:
+                for item in serializable:
+                    key = tuple(item["key"])
+                    self._entries[key] = item["bucket"]
+            log.info("Loaded %d local listing store entries from disk (%s).",
+                      self.entry_count(), path)
+        except Exception:
+            log.exception("Could not load local listing store from disk - starting fresh.")
 
 
 def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftable,
