@@ -251,6 +251,8 @@ def mannco_paint_decimal_hint(details: dict):
 class Watcher:
     def __init__(self, cfg):
         self.cfg = cfg
+        self._effective_cfg_cache = None
+        self._effective_cfg_cache_version = None
         # The primary account (backpacktf_api_key/backpacktf_token) is
         # always included, plus any extra accounts in backpacktf_accounts
         # - confirmed with backpack.tf that running several accounts'
@@ -378,10 +380,26 @@ class Watcher:
         The dict matcher.evaluate_listing() reads its filter settings
         from - static values from config.json, overlaid with whatever is
         currently set at runtime (via Telegram commands; see
-        runtime_settings.py). Rebuilt on every call so a command takes
-        effect on the very next listing event, no restart needed.
+        runtime_settings.py) - so a command takes effect on the very
+        next listing event, no restart needed.
+
+        Cached, keyed by self.runtime._version (bumped only by
+        RuntimeSettings.save(), i.e. only on an actual mutation) -
+        previously rebuilt this ~30-key dict fresh on EVERY call
+        (**self.cfg unpacking copies every key, every time), which given
+        this runs once per evaluate_listing() call adds up: a real
+        /stats report showed 52525 evaluations in 135 minutes, meaning
+        that many full dict copies done synchronously on the main event
+        loop (this runs before the asyncio.to_thread dispatch, not
+        inside it) - competing for the same event loop time as
+        everything else, including the Telegram command loop, for a
+        result that's IDENTICAL on 99.9%+ of those calls, since runtime
+        settings only change when a person actually issues a command.
         """
-        return {
+        version = self.runtime._version
+        if self._effective_cfg_cache is not None and self._effective_cfg_cache_version == version:
+            return self._effective_cfg_cache
+        merged = {
             **self.cfg,
             "min_price_keys": self.runtime.min_price_keys,
             "watched_qualities": self.runtime.watched_qualities,
@@ -389,6 +407,9 @@ class Watcher:
             "discount_threshold_percent": self.runtime.discount_threshold_percent,
             "max_days_since_price_update": self.runtime.max_days_since_price_update,
         }
+        self._effective_cfg_cache = merged
+        self._effective_cfg_cache_version = version
+        return merged
 
     def refresh_prices(self):
         self.bptf.refresh()

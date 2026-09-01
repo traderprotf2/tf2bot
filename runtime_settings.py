@@ -38,6 +38,14 @@ class RuntimeSettings:
         self.max_days_since_price_update = max_days_since_price_update
         self.stn_watchlist = list(stn_watchlist or [])
         self._lock = threading.Lock()
+        # Bumped by save() below on every actual mutation - lets
+        # Watcher.effective_cfg() (main.py) cache its merged dict and
+        # only rebuild it when something genuinely changed, instead of
+        # copying config.py's full ~30-key dict fresh on every single
+        # evaluate_listing() call regardless of whether any Telegram
+        # command has ever been issued. See effective_cfg's own comment
+        # for the real numbers this was costing.
+        self._version = 0
 
     @classmethod
     def load(cls, cfg):
@@ -84,6 +92,7 @@ class RuntimeSettings:
 
     def save(self):
         with self._lock:
+            self._version += 1
             data = {
                 "paused": self.paused,
                 "australium_only": self.australium_only,

@@ -1,0 +1,15 @@
+{
+  "paused": false,
+  "australium_only": false,
+  "min_price_keys": 5,
+  "watched_qualities": [
+    "Strange",
+    "Unique"
+  ],
+  "watched_categories": [
+    "weapon"
+  ],
+  "discount_threshold_percent": 5,
+  "max_days_since_price_update": 90,
+  "stn_watchlist": []
+}

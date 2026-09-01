@@ -732,7 +732,7 @@ class LocalListingStore:
     """
 
     def __init__(self, max_age_seconds=3600, buy_max_age_seconds=None, max_entries_per_key=300):
-        self._entries = {}  # identity_key -> list of {listing_id, seller_id, price_keys, ts, intent}
+        self._entries = {}  # identity_key -> {listing_id: {listing_id, seller_id, price_keys, ts, intent}}
         self._max_age_seconds = max_age_seconds
         # Buy orders get their own, MUCH longer freshness window by
         # default (10x the sell-side one) - per direct feedback that
@@ -754,22 +754,37 @@ class LocalListingStore:
         self._lock = threading.Lock()
 
     def record(self, identity_key, listing_id, seller_id, price_keys, intent, timestamp=None):
+        """
+        Each bucket is a dict keyed by listing_id (not a plain list) -
+        deliberately, after profiling against a real /stats report's
+        actual scale (211315 buy-side records alone for backpack.tf in
+        135 minutes): a list required scanning every existing entry on
+        EVERY call just to drop a possible duplicate for the same
+        listing_id before appending, an O(bucket size) cost paid on the
+        single hottest path in this whole project, for what's usually a
+        brand new listing_id with nothing to actually find. Dict
+        assignment (bucket[listing_id] = ...) inherently replaces any
+        existing entry for that key - same "no duplicate accumulation"
+        behavior as before, now O(1) instead of O(n).
+        """
         if price_keys is None or price_keys <= 0:
             return
         ts = timestamp if timestamp is not None else time.time()
         with self._lock:
-            bucket = self._entries.setdefault(identity_key, [])
-            # Replace any existing entry for the same listing_id (a
-            # price change or re-list bump) instead of accumulating
-            # duplicates for what's really the same listing over time.
-            bucket[:] = [e for e in bucket if e["listing_id"] != listing_id]
-            bucket.append({
+            bucket = self._entries.setdefault(identity_key, {})
+            bucket[listing_id] = {
                 "listing_id": listing_id, "seller_id": seller_id,
                 "price_keys": price_keys, "ts": ts, "intent": intent,
-            })
+            }
             if len(bucket) > self._max_entries_per_key:
-                bucket.sort(key=lambda e: e["ts"])
-                del bucket[:len(bucket) - self._max_entries_per_key]
+                # Only reached once a bucket genuinely exceeds the cap
+                # (rare - most items never see 300+ distinct fresh
+                # listings) - trimming itself is still O(n log n), but
+                # that cost is no longer paid on every single call the
+                # way the old duplicate-scan was.
+                oldest_first = sorted(bucket.values(), key=lambda e: e["ts"])
+                for stale in oldest_first[:len(bucket) - self._max_entries_per_key]:
+                    del bucket[stale["listing_id"]]
 
     def remove_listing(self, listing_id):
         """Removes a specific listing by id from every bucket it might be
@@ -777,12 +792,14 @@ class LocalListingStore:
         websocket event (a real, confirmed event type, see main.py),
         rather than waiting for it to time out of the freshness window
         naturally. Doesn't know which bucket a listing_id lives in
-        without the full identity key, so this scans - acceptable since
-        deletes are far rarer than the records happening constantly, and
-        each bucket is small (capped at max_entries_per_key)."""
+        without the full identity key, so this still scans every
+        BUCKET (deletes are far rarer than records, and there are many
+        fewer buckets than total entries) - but within each bucket, the
+        removal itself is now O(1) (a dict pop) rather than O(bucket
+        size), the same dict-keyed-by-listing_id change as record()."""
         with self._lock:
             for bucket in self._entries.values():
-                bucket[:] = [e for e in bucket if e["listing_id"] != listing_id]
+                bucket.pop(listing_id, None)
 
     def _max_age_for(self, intent):
         return self._buy_max_age_seconds if intent == "buy" else self._max_age_seconds
@@ -792,7 +809,7 @@ class LocalListingStore:
         if max_age is None:
             max_age = self._max_age_for(intent)
         with self._lock:
-            bucket = list(self._entries.get(identity_key, ()))
+            bucket = list(self._entries.get(identity_key, {}).values())
         return [
             e for e in bucket
             if e["intent"] == intent
@@ -860,7 +877,12 @@ class LocalListingStore:
         with self._lock:
             for key in list(self._entries.keys()):
                 bucket = self._entries[key]
-                bucket[:] = [e for e in bucket if (now - e["ts"]) <= self._max_age_for(e["intent"])]
+                expired_ids = [
+                    lid for lid, e in bucket.items()
+                    if (now - e["ts"]) > self._max_age_for(e["intent"])
+                ]
+                for lid in expired_ids:
+                    del bucket[lid]
                 if not bucket:
                     del self._entries[key]
 
