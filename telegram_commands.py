@@ -436,6 +436,14 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
         no_key_price = stats.get(f"{prefix}_no_key_price", 0)
         if no_key_price:
             detail_bits.append(f"{no_key_price} нет цены ключа")
+        # backpack.tf only - buy-intent listings recorded into the local
+        # store (see LocalListingStore) rather than evaluated for a deal.
+        # Added after a real report where this bucket alone accounted
+        # for the majority of "received" with no visible explanation
+        # anywhere in the numbers shown.
+        buy_recorded = stats.get(f"{prefix}_buy_recorded", 0)
+        if buy_recorded:
+            detail_bits.append(f"{buy_recorded} buy-заявок записано в базу")
         detail = f" ({', '.join(detail_bits)})" if detail_bits else ""
 
         lines.append(

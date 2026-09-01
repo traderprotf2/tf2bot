@@ -48,6 +48,7 @@ class TelegramErrorBuffer(logging.Handler):
         super().__init__(level=logging.WARNING)
         self.buffer = collections.deque(maxlen=MAX_ERRORS_KEPT)
         self._lock = threading.Lock()
+        self._trim_lock = threading.Lock()
         self._writes_since_trim = 0
         self._load_from_disk()
 
@@ -81,16 +82,40 @@ class TelegramErrorBuffer(logging.Handler):
             }
             with self._lock:
                 self.buffer.append(entry)
+            # Disk write happens OUTSIDE the lock - a real report showed
+            # /errors (recent() below, which needs this same lock) never
+            # responding across several attempts during a run generating
+            # a very high volume of log calls (thousands/minute). Every
+            # emit() previously held the lock for the ENTIRE duration of
+            # a synchronous disk write (a real, blocking file open+write
+            # syscall), so a reader could be starved indefinitely if
+            # writes kept arriving faster than each one's disk I/O
+            # completed. Readers only ever need the in-memory buffer
+            # (self.buffer, appended above), never the file on disk - so
+            # there is no correctness reason for a read to wait on a
+            # write's disk I/O in the first place.
+            try:
                 with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                self._writes_since_trim += 1
-                if self._writes_since_trim >= _TRIM_EVERY_N_WRITES:
-                    self._trim_file()
-                    self._writes_since_trim = 0
+            except Exception:
+                pass
+            self._writes_since_trim += 1
+            if self._writes_since_trim >= _TRIM_EVERY_N_WRITES:
+                self._trim_file()
+                self._writes_since_trim = 0
         except Exception:
             pass
 
     def _trim_file(self):
+        # Also deliberately outside self._lock (same reasoning as the
+        # write above) - and now further guarded by its OWN lock
+        # (_trim_lock, not self._lock) so two trims can't run
+        # concurrently and corrupt the file between them, without that
+        # guard ever blocking a plain read() or a plain append.
+        if not self._trim_lock.acquire(blocking=False):
+            # Another trim is already in progress - skip this one rather
+            # than wait; the next write's trim check will catch up.
+            return
         try:
             with open(LOG_FILE_PATH, "r", encoding="utf-8") as f:
                 lines = f.readlines()
@@ -99,6 +124,8 @@ class TelegramErrorBuffer(logging.Handler):
                     f.writelines(lines[-_TRIM_KEEP_LINES:])
         except Exception:
             pass
+        finally:
+            self._trim_lock.release()
 
     def recent(self, n=20):
         with self._lock:
