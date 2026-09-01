@@ -439,6 +439,36 @@ def name_for_killstreak_tier(name_without_killstreak: str, tier: int) -> str:
     return f"{KILLSTREAK_TIER_NAMES.get(tier, '')}{name_without_killstreak}"
 
 
+def strip_effect_prefix(name: str, particle_name: str) -> str:
+    """
+    Strips an Unusual particle effect name from the FRONT of the item
+    name, e.g. strip_effect_prefix("Circling Heart Hot Dogger", "Circling
+    Heart") -> "Hot Dogger". Needed because backpack.tf's own item.name
+    field already includes the effect as a display prefix (confirmed by
+    a real alert AND the real classifieds listings behind it both
+    showing "Circling Heart Hot Dogger" as one string) - without this,
+    the effect name ends up duplicated in an alert's own display text
+    ("Unusual Circling Heart Hot Dogger (Circling Heart)"), and more
+    importantly the classifieds search link ends up searching for an
+    item literally named "Circling Heart Hot Dogger" while ALSO passing
+    particle=<id> separately, which doesn't match anything real - a
+    direct report confirmed the resulting link simply didn't work,
+    exactly like strip_variant_prefixes' own docstring describes for a
+    stale name mismatch elsewhere.
+
+    Only strips when the name genuinely starts with "<particle_name> "
+    (case-sensitive, matching backpack.tf's own capitalization) - if it
+    doesn't (e.g. a source that DOESN'T prefix the effect this way), the
+    name is returned unchanged rather than guessing.
+    """
+    if not particle_name:
+        return name
+    prefix = particle_name + " "
+    if name.startswith(prefix):
+        return name[len(prefix):]
+    return name
+
+
 def strip_variant_prefixes(name: str) -> str:
     """
     Strips "Non-Craftable", Killstreak-tier, and Australium prefixes on

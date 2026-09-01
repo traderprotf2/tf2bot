@@ -335,6 +335,18 @@ class Watcher:
         # this is safe to keep for the whole run without expiring it the
         # way the recent-listings dedup cache does.
         self._known_non_tf2_item_ids = set()
+        # None means "not yet successfully prefetched" - distinct from an
+        # empty set, which would incorrectly mean "no TF2 items exist at
+        # all". See known_tf2_ids_refresh_loop and mannco_client.py's
+        # fetch_game_item_ids for why this exists: a real report showed
+        # non-TF2 items still costing a full get_item_details call even
+        # with the id-cache above, because that cache only helps on a
+        # REPEAT of the same non-TF2 item - a constant stream of
+        # distinct, never-before-seen CS2/Dota2/Rust items each paid the
+        # full cost once regardless. When this set IS loaded, an incoming
+        # item_id not in it can be skipped immediately, before any
+        # per-item API call at all.
+        self.known_tf2_item_ids = None
 
         # Which "kinds" of item structure we've already logged a raw
         # sample of since startup - see the sampling calls in
@@ -445,6 +457,28 @@ class Watcher:
                 log.warning("mannco.store key price still unavailable - retrying in %ss instead of "
                              "waiting for the full weekly cycle.", retry_seconds)
                 await asyncio.sleep(retry_seconds)
+
+    async def known_tf2_ids_refresh_loop(self):
+        """
+        Refreshes self.known_tf2_item_ids from mannco_client.py's bulk
+        fetch_game_item_ids(440) - see there and known_tf2_item_ids'
+        own comment for why. Runs once immediately (so the fast-path
+        filter is available as soon as possible after startup), then on
+        a slow, multi-hour cadence - the set of TF2 items barely changes
+        day to day, and the endpoint itself is documented at 1 request
+        per 5 minutes per key, so there's no reason to refresh often.
+        A failed attempt leaves the PREVIOUS value in place (or None, if
+        this is the very first attempt) rather than clearing it - a
+        transient failure shouldn't throw away a working filter.
+        """
+        while True:
+            try:
+                ids = await asyncio.to_thread(self.mannco.fetch_game_item_ids, 440)
+                if ids:
+                    self.known_tf2_item_ids = ids
+            except Exception:
+                log.exception("known_tf2_item_ids refresh failed, keeping previous value.")
+            await asyncio.sleep(6 * 3600)
 
     async def local_store_prune_loop(self):
         """Periodically removes expired entries from
@@ -898,6 +932,21 @@ class Watcher:
             self.stats["mannco_wrong_game"] += 1
             return
 
+        # FAST PATH, no API call at all: if the bulk TF2-item-id set has
+        # been successfully loaded (see known_tf2_ids_refresh_loop) and
+        # this item_id isn't in it, it's confidently not TF2 - covers
+        # the case the per-id cache above can't: a distinct, never-
+        # before-seen non-TF2 item_id, which used to still cost a full
+        # get_item_details call on its first sighting regardless of how
+        # many repeats of THAT SAME id got cached afterward. Only
+        # applied when the set is genuinely loaded (not None) - a failed
+        # prefetch correctly falls back to the slower, per-item path
+        # rather than wrongly rejecting everything.
+        if self.known_tf2_item_ids is not None and item_id not in self.known_tf2_item_ids:
+            self._known_non_tf2_item_ids.add(item_id)
+            self.stats["mannco_wrong_game"] += 1
+            return
+
         details = await asyncio.to_thread(self.mannco.get_item_details, item_id)
         if details is None:
             # A real production log showed this bucket silently absorbing
@@ -1061,6 +1110,20 @@ class Watcher:
             # Resolve the name from the id via the schema we already have,
             # in case a fallback path above found the id but not a name.
             particle_name = self.particle_id_to_name.get(particle_id)
+
+        if particle_name:
+            # Confirmed real via a direct report: backpack.tf's own
+            # item.name already includes the effect as a display prefix
+            # ("Circling Heart Hot Dogger", not just "Hot Dogger") - left
+            # in place, the effect ends up shown twice in an alert's own
+            # text, AND (more importantly) the classifieds search link
+            # ends up searching for a literal item named "Circling Heart
+            # Hot Dogger" while ALSO passing particle=<id> separately,
+            # which doesn't match anything real - the exact reason a
+            # real alert's search link didn't work. Stripped here, once,
+            # so every downstream use (display name, identity key,
+            # search link) sees the same clean name consistently.
+            name = bptf_client.strip_effect_prefix(name, particle_name)
 
         spells = [s.get("name") for s in (item.get("spells") or []) if isinstance(s, dict) and s.get("name")]
         strange_parts = [p.get("name") for p in (item.get("strangeParts") or [])
@@ -1434,6 +1497,7 @@ class Watcher:
             self.telegram_command_loop(),
             self.health_check_loop(),
             self.local_store_prune_loop(),
+            self.known_tf2_ids_refresh_loop(),
             self.marketplacetf_poll_loop(),
             self.stntrading_poll_loop(),
             mannco_ws.stream_listing_events(self.handle_mannco_event),

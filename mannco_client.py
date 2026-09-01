@@ -166,6 +166,72 @@ class ManncoClient:
         self._item_details_cache[item_id] = details
         return details
 
+    def fetch_game_item_ids(self, game: int):
+        """
+        Bulk-fetches every known item_id for a given game (440=TF2,
+        730=CS2, 570=Dota2, 252490=Rust, 753=Steam) via /item/prices, so
+        main.py can build a "known TF2 item_ids" set ONCE (or on a slow
+        periodic refresh) instead of paying a per-item get_item_details
+        call just to discover a listing belongs to a different game -
+        per direct feedback that this was still happening a lot even
+        with the item_id cache added earlier (that cache only helps on
+        a REPEAT of the same non-TF2 item_id; a constant stream of
+        distinct, never-before-seen CS2/Dota2/Rust items each paid the
+        full cost once regardless).
+
+        This endpoint is documented with a strict rate limit (1 request
+        per 5 minutes per API key) - fine for an occasional bulk refresh,
+        never for a per-listing check, which is exactly the point.
+
+        Returns a set of item_ids, or None on any failure/unexpected
+        response shape - callers should treat None as "couldn't
+        prefetch, fall back to the existing per-item cache" rather than
+        a fatal error, since the exact response shape here hasn't been
+        independently confirmed against a real response the way other
+        endpoints in this project have been.
+        """
+        try:
+            data = self._get("/item/prices", params={"game": game})
+        except Exception:
+            log.warning("Bulk item-id prefetch for game %s failed.", game)
+            return None
+
+        # Response shape not independently confirmed - try the most
+        # plausible structures and log the raw shape if none match, the
+        # same "don't guess silently" approach used elsewhere in this
+        # project when a field/endpoint's exact format isn't verified.
+        content = data.get("content") if isinstance(data, dict) else None
+        items = None
+        if isinstance(content, list):
+            items = content
+        elif isinstance(content, dict):
+            items = content.get("items") or content.get("prices")
+        if not isinstance(items, list):
+            log.warning(
+                "Bulk item-id prefetch for game %s returned an unexpected shape - "
+                "raw response (truncated): %r",
+                game, str(data)[:500],
+            )
+            return None
+
+        ids = set()
+        for entry in items:
+            if isinstance(entry, dict):
+                item_id = entry.get("item_id") or entry.get("id")
+                if item_id is not None:
+                    ids.add(item_id)
+            elif isinstance(entry, (int, str)):
+                ids.add(entry)
+        if not ids:
+            log.warning(
+                "Bulk item-id prefetch for game %s parsed 0 ids from a non-empty-shaped "
+                "response - raw response (truncated): %r",
+                game, str(data)[:500],
+            )
+            return None
+        log.info("Prefetched %d known item ids for game %s from mannco.store.", len(ids), game)
+        return ids
+
     def get_item_pricing(self, item_identifier):
         """
         item_identifier can be a numeric item id or a URL slug.

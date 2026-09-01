@@ -469,21 +469,40 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, name_to_image_
     # Liquidity check: skip items whose price hasn't been revised by the
     # community in a long time - a big discount on something nobody's
     # actively trading is more likely a forgotten/stale price than a real
-    # find. Uses the same price-history fetch as the average below (one
-    # HTTP call covers both, see bptf_client's history cache). Unknown
-    # (None) fails OPEN - an item with literally no price history yet
-    # isn't necessarily illiquid, just unpriced, and a fetch hiccup
-    # shouldn't cost a real deal.
-    days_since_update = bptf.get_liquidity_days_since_update(
-        lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable
-    )
-    if days_since_update is not None and days_since_update > cfg["max_days_since_price_update"]:
-        return None
+    # OFF by default now - both this liquidity check and the average
+    # price below go through backpack.tf's /IGetPriceHistory/v1, a real,
+    # separate HTTP call (throttled the same as every other backpack.tf
+    # request - see bptf_client.py's account pool) that was still adding
+    # ~11+ seconds to an otherwise near-instant evaluation once the
+    # reference-price/buy-order lookups moved to the self-collected local
+    # store. Direct feedback that competing bots reply in 1-3 seconds
+    # made clear this was no longer an acceptable cost for what these two
+    # values actually provide: the liquidity check's own underlying
+    # concern (don't trust stale comparison data) is now already covered
+    # by LocalListingStore's own freshness window (entries older than
+    # max_age_seconds, default 1 hour, are never used - see
+    # bptf_client.py), and the average price is purely informational
+    # display text, never used in the discount decision itself. Set
+    # fetch_price_history_data to true in config.json to bring both
+    # back, trading speed for this extra (now largely redundant) context.
+    days_since_update = None
+    avg_keys = None
+    if cfg.get("fetch_price_history_data"):
+        # find. Uses the same price-history fetch as the average below (one
+        # HTTP call covers both, see bptf_client's history cache). Unknown
+        # (None) fails OPEN - an item with literally no price history yet
+        # isn't necessarily illiquid, just unpriced, and a fetch hiccup
+        # shouldn't cost a real deal.
+        days_since_update = bptf.get_liquidity_days_since_update(
+            lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable
+        )
+        if days_since_update is not None and days_since_update > cfg["max_days_since_price_update"]:
+            return None
 
-    # Average price is a nice-to-have on top of an already-qualifying deal
-    # - only fetched now, not for every listing scanned.
-    avg_keys = bptf.get_average_price_keys(lookup_name, listing.quality, listing.particle_id,
-                                            craftable=listing.craftable)
+        # Average price is a nice-to-have on top of an already-qualifying
+        # deal - only fetched now, not for every listing scanned.
+        avg_keys = bptf.get_average_price_keys(lookup_name, listing.quality, listing.particle_id,
+                                                craftable=listing.craftable)
 
     # Community-suggested price, shown as PURELY INFORMATIONAL context
     # alongside the live comparison - never used to gate or compute the

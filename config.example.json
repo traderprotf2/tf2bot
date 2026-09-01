@@ -20,6 +20,7 @@
   "health_check_error_threshold": 5,
   "health_check_auto_pause": true,
   "max_days_since_price_update": 90,
+  "fetch_price_history_data": false,
   "marketplacetf_poll_seconds": 300,
   "stntrading_poll_seconds": 300,
 

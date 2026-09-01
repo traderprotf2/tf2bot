@@ -148,8 +148,25 @@ DEFAULTS = {
     # price than a real find. backpack.tf's actual sale-confirmation data
     # is a paid Premium feature (not available via the free API this
     # project uses) - this uses price-suggestion recency as the closest
-    # free proxy for "is this item actively traded".
+    # free proxy for "is this item actively traded". Only actually
+    # applied when fetch_price_history_data (below) is true.
     "max_days_since_price_update": 90,
+
+    # OFF by default - both the liquidity check above and the "average
+    # price (~30 days)" alert line require a separate backpack.tf HTTP
+    # call (/IGetPriceHistory/v1), throttled the same as every other
+    # backpack.tf request. After the reference-price/buy-order lookups
+    # moved to a self-collected local store (near-instant, no HTTP call
+    # per evaluation - see bptf_client.py's LocalListingStore), this
+    # remaining call was still adding ~11+ seconds to an otherwise fast
+    # evaluation - direct feedback that competing bots reply in 1-3
+    # seconds made clear this was no longer worth it for what these two
+    # values provide: the liquidity check's own concern (don't trust
+    # stale data) is already covered by the local store's own freshness
+    # window, and the average price is purely informational, never used
+    # in the actual discount decision. Set to true to bring both back,
+    # trading speed for this extra (now largely redundant) context.
+    "fetch_price_history_data": False,
 
     # --- Operational settings ---
     # How often (seconds) to refresh backpack.tf's whole price list -
