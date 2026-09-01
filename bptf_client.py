@@ -931,6 +931,23 @@ class LocalListingStore:
         old enough that its entries have expired, they're correctly
         ignored the normal way, not because loading did anything special
         for them.
+
+        Migrates old-format buckets on the fly: a real, severe production
+        incident (every single event failing) traced to exactly this -
+        an update that changed each bucket's own type from a plain list
+        to a dict keyed by listing_id (for O(1) record() instead of an
+        O(n) duplicate-scan on every call - see record()'s own
+        docstring) shipped without accounting for state a PREVIOUS
+        version had already saved to disk in the old, list-shaped
+        format. On restart, that old file loaded straight into the new
+        code with no conversion, meaning bucket[listing_id] = ... hit a
+        TypeError (list indices must be integers, not str) on every
+        single record() call that touched an old-format bucket - which,
+        given the store had been running a while, was most of them.
+        Converting on load, keyed by each entry's own listing_id (same
+        as record() itself would), means old saved state keeps working
+        transparently across this kind of internal format change,
+        without the person needing to know or do anything about it.
         """
         if not os.path.exists(path):
             return
@@ -940,7 +957,10 @@ class LocalListingStore:
             with self._lock:
                 for item in serializable:
                     key = tuple(item["key"])
-                    self._entries[key] = item["bucket"]
+                    bucket = item["bucket"]
+                    if isinstance(bucket, list):
+                        bucket = {e["listing_id"]: e for e in bucket if "listing_id" in e}
+                    self._entries[key] = bucket
             log.info("Loaded %d local listing store entries from disk (%s).",
                       self.entry_count(), path)
         except Exception:
