@@ -47,6 +47,7 @@ class NormalizedListing:
     link: Optional[str] = None
     extra_excluded_hint: bool = False    # set True for things like War Paint skins detected structurally
     texture: Optional[str] = None        # item "grade" for decorated weapons/certain cosmetics (Civilian..Elite) - see listing_identity_key's own docstring in bptf_client.py
+    defindex: Optional[int] = None       # base item type's own numeric schema id - preferred identity anchor over name text when available, see listing_identity_key's own docstring
     spells: List[str] = field(default_factory=list)     # Halloween spell names, e.g. "Voices from Below"
     strange_parts: List[str] = field(default_factory=list)  # e.g. "Strange Part: Domination Kills"
     paint: Optional[str] = None                          # paint-can colour name, if painted
@@ -129,7 +130,7 @@ def filter_spells_for_category(spells, category: str):
 def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, spell, australium,
                                killstreak_tier, min_other_listings, exclude_listing_id="",
                                paint=None, killstreaker=None, sheen=None, paint_decimal_override=None,
-                               texture=None):
+                               texture=None, defindex=None):
     """
     Live-buy-order-ONLY reference price lookup. Used both for the item
     being evaluated, and (in check_killstreak_tier_pricing below) for its
@@ -147,7 +148,7 @@ def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, 
         particle_id=particle_id, craftable=craftable, spell=spell,
         australium=australium, killstreak_tier=killstreak_tier,
         paint=paint, killstreaker=killstreaker, sheen=sheen,
-        paint_decimal_override=paint_decimal_override, texture=texture,
+        paint_decimal_override=paint_decimal_override, texture=texture, defindex=defindex,
     )
 
     if ref_keys is not None and other_count >= min_other_listings:
@@ -207,6 +208,7 @@ def check_killstreak_tier_pricing(bptf, listing: "NormalizedListing", lookup_nam
         bptf, tier0_name, listing.quality, listing.particle_id, listing.craftable,
         spell=None, australium=is_australium, killstreak_tier=0,
         min_other_listings=cfg["min_other_listings"],
+        texture=listing.texture, defindex=listing.defindex,
     )
     if tier0_ref is not None and tier0_ref > ref_keys:
         log.info(
@@ -375,7 +377,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
             spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
             min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
             paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
-            texture=listing.texture,
+            texture=listing.texture, defindex=listing.defindex,
             paint_decimal_override=listing.paint_decimal_hint,
         )
         if ref_keys is not None:
@@ -387,7 +389,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
                 spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
                 min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
                 paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
-                texture=listing.texture,
+                texture=listing.texture, defindex=listing.defindex,
                 paint_decimal_override=candidate,
             )
             if ref_keys is not None:
@@ -399,7 +401,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
             spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
             min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
             paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
-            texture=listing.texture,
+            texture=listing.texture, defindex=listing.defindex,
         )
 
     if ref_keys is None or ref_keys <= 0:
@@ -414,11 +416,17 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         # doesn't need a SECOND coincidental listing to compare against.
         ref_keys = None
 
+    # Community-suggested price - fetched here (before the buy order
+    # check below) so it can double as a sanity ceiling against buy-
+    # order manipulation, not just informational display later. Free -
+    # get_price_keys reads the already-loaded bulk price list.
+    suggested_keys = bptf.get_price_keys(lookup_name, listing.quality, listing.particle_id)
+
     buy_order_keys, buy_order_count = bptf.get_best_buy_order_keys(
         lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable,
         spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
         paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
-        texture=listing.texture,
+        texture=listing.texture, defindex=listing.defindex,
         paint_decimal_override=winning_paint_decimal,
     )
     if buy_order_keys is None or buy_order_keys <= 0:
@@ -431,6 +439,29 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         # discounted" - "there's no live enough buy order to compare
         # against right now".
         return reject("no_live_buy_order")
+
+    # Sanity ceiling against buy-order manipulation: a real report showed
+    # scam/bulk-reseller sellers (seller notes literally advertising
+    # "Quicksell.store", "Over 10k items for sale") paired with an
+    # absurdly inflated buy order for the SAME cheap item (88 keys on a
+    # Non-Craftable Summer Hat normally worth well under 1) - enough
+    # buy-order listings (6, 22) to clear _filter_price_outliers' own
+    # 3-listing minimum, so a coordinated pattern across several fake
+    # listings isn't caught by outlier filtering alone (the "outliers"
+    # WERE the consensus). Rejecting a buy order that's wildly above what
+    # backpack.tf's own community suggests this item is worth catches
+    # this without reintroducing the community price as a PRIMARY
+    # reference (still never used to compute the discount itself, only
+    # to sanity-check the buy order) - permissive when no suggested price
+    # is available at all (nothing to check against), so this can't make
+    # genuinely rare/uncommon items harder to alert on than before.
+    if suggested_keys and suggested_keys > 0 and buy_order_keys > suggested_keys * 8:
+        log.warning(
+            "Buy order for %s (%.2f keys, %d listing(s)) is over 8x the community-suggested "
+            "price (%.2f keys) - treating as implausible/manipulated, not using it.",
+            lookup_name, buy_order_keys, buy_order_count, suggested_keys,
+        )
+        return reject("buy_order_implausible")
 
     discount_percent = (buy_order_keys - listing.price_keys) / buy_order_keys * 100
     if discount_percent < cfg["discount_threshold_percent"]:
@@ -487,18 +518,6 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         # deal - only fetched now, not for every listing scanned.
         avg_keys = bptf.get_average_price_keys(lookup_name, listing.quality, listing.particle_id,
                                                 craftable=listing.craftable)
-
-    # Community-suggested price, shown as PURELY INFORMATIONAL context
-    # alongside the live comparison - never used to gate or compute the
-    # discount itself (that's live-listings-only, see _get_reference_
-    # price_keys above; a real, repeated correction made clear a
-    # suggested price must never drive the actual decision). This is
-    # free - get_price_keys reads the already-loaded bulk price list, no
-    # extra network call - and gives the user the same side-by-side view
-    # a real report showed being genuinely useful on a similar bot
-    # elsewhere: live data AND the community number together, clearly
-    # labeled, so a big gap between them is visible rather than hidden.
-    suggested_keys = bptf.get_price_keys(lookup_name, listing.quality, listing.particle_id)
 
     # Best current buy order - "could I flip this for an instant, guaranteed
     # profit". Also only fetched now, same reasoning as the average price.

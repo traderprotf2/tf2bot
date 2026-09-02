@@ -558,6 +558,29 @@ class Watcher:
         if not name:
             return
 
+        # The base item type's own numeric schema ID - confirmed real in
+        # backpack.tf's own listing payload (multiple independent
+        # third-party API docs/libraries: "The item being sold...
+        # Contains keys like defindex and quality"; also the basis of
+        # the tf2-sku-2 format real trading tools use, e.g. "202;11;
+        # australium"). Used below as the PRIMARY identity anchor instead
+        # of `name` when available - a real, repeated pattern this
+        # session: name-text-based identity (stripping "Non-Craftable",
+        # killstreak-tier, Australium, effect prefixes) turned out to be
+        # fragile in ways that caused the exact same real item to
+        # silently resolve to two different identity keys between
+        # events (a craftable-field/name-text disagreement fixed
+        # earlier, a particle-name casing inconsistency fixed after
+        # that) - each was a different symptom of the same root issue:
+        # matching by string text is inherently more fragile than
+        # matching by the stable, numeric id Valve assigns per distinct
+        # item variant (a craftable/non-craftable, or Australium/non,
+        # or different killstreak tier of the "same" weapon are each
+        # already their OWN separate defindex in Valve's schema - so
+        # using it sidesteps needing to parse any of that from text at
+        # all, not just work around individual bugs one at a time).
+        defindex = item.get("defindex")
+
         # Action items excluded unconditionally, not via watched_categories
         # (so re-enabling by mistake via /addcategory can't undo it) - per
         # a direct, explicit request to never even consider Tool, Craft
@@ -629,10 +652,25 @@ class Watcher:
                     except (TypeError, ValueError):
                         particle_id = None
                     break
-        if particle_id is not None and not particle_name:
-            # Resolve the name from the id via the schema we already have,
-            # in case a fallback path above found the id but not a name.
-            particle_name = self.particle_id_to_name.get(particle_id)
+        if particle_id is not None:
+            # Prefer the schema-based canonical name over whatever the
+            # raw payload's own "name" field happens to say for THIS
+            # specific event, whenever we have one - a real, hard-to-spot
+            # bug: strip_effect_prefix() below only strips the effect
+            # prefix when its EXACT string matches the start of `name`
+            # (case-sensitive), and if the raw payload's own particle
+            # name ever varies in phrasing/casing between two events for
+            # the SAME effect, the strip would succeed for one and
+            # silently fail for the other - leaving the SAME effect
+            # producing two DIFFERENT `name` values (one with the prefix
+            # still attached), which never match in the identity key,
+            # even though particle_id itself agrees. Using the one
+            # canonical name tied to this particle_id, always, removes
+            # that inconsistency at the source. Falls back to the raw
+            # payload's own name only when this id isn't in the schema at
+            # all (e.g. steam_api_key not configured, or a brand new
+            # effect Valve hasn't indexed yet).
+            particle_name = self.particle_id_to_name.get(particle_id) or particle_name
 
         if particle_name:
             # Confirmed real via a direct report: backpack.tf's own
@@ -754,9 +792,18 @@ class Watcher:
         is_skin = bool(item.get("wearTier"))
         texture_obj = item.get("texture")
         texture = texture_obj.get("name") if isinstance(texture_obj, dict) else texture_obj
-        craftable = item.get("craftable")
-        if craftable is None:
-            craftable = True
+        # Derived from the NAME TEXT, not the separate item.craftable
+        # field - a real, confirmed bug: the two disagreed for some
+        # listings, so the alert's own displayed name (built straight
+        # from this same name string - see clean_display_name) said
+        # "Non-Craftable X" while the buy order actually being compared
+        # against was looked up under craftable=True, because the
+        # separate boolean field said so. backpack.tf's name text
+        # reliably carries "Non-Craftable " as a literal prefix when
+        # applicable (the same convention strip_variant_prefixes already
+        # relies on for search links) - deriving from the SAME string
+        # that gets displayed means the two can never disagree again.
+        craftable = not name.startswith("Non-Craftable ")
 
         currencies = payload.get("currencies") or {}
         price_keys = self.bptf.currencies_to_keys(currencies)
@@ -771,6 +818,28 @@ class Watcher:
             return
 
         intent = payload.get("intent")
+
+        # Excludes the listing from the local store entirely (both sell
+        # AND buy intent) when its own seller note matches a known spam/
+        # scam-bot pattern - a real, proven technique borrowed directly
+        # from bptf-autopricer/tf2-autopricer (the same real, production
+        # pricer whose "listings" database table this project's own
+        # LocalListingStore mirrors - see that class's own docstring):
+        # their own config has an "excludedListingDescriptions" option
+        # for exactly this. Added after a real, concrete case: a bulk-
+        # reseller bot's own seller note literally said "Quicksell.store"
+        # and "Over 10k items for sale", paired with a buy order wildly
+        # above the item's real value on a cheap item - a DIFFERENT
+        # instance of the same underlying risk the buy-order sanity
+        # ceiling in matcher.py already guards against, but catching it
+        # here, before the listing is ever recorded at all, stops it
+        # contaminating the store for ANY future comparison, not just
+        # the one alert.
+        seller_note_text = (payload.get("details") or "").lower()
+        excluded_keywords = self.cfg.get("excluded_listing_keywords", [])
+        if seller_note_text and any(kw.lower() in seller_note_text for kw in excluded_keywords):
+            self.stats["bptf_rejected_spam_listing"] += 1
+            return
 
         # Record EVERY listing this project sees (both sell AND buy
         # intent, now that bptf_ws.py passes buy-intent events through
@@ -787,7 +856,7 @@ class Watcher:
         identity_key = bptf_client.listing_identity_key(
             name, quality, particle_id, paint_value_for_identity, bool(craftable),
             spells[0] if spells else None, killstreak_tier, name.startswith("Australium "),
-            texture=texture,
+            texture=texture, defindex=defindex,
         )
         self.bptf.local_listings.record(
             identity_key, str(listing_id), seller_steamid, price_keys, intent,
@@ -823,6 +892,7 @@ class Watcher:
             link=link,
             extra_excluded_hint=is_skin,
             texture=texture,
+            defindex=defindex,
             spells=spells,
             strange_parts=strange_parts,
             paint=paint,

@@ -93,7 +93,19 @@ async def stream_listing_events(on_event):
     while True:
         try:
             log.info("Connecting to backpack.tf market stream...")
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, max_size=None) as ws:
+            # ping_timeout raised from 20s to 60s (ping_interval kept at
+            # 20s) - a real report showed frequent disconnects with
+            # "keepalive" in the stack trace, at a real sustained load of
+            # ~60+ events/second. Under that load the event loop can be
+            # momentarily busy enough that a pong reply is delayed past a
+            # tight 20s timeout even though the connection itself is
+            # perfectly healthy - a false-positive disconnect, not a real
+            # one. Each disconnect is a real gap in coverage (backpack.tf's
+            # websocket has no "replay what I missed" on reconnect - a
+            # buy order that updates during that gap is simply never
+            # seen), so cutting down on FALSE disconnects directly means
+            # fewer missed events, not just fewer log lines.
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=60, max_size=None) as ws:
                 log.info("Connected to backpack.tf market stream.")
                 while True:
                     try:

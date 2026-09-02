@@ -55,6 +55,15 @@ DEFAULTS = {
     # structured field for them yet), so a miss here is possible.
     "excluded_types": ["War Paint", "Badge", "Tool", "Strangifier", "Craft Item", "Crate", "Party Favor"],
 
+    # Skips a listing entirely (never even recorded into the local store,
+    # buy or sell) when its OWN seller note contains any of these
+    # (case-insensitive). Borrowed directly from a real, production
+    # pricer's "excludedListingDescriptions" option - bulk-reseller/scam
+    # bots tend to advertise themselves in their own note text, often
+    # paired with a manipulated price. Starting list, not exhaustive -
+    # edit freely as new patterns turn up.
+    "excluded_listing_keywords": ["quicksell.store", "10k items", "10,000 items"],
+
     # Minimum item value to bother alerting on, in TF2 keys.
     "min_price_keys": 5,
 

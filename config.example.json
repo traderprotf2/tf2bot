@@ -10,6 +10,7 @@
   "watched_qualities": ["Unusual", "Strange", "Unique"],
   "watched_categories": ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"],
   "excluded_types": ["War Paint", "Badge", "Tool", "Strangifier", "Craft Item", "Crate", "Party Favor"],
+  "excluded_listing_keywords": ["quicksell.store", "10k items", "10,000 items"],
   "min_price_keys": 5,
   "discount_threshold_percent": 5,
   "min_other_listings": 1,

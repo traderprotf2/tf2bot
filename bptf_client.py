@@ -408,13 +408,20 @@ def strip_effect_prefix(name: str, particle_name: str) -> str:
     name that doesn't match anything real once particle=<id> is also
     passed separately.
 
-    Only strips when the name genuinely starts with "<particle_name> "
-    (case-sensitive) - otherwise returned unchanged rather than guessing.
+    Strips the prefix case-INSENSITIVELY (only the returned slice keeps
+    `name`'s own original casing for whatever remains after the prefix) -
+    a real, hard-to-spot bug: raw effect-name casing/phrasing from
+    backpack.tf's own payload isn't guaranteed identical across every
+    event for the same effect, and an exact, case-sensitive match here
+    meant the SAME effect could strip successfully on one event and
+    silently fail on another - leaving that one item's `name` still
+    carrying the effect prefix, which never matches the identity key of
+    every OTHER, correctly-stripped event for the exact same effect.
     """
     if not particle_name:
         return name
     prefix = particle_name + " "
-    if name.startswith(prefix):
+    if name.lower().startswith(prefix.lower()):
         return name[len(prefix):]
     return name
 
@@ -826,7 +833,7 @@ class LocalListingStore:
 
 
 def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftable,
-                          spell, killstreak_tier, australium, texture=None):
+                          spell, killstreak_tier, australium, texture=None, defindex=None):
     """
     The exact tuple LocalListingStore keys entries by - every field is
     already extracted/validated from the raw websocket payload (see
@@ -840,9 +847,20 @@ def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftab
     display name (backpack.tf's own forums document items whose name
     text contains a different grade's word than their real one) - must
     come from the structured texture field.
+
+    defindex (the base item type's own numeric schema id) is used
+    INSTEAD of the name-text-based strip_variant_prefixes() below,
+    whenever the caller has one - see main.py's own comment on why:
+    matching by this stable, numeric id sidesteps a whole class of
+    name-text fragility (prefix-stripping edge cases, casing/phrasing
+    variation) that caused two real, confirmed bugs this session, each a
+    different symptom of the same underlying issue. Falls back to the
+    name-based key when defindex isn't available (e.g. a payload shape
+    that doesn't include it) - never a hard requirement.
     """
+    name_component = defindex if defindex is not None else strip_variant_prefixes(name)
     return (
-        strip_variant_prefixes(name), quality_name, particle_id, paint_decimal,
+        name_component, quality_name, particle_id, paint_decimal,
         bool(craftable), spell or None, killstreak_tier or 0, bool(australium),
         texture or None,
     )
@@ -969,7 +987,7 @@ class BackpackTFPriceList:
                                      particle_id=None, craftable=True, spell=None,
                                      australium: bool = False, killstreak_tier=None, paint=None,
                                      killstreaker=None, sheen=None, paint_decimal_override=None,
-                                     texture=None):
+                                     texture=None, defindex=None):
         """
         Returns (min_price_in_keys_among_OTHER_sell_listings,
         count_of_other_listings), or (None, 0) if not enough fresh,
@@ -986,13 +1004,13 @@ class BackpackTFPriceList:
             paint_rgb_decimal(paint) if paint else None
         )
         key = listing_identity_key(name, quality_name, particle_id, paint_value, craftable,
-                                    spell, killstreak_tier, australium, texture=texture)
+                                    spell, killstreak_tier, australium, texture=texture, defindex=defindex)
         return self.local_listings.get_min_sell_price(key, exclude_listing_id=exclude_listing_id)
 
     def get_best_buy_order_keys(self, name: str, quality_name: str, particle_id=None, craftable=True,
                                  spell=None, australium: bool = False, killstreak_tier=None, paint=None,
                                  killstreaker=None, sheen=None, paint_decimal_override=None,
-                                 texture=None):
+                                 texture=None, defindex=None):
         """
         Highest current self-collected BUY-intent price for this exact
         item, in keys, plus how many fresh buy-intent listings that
@@ -1005,7 +1023,7 @@ class BackpackTFPriceList:
             paint_rgb_decimal(paint) if paint else None
         )
         key = listing_identity_key(name, quality_name, particle_id, paint_value, craftable,
-                                    spell, killstreak_tier, australium, texture=texture)
+                                    spell, killstreak_tier, australium, texture=texture, defindex=defindex)
         return self.local_listings.get_max_buy_price(key)
 
     # -- liquidity (best-effort, via price-suggestion recency) ------------
