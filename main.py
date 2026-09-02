@@ -1,19 +1,15 @@
 """
 TF2 Deal Watcher
 ================
-Watches TWO live sources at once:
-  - mannco.store's market websocket
-  - backpack.tf's own classifieds websocket
-for newly listed / re-priced TF2 items (Unusual hats, Strange weapons,
-Australiums, ...) priced well below the going rate, and sends a Telegram
-alert either way.
+Watches backpack.tf's classifieds websocket for newly-listed TF2 items
+(Unusual hats, Strange weapons, Australiums, ...) priced well below their
+current live buy order, and sends a Telegram alert.
 
-The reference "going rate" is backpack.tf's own LIVE listings for that
-exact item (name + quality + effect) when available - i.e. this also
-catches someone undercutting the rest of the market on backpack.tf
-itself, not just mannco.store listings being cheap. Falls back to
-backpack.tf's community-suggested price when live listings aren't
-available for that item (or no backpacktf_token is configured).
+The reference price is backpack.tf's own live buy order for that exact
+item (name + quality + effect + ...), self-collected from the same
+websocket stream into a local store (see bptf_client.py) - never
+backpack.tf's community-suggested price, which real cases showed
+disagreeing with what was actually for sale.
 
 Usage:
     python3 main.py
@@ -33,13 +29,10 @@ import bptf_client
 import bptf_ws
 import error_log
 import mannco_client
-import mannco_ws
-import marketplacetf_client
 import matcher
 import runtime_settings
 import steam_inventory
 import steam_schema
-import stntrading_client
 import telegram_commands
 import telegram_notify
 from config import load_config
@@ -52,55 +45,31 @@ log = logging.getLogger("main")
 
 _error_buffer = error_log.install()
 
-# Only cosmetics (hats/misc) can carry a Paint Can colour in TF2 - weapons
-# can never be painted (that's a common misconception; War Paint *skins*
-# are a separate, unrelated system). Only weapons can carry a Killstreak
-# tier - cosmetics can't. These whitelists are used to strip out either
-# field if upstream data ever looks physically impossible, rather than
-# ever showing a combination that can't exist in the game.
+# Only cosmetics can carry a Paint Can colour in TF2; only weapons can
+# carry a Killstreak tier. Used to strip out either field if upstream
+# data ever looks physically impossible.
 COSMETIC_SLOTS = {"head", "misc"}
 WEAPON_SLOTS = {"primary", "secondary", "melee", "pda", "pda2", "building"}
 
-# Real TF2 item taxonomy, confirmed against Valve's own item schema
-# (backpack.tf/schema/... historical dumps) and the community-standard
-# item.tf filter categories - not guessed:
-#   - Taunts have item_slot == "taunt" (a distinct schema value, separate
-#     from any weapon/cosmetic slot).
-#   - Killstreak Kits and Killstreak Kit Fabricators are Tool items with
-#     no weapon/cosmetic slot at all - Valve names them consistently
-#     ("Killstreak Kit", "Specialized Killstreak Kit", "Professional
-#     Killstreak Kit", plus the Fabricator variants), so a name-pattern
-#     check is the most reliable signal, more so than any single slot
-#     value. NOTE: kits/fabricators are Unique-quality tools, not
-#     Strange/Unusual themselves - watching this category alone won't
-#     surface anything unless "Unique" is also in watched_qualities.
+# Taunts have item_slot == "taunt". Killstreak Kits/Fabricators are Tool
+# items with no weapon/cosmetic slot - identified by Valve's consistent
+# naming instead ("Killstreak Kit", "Specialized Killstreak Kit", etc.).
+# NOTE: kits/fabricators are Unique-quality tools, not Strange/Unusual -
+# watching this category alone won't surface anything unless "Unique" is
+# also in watched_qualities.
 
 
-def classify_category(name, slot=None, mannco_type=None):
-    """
-    Single classifier for both sources. `slot` is backpack.tf's reliable
-    schema field; `mannco_type` is mannco.store's less-certain type string
-    (same honesty caveat as mannco_paint() below - their exact TF2 type
-    strings aren't documented, so this branch is keyword-based
-    best-effort and falls back to "other" rather than guessing wrong).
-    """
+def classify_category(name, slot=None):
+    """backpack.tf's `slot` schema field is the reliable classifier."""
     name = name or ""
-    # Valve names every tier consistently: "Killstreak <Weapon> Kit",
-    # "Specialized Killstreak <Weapon> Kit", "Professional Killstreak Kit
-    # Fabricator", etc. - "Kit"/"Fabricator" is always the last word, and
-    # "Killstreak" always appears somewhere in the name. Checking for the
-    # literal substring "Killstreak Kit" (an earlier version of this
-    # check) misses the common case where a weapon name sits in between,
-    # e.g. "Killstreak Rocket Launcher Kit" - caught by a real test.
+    # Valve names every killstreak-kit tier consistently, "Kit"/
+    # "Fabricator" always the last word - catches "Killstreak Rocket
+    # Launcher Kit" too, not just the literal substring "Killstreak Kit".
     if "Killstreak" in name and (name.endswith("Kit") or name.endswith("Fabricator")):
         return "killstreak_kit"
 
-    # Universal, source-independent signal: Valve always names taunt items
-    # "Taunt: <Name>" (the effect/variant prefix, if any, comes before this,
-    # e.g. "Shimmering Lights Taunt: Rocket Jockey" - confirmed against a
-    # real, live marketplace.tf listing). Checked before the slot/type
-    # branches below since it's more reliable than either for sources that
-    # don't provide a slot or type at all (marketplace.tf, stntrading.eu).
+    # Valve always names taunt items "Taunt: <Name>" - reliable regardless
+    # of whether slot happens to be populated.
     if "Taunt: " in name:
         return "taunt"
 
@@ -111,141 +80,13 @@ def classify_category(name, slot=None, mannco_type=None):
             return "weapon"
         if slot in COSMETIC_SLOTS:
             return "cosmetic"
-        # Badges/medals/pins equip in their own dedicated slot, distinct
-        # from head/misc cosmetics - confirmed via the official TF2 wiki's
-        # own description of the item type ("equip in the medal equip
-        # region"), not guessed. Given a direct request to stop wasting
-        # requests on badges (illiquid, not real trading interest) and
-        # that item_type/name-based exclusion alone was unreliable for
-        # backpack.tf specifically (item_type is never populated for that
-        # source - see handle_bptf_event - so exclusion fell back to
-        # matching "badge" against the item NAME, which many real badges
-        # don't literally contain), this is a second, independent,
-        # slot-based signal that doesn't depend on the name at all.
+        # Badges/medals equip in their own slot, distinct from head/misc
+        # cosmetics (confirmed via the official wiki) - a reliable,
+        # slot-based signal independent of the item's name text.
         if slot == "medal":
             return "badge"
-        return "other"
-
-    if mannco_type is not None:
-        t = mannco_type.lower()
-        if "taunt" in t:
-            return "taunt"
-        if any(w in t for w in ("hat", "cosmetic", "misc")):
-            return "cosmetic"
-        if any(w in t for w in ("weapon", "rifle", "pistol", "launcher", "melee",
-                                 "primary", "secondary", "sword", "axe", "bow")):
-            return "weapon"
 
     return "other"
-
-
-def mannco_effect_name(details: dict):
-    for key in ("effect", "particle", "unusual_effect", "particleName"):
-        value = details.get(key)
-        if value:
-            return value
-    return None
-
-
-def mannco_spells(details: dict):
-    """
-    Best-effort: mannco.store's item-details schema isn't fully documented
-    for Halloween spells, so we try a couple of plausible shapes. Returns
-    a list of spell name strings (possibly empty).
-    """
-    raw = details.get("spells")
-    if not raw:
-        return []
-    names = []
-    for s in raw:
-        if isinstance(s, dict):
-            n = s.get("name") or s.get("spellId")
-            if n:
-                names.append(str(n))
-        elif isinstance(s, str):
-            names.append(s)
-    return names
-
-
-def mannco_strange_parts(details: dict):
-    """Same honesty caveat as mannco_spells() above - field name guessed
-    by analogy, not confirmed against a real mannco.store example."""
-    raw = details.get("strangeParts") or details.get("strange_parts")
-    if not raw:
-        return []
-    names = []
-    for p in raw:
-        if isinstance(p, dict):
-            n = p.get("name")
-            if n:
-                names.append(str(n))
-        elif isinstance(p, str):
-            names.append(p)
-    return names
-
-
-_sampled_mannco_team_paint = False
-
-
-def mannco_paint(details: dict):
-    """
-    Same honesty caveat as mannco_spells() above, PLUS a hard game-logic
-    check: only cosmetics can be painted in TF2, weapons never can. If
-    mannco's "type" field doesn't look like a cosmetic, the paint value
-    is dropped rather than shown - an impossible combination is worse
-    than no data.
-    """
-    raw = details.get("paint")
-    if not raw:
-        return None
-
-    item_type = (details.get("type") or "").lower()
-    is_cosmetic_type = any(word in item_type for word in ("hat", "cosmetic", "misc"))
-    if not is_cosmetic_type:
-        return None
-
-    if isinstance(raw, dict):
-        name = raw.get("name")
-        global _sampled_mannco_team_paint
-        if name in bptf_client.TEAM_COLOR_PAINT_RGB and not _sampled_mannco_team_paint:
-            _sampled_mannco_team_paint = True
-            log.warning(
-                "DIAGNOSTIC SAMPLE (first team-coloured paint seen this run from mannco.store, "
-                "%r) - raw paint object: %r",
-                name, raw,
-            )
-        return name
-    if isinstance(raw, str):
-        return raw
-    return None
-
-
-def mannco_paint_decimal_hint(details: dict):
-    """
-    The exact RGB decimal for this SPECIFIC listing's paint, when
-    mannco.store's own payload gives one directly - confirmed real via
-    the diagnostic sample above: a raw paint object of {'name': 'Team
-    Spirit', 'color': 'b8383b', 'team': 'red'}, where 'b8383b' decodes to
-    (184, 56, 59) - an exact match for this project's own independently-
-    researched "Team Spirit RED" RGB value. This means mannco.store
-    tells us directly which of the two colours a team-coloured item
-    actually is, so there's no need to guess-and-try-both the way
-    evaluate_listing does for backpack.tf (which has no equivalent
-    confirmed field yet). Only meaningful for team-coloured paints -
-    ordinary paints already resolve to one RGB value from the name alone
-    (see paint_rgb_decimal), so this returns None for anything else,
-    letting the normal name-based path handle it.
-    """
-    raw = details.get("paint")
-    if not isinstance(raw, dict):
-        return None
-    color_hex = raw.get("color")
-    if not color_hex or not isinstance(color_hex, str):
-        return None
-    try:
-        return int(color_hex, 16)
-    except ValueError:
-        return None
 
 
 class Watcher:
@@ -280,37 +121,9 @@ class Watcher:
             cfg["snapshot_cache_seconds"],
         )
         self.mannco = mannco_client.ManncoClient(cfg["mannco_api_key"], cfg["jwt_refresh_seconds"])
-        # Persistent (not re-created per call) so the same client can be
-        # reused both by the watchlist poll loop below AND by the
-        # per-deal STN-buy-order context lookup in evaluate_listing -
-        # None when no key is configured, which every caller already
-        # treats as "skip this source" (stntrading_client.py's own
-        # methods return None/empty on a missing key too).
-        self.stn_client = (
-            stntrading_client.STNTradingClient(cfg["stntrading_api_key"])
-            if cfg.get("stntrading_api_key") else None
-        )
         self.telegram = telegram_notify.TelegramNotifier(cfg["telegram_bot_token"], cfg["telegram_chat_id"])
         self.particle_name_to_id = steam_schema.fetch_particle_name_to_id(cfg.get("steam_api_key", ""))
         self.particle_id_to_name = {v: k for k, v in self.particle_name_to_id.items()}
-        # Case/whitespace-normalized lookup too, alongside the exact one -
-        # mannco.store's effect-name field isn't documented (see
-        # mannco_effect_name's own comment), so a mismatch as small as
-        # "kill-a-watt" vs "Kill-A-Watt" or stray whitespace would
-        # otherwise silently make every one of that effect's Unusuals
-        # unmatchable, with no indication why.
-        self.particle_name_to_id_normalized = {
-            name.strip().lower(): pid for name, pid in self.particle_name_to_id.items()
-        }
-        self.defindex_to_name = steam_schema.fetch_defindex_to_name(
-            cfg.get("steam_api_key", "")
-        )
-        if not self.defindex_to_name:
-            log.warning(
-                "No Steam schema defindex map available (steam_api_key missing or fetch failed) - "
-                "marketplace.tf listings will be skipped, since their item names can't be split "
-                "from the effect name without it. See README."
-            )
         self.inventory_checker = steam_inventory.SteamInventoryChecker(
             cache_ttl_seconds=cfg.get("inventory_cache_seconds", 900)
         )
@@ -333,24 +146,6 @@ class Watcher:
         # display_name, particle, paint, killstreaker, sheen) -> last
         # alert timestamp.
         self.item_type_last_alerted = {}
-        # Caches item_ids confirmed NOT TF2 (game != 440) - see
-        # handle_mannco_event, which skips the details fetch entirely for
-        # any item_id already in here. An item's game never changes, so
-        # this is safe to keep for the whole run without expiring it the
-        # way the recent-listings dedup cache does.
-        self._known_non_tf2_item_ids = set()
-        # None means "not yet successfully prefetched" - distinct from an
-        # empty set, which would incorrectly mean "no TF2 items exist at
-        # all". See known_tf2_ids_refresh_loop and mannco_client.py's
-        # fetch_game_item_ids for why this exists: a real report showed
-        # non-TF2 items still costing a full get_item_details call even
-        # with the id-cache above, because that cache only helps on a
-        # REPEAT of the same non-TF2 item - a constant stream of
-        # distinct, never-before-seen CS2/Dota2/Rust items each paid the
-        # full cost once regardless. When this set IS loaded, an incoming
-        # item_id not in it can be skipped immediately, before any
-        # per-item API call at all.
-        self.known_tf2_item_ids = None
 
         # Which "kinds" of item structure we've already logged a raw
         # sample of since startup - see the sampling calls in
@@ -377,24 +172,17 @@ class Watcher:
 
     def effective_cfg(self):
         """
-        The dict matcher.evaluate_listing() reads its filter settings
-        from - static values from config.json, overlaid with whatever is
-        currently set at runtime (via Telegram commands; see
-        runtime_settings.py) - so a command takes effect on the very
-        next listing event, no restart needed.
+        The dict matcher.evaluate_listing() reads filter settings from -
+        config.json's static values, overlaid with whatever is currently
+        set at runtime via Telegram commands (see runtime_settings.py) -
+        so a command takes effect on the very next listing event.
 
         Cached, keyed by self.runtime._version (bumped only by
-        RuntimeSettings.save(), i.e. only on an actual mutation) -
-        previously rebuilt this ~30-key dict fresh on EVERY call
-        (**self.cfg unpacking copies every key, every time), which given
-        this runs once per evaluate_listing() call adds up: a real
-        /stats report showed 52525 evaluations in 135 minutes, meaning
-        that many full dict copies done synchronously on the main event
-        loop (this runs before the asyncio.to_thread dispatch, not
-        inside it) - competing for the same event loop time as
-        everything else, including the Telegram command loop, for a
-        result that's IDENTICAL on 99.9%+ of those calls, since runtime
-        settings only change when a person actually issues a command.
+        RuntimeSettings.save(), i.e. on an actual mutation) rather than
+        rebuilt fresh on every call - this runs once per evaluate_listing()
+        call, synchronously on the main event loop, for a result that's
+        identical on the overwhelming majority of calls (settings only
+        change when a command is actually issued).
         """
         version = self.runtime._version
         if self._effective_cfg_cache is not None and self._effective_cfg_cache_version == version:
@@ -446,27 +234,13 @@ class Watcher:
 
     async def key_price_refresh_loop(self):
         """
-        The mannco.store key price gets its own, much slower refresh
-        cadence, separate from price_refresh_loop above - a real
-        complaint that this was refreshing every 15 minutes (the same
-        cadence as backpack.tf's whole price list, which genuinely does
-        need to be that fresh) despite the key's own USD price being
-        stable week to week. Each attempt is a full mannco.store API
-        round-trip (auth + request) that can fail on its own and was
-        contributing repeated identical warnings to the logs for no real
-        benefit - see key_price_refresh_seconds in config.py.
-
-        RETRY-SOONER ON FAILURE: a real /stats report showed mannco.store
-        AND marketplace.tf both going completely silent for 5+ hours
-        straight (both depend on this same USD-per-key rate for price
-        conversion), with the mannco.store key price stuck unavailable
-        the whole time. At a weekly cadence with no retry, a single
-        failed attempt - which does happen, mannco.store's own login has
-        hit real rate limits before - would otherwise leave TWO sources
-        completely dead for up to a week before the next scheduled try.
-        This retries much sooner after any failure, and only settles
-        into the full weekly cadence once a refresh has actually
-        succeeded.
+        The mannco.store key price refreshes on its own, much slower
+        cadence than price_refresh_loop above - its USD price is stable
+        week to week, unlike backpack.tf's whole price list. Retries
+        sooner (retry_seconds below) after any failure rather than
+        waiting the full weekly cycle - mannco.store's login has hit real
+        rate limits before, and this rate feeds every USD<->keys
+        conversion in the project.
         """
         retry_seconds = 300  # 5 minutes - only used while no value has been obtained yet
         while True:
@@ -480,28 +254,6 @@ class Watcher:
                 log.warning("mannco.store key price still unavailable - retrying in %ss instead of "
                              "waiting for the full weekly cycle.", retry_seconds)
                 await asyncio.sleep(retry_seconds)
-
-    async def known_tf2_ids_refresh_loop(self):
-        """
-        Refreshes self.known_tf2_item_ids from mannco_client.py's bulk
-        fetch_game_item_ids(440) - see there and known_tf2_item_ids'
-        own comment for why. Runs once immediately (so the fast-path
-        filter is available as soon as possible after startup), then on
-        a slow, multi-hour cadence - the set of TF2 items barely changes
-        day to day, and the endpoint itself is documented at 1 request
-        per 5 minutes per key, so there's no reason to refresh often.
-        A failed attempt leaves the PREVIOUS value in place (or None, if
-        this is the very first attempt) rather than clearing it - a
-        transient failure shouldn't throw away a working filter.
-        """
-        while True:
-            try:
-                ids = await asyncio.to_thread(self.mannco.fetch_game_item_ids, 440)
-                if ids:
-                    self.known_tf2_item_ids = ids
-            except Exception:
-                log.exception("known_tf2_item_ids refresh failed, keeping previous value.")
-            await asyncio.sleep(6 * 3600)
 
     async def local_store_prune_loop(self):
         """Periodically removes expired entries from
@@ -541,25 +293,16 @@ class Watcher:
     async def health_check_loop(self):
         """
         Proactively pings Telegram only when something looks worth
-        knowing about - NOT a routine "all good" check-in every few
-        hours, which would just be noise. Specifically watches for a
-        meaningful number of new warnings/errors piling up since the
-        last check (see error_log.py) - the kind of thing that, across
-        this project's history, otherwise only surfaced once someone
-        noticed a bad alert and had to go dig through logs by hand.
+        knowing about (a meaningful pile-up of new warnings/errors - see
+        error_log.py) - not a routine "all good" check-in, which would
+        just be noise.
 
-        When the threshold is crossed, this also PAUSES deal alerts (the
-        same /pause a person can trigger by hand) - not a full process
-        stop. A full stop was the original ask, but risks two things: (1)
-        systemd's own restart policy could just bring the process back up
-        within seconds, defeating the point, and (2) actually stopping
-        for longer would mean missing real, time-sensitive deals for
-        however long it takes to notice - the exact opposite of what this
-        project is for. Pausing achieves the same "impossible to miss"
-        effect (no more deal alerts show up at all until /resume) while
-        keeping the websocket connections and monitoring themselves alive
-        in the background, and it's fully reversible with one command
-        once the /errors output has been checked.
+        When the threshold is crossed, this PAUSES deal alerts (the same
+        /pause a person can trigger by hand) rather than stopping the
+        process - a full stop risks systemd just restarting it (defeating
+        the point) and misses real, time-sensitive deals while down.
+        Pausing keeps monitoring alive in the background and is fully
+        reversible with /resume once /errors has been checked.
         """
         last_error_count = len(_error_buffer.recent(1000))
         interval_seconds = self.cfg.get("health_check_interval_minutes", 180) * 60
@@ -591,186 +334,19 @@ class Watcher:
                 last_error_count = len(current_errors)
             except Exception:
                 log.exception("Health check loop itself failed - continuing anyway.")
-
-    # -- marketplace.tf (autonomous - scrapes their public /deals page) -----
-
-    async def marketplacetf_poll_loop(self):
-        client = marketplacetf_client.MarketplaceTFClient()
-        poll_seconds = self.cfg.get("marketplacetf_poll_seconds", 300)
-        log.info("Polling marketplace.tf deals every %ss", poll_seconds)
-        while True:
-            try:
-                await self._check_marketplacetf_deals(client)
-            except Exception:
-                log.exception("marketplace.tf poll failed, will retry next cycle.")
-            await asyncio.sleep(poll_seconds)
-
-    async def _check_marketplacetf_deals(self, client):
-        if self.runtime.paused:
-            return
-        if not self.mannco_key_usd_cents:
-            # Same root cause and same fix as mannco.store's own
-            # no-key-price return (see handle_mannco_event) - this
-            # source depends on the SAME mannco.store USD-per-key rate
-            # for its own price conversion, and a real /stats report
-            # showed marketplace.tf reporting a flat "0 events" for 5+
-            # hours straight with nothing in /errors explaining why -
-            # traced to this exact return having no counter or log
-            # message either, on a SEPARATE source from the one that
-            # first exposed the same gap.
-            if "mptf_no_key_price" not in self._sampled_item_kinds:
-                self._sampled_item_kinds.add("mptf_no_key_price")
-                log.warning(
-                    "marketplace.tf polling is skipped - mannco.store key price is unavailable "
-                    "(needed for USD-to-keys conversion) - will resume once it refreshes."
-                )
-            self.stats["mptf_no_key_price"] += 1
-            return
-        if not self.defindex_to_name:
-            return  # can't safely resolve item names - see __init__ warning
-        deals = await asyncio.to_thread(client.fetch_deals)
-        for raw in deals:
-            self.stats["mptf_received"] += 1
-            # Include price in the dedup key too, same reasoning as the
-            # mannco.store/backpack.tf handlers - a price drop on a SKU
-            # already seen once must still be evaluated fresh, not
-            # silently skipped because that SKU showed up before.
-            dedup_id = f"mptf:{raw['sku']}:{round(raw['price_usd'], 2)}"
-            if not self._mark_seen(dedup_id):
-                self.stats["mptf_deduped"] += 1
-                continue
-
-            defindex, quality_name, particle_id, craftable = marketplacetf_client.parse_sku(raw["sku"])
-            if quality_name is None:
-                continue
-
-            # CRITICAL: marketplace.tf's own display text combines the
-            # effect name and the item name into one string with no
-            # reliable separator (e.g. "Iridescence Crustaceous Cowl" -
-            # "Iridescence" is the effect, "Crustaceous Cowl" is the hat).
-            # An earlier version of this used that combined text directly
-            # as the item name, which silently broke every backpack.tf
-            # comparison for marketplace.tf listings (the combined string
-            # matches nothing in backpack.tf's own data) - caught by a
-            # real report where this showed a "discount" that wasn't
-            # actually verified against backpack.tf at all. Resolving the
-            # real name from the SKU's own defindex (unambiguous, from
-            # Valve's schema) is the fix - and if it can't be resolved,
-            # this listing is skipped rather than falling back to the
-            # unreliable combined text.
-            base_name = self.defindex_to_name.get(defindex)
-            if not base_name:
-                log.warning("Could not resolve marketplace.tf defindex %s to a name - skipping SKU %s.",
-                            defindex, raw["sku"])
-                continue
-            particle_name = self.particle_id_to_name.get(particle_id) if particle_id is not None else None
-
-            price_keys = (raw["price_usd"] * 100) / self.mannco_key_usd_cents
-
-            listing = matcher.NormalizedListing(
-                source="marketplace.tf",
-                listing_id=dedup_id,
-                name=base_name,
-                quality=quality_name,
-                category=classify_category(base_name),
-                particle_id=particle_id,
-                particle_name=particle_name,
-                craftable=craftable,
-                price_keys=price_keys,
-                price_usd=raw["price_usd"],
-                link=f"https://marketplace.tf/items/tf2/{raw['sku']}",
-            )
-            self.stats["mptf_evaluated"] += 1
-            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.stn_client, self.stats)
-            if deal:
-                self.stats["mptf_alerts"] += 1
-                await self.send_deal(deal)
-            else:
-                self.stats["mptf_rejected_by_checks"] += 1
-
-    # -- stntrading.eu (opt-in watchlist - see /watchstn in Telegram) -------
-
-    async def stntrading_poll_loop(self):
-        if not self.cfg.get("stntrading_api_key"):
-            return  # nothing to check without a key - skip the loop entirely
-        client = self.stn_client
-        poll_seconds = self.cfg.get("stntrading_poll_seconds", 300)
-        log.info("Polling stntrading.eu watchlist every %ss (when non-empty)", poll_seconds)
-        while True:
-            try:
-                await self._check_stn_watchlist(client)
-            except Exception:
-                log.exception("stntrading.eu poll failed, will retry next cycle.")
-            await asyncio.sleep(poll_seconds)
-
-    async def _check_stn_watchlist(self, client):
-        if self.runtime.paused or not self.runtime.stn_watchlist:
-            return
-        for item_name in list(self.runtime.stn_watchlist):
-            self.stats["stn_received"] += 1
-            price_keys, _stock = await asyncio.to_thread(
-                client.get_item_price_keys, item_name, self.bptf.key_price_metal
-            )
-            if price_keys is None:
-                continue  # no Premium access, or nothing currently for sale - not an error
-
-            quality = "Unique"
-            for q in bptf_client.QUALITY_NAME_TO_ID:
-                if q != "Unique" and item_name.startswith(q + " "):
-                    quality = q
-                    break
-            bare_name = bptf_client.strip_quality_prefix(item_name, quality)
-
-            # Re-checking the same watched item repeatedly at an unchanged
-            # price shouldn't re-alert every poll - dedup on price too, so
-            # a genuine price *change* still gets through.
-            dedup_id = f"stn:{item_name}:{round(price_keys, 2)}"
-            if not self._mark_seen(dedup_id):
-                self.stats["stn_deduped"] += 1
-                continue
-
-            listing = matcher.NormalizedListing(
-                source="stntrading.eu",
-                listing_id=dedup_id,
-                name=bare_name,
-                quality=quality,
-                category=classify_category(bare_name),
-                craftable=True,
-                price_keys=price_keys,
-                price_usd=None,
-                link="https://stntrading.eu/tf2",
-            )
-            self.stats["stn_evaluated"] += 1
-            deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.stn_client, self.stats)
-            if deal:
-                self.stats["stn_alerts"] += 1
-                await self.send_deal(deal)
-            else:
-                self.stats["stn_rejected_by_checks"] += 1
-
     def _build_alert_keyboard(self, deal: dict):
         """
-        Inline URL buttons for the alert - Trade/Buy and the classifieds
-        search link as actual tappable buttons instead of plain text
-        links in the message body, closer to how a real, well-regarded
-        Discord alert bot presents the same kind of information (real
-        example seen: Trade URL / Classifieds / Item History / Steam
-        Profile as buttons under the embed). Telegram buttons need a
-        real https URL, so anything without one (e.g. a closed-inventory
-        listing with no direct trade link) is simply omitted from the
-        row rather than shown as a dead button.
+        Inline URL buttons for the alert (Trade/Buy, classifieds search)
+        instead of plain text links in the message body. Telegram buttons
+        need a real https URL, so anything without one (e.g. a closed-
+        inventory listing with no direct trade link) is simply omitted.
         """
         buttons = []
         if deal.get("trade_closed"):
             if deal.get("profile_link"):
                 buttons.append({"text": "👤 Профиль продавца", "url": deal["profile_link"]})
         elif deal.get("link"):
-            buy_labels = {
-                "mannco.store": "🔗 Купить",
-                "backpack.tf": "🔗 Трейд с продавцом",
-                "marketplace.tf": "🔗 Купить",
-                "stntrading.eu": "🔗 Открыть stntrading.eu",
-            }
+            buy_labels = {"backpack.tf": "🔗 Трейд с продавцом"}
             buttons.append({"text": buy_labels.get(deal["source"], "🔗 Открыть"), "url": deal["link"]})
         if deal.get("backpacktf_search_link"):
             buttons.append({"text": "📋 Объявления на backpack.tf", "url": deal["backpacktf_search_link"]})
@@ -937,163 +513,6 @@ class Watcher:
         keyboard = self._build_alert_keyboard(deal)
         await self._run_telegram(self.telegram.send, alert_text, keyboard)
 
-    # -- mannco.store side ------------------------------------------------
-
-    async def handle_mannco_event(self, event: dict):
-        if self.runtime.paused:
-            return
-        self.stats["mannco_received"] += 1
-
-        data = event.get("data", {})
-        item_id = data.get("itemId")
-        listing_id = data.get("id")
-        price_cents = data.get("price") if event.get("event") == "listing_added" else data.get("newPrice")
-
-        if item_id is None or price_cents is None or listing_id is None:
-            self.stats["mannco_malformed"] += 1
-            return
-        # Dedup key includes the price, not just the listing id - a price
-        # CHANGE on an already-seen listing must still be evaluated fresh.
-        # Confirmed this matters: mannco.store's own price_changed event
-        # (the `newPrice` branch above) carries a real new price for an
-        # EXISTING listing id, and deduping by id alone would have
-        # silently swallowed every one of those, missing exactly the kind
-        # of price-drop event this whole feature exists to catch.
-        if not self._mark_seen(f"mannco:{listing_id}:{price_cents}"):
-            self.stats["mannco_deduped"] += 1
-            return
-
-        # Skip the details fetch ENTIRELY for an item_id already known to
-        # be a different game - direct feedback that other-game items
-        # were being fetched and "messing up parsing" (each one is a real
-        # mannco.store API call that only gets discarded afterward at the
-        # game!=440 check below). mannco.store's own catalog item ids are
-        # apparently shared across all 5 games it supports (440/730/570/
-        # 252490/753), and the SAME popular CS2/Dota2/Rust item type
-        # tends to generate many repeat listing events, so remembering
-        # "this item_id isn't TF2" the first time avoids paying for that
-        # same lookup again and again for the rest of this run.
-        if item_id in self._known_non_tf2_item_ids:
-            self.stats["mannco_wrong_game"] += 1
-            return
-
-        # FAST PATH, no API call at all: if the bulk TF2-item-id set has
-        # been successfully loaded (see known_tf2_ids_refresh_loop) and
-        # this item_id isn't in it, it's confidently not TF2 - covers
-        # the case the per-id cache above can't: a distinct, never-
-        # before-seen non-TF2 item_id, which used to still cost a full
-        # get_item_details call on its first sighting regardless of how
-        # many repeats of THAT SAME id got cached afterward. Only
-        # applied when the set is genuinely loaded (not None) - a failed
-        # prefetch correctly falls back to the slower, per-item path
-        # rather than wrongly rejecting everything.
-        if self.known_tf2_item_ids is not None and item_id not in self.known_tf2_item_ids:
-            self._known_non_tf2_item_ids.add(item_id)
-            self.stats["mannco_wrong_game"] += 1
-            return
-
-        details = await asyncio.to_thread(self.mannco.get_item_details, item_id)
-        if details is None:
-            # A real production log showed this bucket silently absorbing
-            # nearly an entire 5-minute window (4854 received, 0 reaching
-            # evaluation, with no specific reason accounting for the gap)
-            # - traced to mannco.store's own rate limiting on this exact
-            # call, now throttled (see mannco_client.py). Counted
-            # separately now so a repeat of that pattern is immediately
-            # visible in /stats instead of leaving another unexplained
-            # gap between received and evaluated.
-            self.stats["mannco_details_failed"] += 1
-            return
-        if details.get("game") != 440:
-            self._known_non_tf2_item_ids.add(item_id)
-            self.stats["mannco_wrong_game"] += 1
-            return
-
-        quality = (details.get("quality") or "").strip(" ;")
-        if quality not in self.runtime.watched_qualities:
-            self.stats["mannco_rejected_quality"] += 1
-            return
-
-        # Checked right alongside quality, before particle resolution and
-        # the key-price check below - same reasoning as backpack.tf's own
-        # identical move above, though the saving here is smaller (the
-        # expensive part for this source, get_item_details itself, has
-        # already happened by this point either way - mannco.store's own
-        # websocket event carries no category/type info at all until
-        # after that fetch).
-        category = classify_category(details.get("name"), mannco_type=details.get("type"))
-        if category not in self.runtime.watched_categories:
-            self.stats["mannco_rejected_category"] += 1
-            return
-
-        particle_id = None
-        particle_name = None
-        if quality == "Unusual":
-            particle_name = mannco_effect_name(details)
-            if particle_name and self.particle_name_to_id:
-                particle_id = self.particle_name_to_id.get(particle_name)
-                if particle_id is None:
-                    # Exact match failed - try case/whitespace-normalized,
-                    # in case mannco.store formats the effect name
-                    # slightly differently than Valve's own schema does.
-                    particle_id = self.particle_name_to_id_normalized.get(particle_name.strip().lower())
-
-        if not self.mannco_key_usd_cents:
-            # A real /stats report showed a large, completely unexplained
-            # gap between received and every other counted bucket for
-            # mannco.store (9392 received, only 3665 accounted for across
-            # every other reason) - traced to this exact return having no
-            # counter at all. Given the key price now only refreshes
-            # weekly (see key_price_refresh_loop in this file), a single
-            # failed refresh can leave mannco_key_usd_cents unset - and
-            # therefore every qualifying mannco.store item silently
-            # dropped here - for up to a week, not just a brief blip.
-            # Logged once per run (not per item) so a real, ongoing
-            # outage is visible in /errors without flooding it.
-            if "mannco_no_key_price" not in self._sampled_item_kinds:
-                self._sampled_item_kinds.add("mannco_no_key_price")
-                log.warning(
-                    "mannco.store key price is unavailable - every qualifying mannco.store item "
-                    "will be skipped until the next successful key-price refresh."
-                )
-            self.stats["mannco_no_key_price"] += 1
-            return
-        price_keys = price_cents / self.mannco_key_usd_cents
-
-        # details["url"] is mannco's own URL slug for the item's market
-        # page (confirmed field in their API docs). Best-effort link -
-        # not verified live against the real site from where this was
-        # written; if the path segment turns out wrong, easy one-line fix.
-        slug = details.get("url")
-        link = f"https://mannco.store/item/{slug}" if slug else "https://mannco.store/tf2"
-
-        listing = matcher.NormalizedListing(
-            source="mannco.store",
-            listing_id=str(listing_id),
-            name=details.get("name") or "",
-            quality=quality,
-            item_type=(details.get("type") or ""),
-            category=category,
-            particle_id=particle_id,
-            particle_name=particle_name,
-            craftable=bool(details.get("craftable", True)),
-            price_keys=price_keys,
-            price_usd=price_cents / 100,
-            link=link,
-            spells=mannco_spells(details),
-            strange_parts=mannco_strange_parts(details),
-            paint=mannco_paint(details),
-            paint_decimal_hint=mannco_paint_decimal_hint(details),
-        )
-
-        self.stats["mannco_evaluated"] += 1
-        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.stn_client, self.stats)
-        if deal:
-            self.stats["mannco_alerts"] += 1
-            await self.send_deal(deal)
-        else:
-            self.stats["mannco_rejected_by_checks"] += 1
-
     # -- backpack.tf side ---------------------------------------------------
 
     async def handle_bptf_event(self, payload: dict):
@@ -1137,6 +556,29 @@ class Watcher:
 
         name = item.get("name") or item.get("marketName") or item.get("baseName")
         if not name:
+            return
+
+        # Action items excluded unconditionally, not via watched_categories
+        # (so re-enabling by mistake via /addcategory can't undo it) - per
+        # a direct, explicit request to never even consider Tool, Craft
+        # Item, Strangifier, Crate, Party Favor, or Action items. Action
+        # items specifically have their own dedicated equip slot ("action",
+        # previously "MISC2") distinct from every other item type -
+        # confirmed via the official TF2 wiki's own Action items article -
+        # so this is a reliable, structural signal, not a name guess. The
+        # other five categories don't have an equally reliable single
+        # field confirmed for this project's exact data source, so they're
+        # excluded via config.py's excluded_types instead (name/type text
+        # match - the same, less-certain mechanism War Paint/Badge already
+        # used). A more reliable, schema-based check (Valve's own
+        # craft_class field confirms "tool" and "supply_crate" as real
+        # values for Tool and Crate specifically) was researched and is a
+        # good candidate for a future pass, but wasn't rushed into this
+        # one - implementing a new schema-fetch system without room to
+        # test it properly risked introducing exactly the kind of mistake
+        # a large, hurried edit already caused once this session.
+        if item.get("slot") == "action":
+            self.stats["bptf_rejected_category"] += 1
             return
 
         # Category checked HERE, right alongside quality above and before
@@ -1218,15 +660,12 @@ class Watcher:
         raw_paint = paint_obj.get("name") if isinstance(paint_obj, dict) else None
         paint = raw_paint if slot in COSMETIC_SLOTS else None
 
-        # Exact RGB decimal straight from the source, same idea as
-        # mannco_paint_decimal_hint - confirmed real for backpack.tf too
-        # by the diagnostic sample below: a raw paint object of {'id':
-        # 5046, 'name': 'Team Spirit', 'color': '#b8383b'} - '#b8383b'
-        # decodes (after stripping the '#', unlike mannco.store's own
-        # hex which has none) to (184, 56, 59), an exact match for this
-        # project's own "Team Spirit RED" value. Team-coloured paints no
-        # longer need the RED/BLU guess-and-check for backpack.tf either -
-        # this goes straight to the exact colour the listing actually is.
+        # Exact RGB decimal straight from the source (confirmed real via
+        # a diagnostic sample: {'id': 5046, 'name': 'Team Spirit',
+        # 'color': '#b8383b'} - '#b8383b' decodes, after stripping the
+        # '#', to (184, 56, 59), an exact match for this project's own
+        # "Team Spirit RED" value) - no RED/BLU guessing needed for
+        # team-coloured paints, this is the exact colour the listing is.
         paint_decimal_hint = None
         if paint and slot in COSMETIC_SLOTS:
             raw_color = paint_obj.get("color") if isinstance(paint_obj, dict) else None
@@ -1404,7 +843,7 @@ class Watcher:
         )
 
         self.stats["bptf_evaluated"] += 1
-        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.stn_client, self.stats)
+        deal = await asyncio.to_thread(matcher.evaluate_listing, listing, self.bptf, self.effective_cfg(), self.stats)
         if not deal:
             self.stats["bptf_rejected_by_checks"] += 1
             return
@@ -1488,7 +927,7 @@ class Watcher:
                 await self._run_telegram(self.telegram.send, errors_text, keyboard)
             else:
                 reply = telegram_commands.handle_command(
-                    text, self.runtime, has_stn_key=bool(self.cfg.get("stntrading_api_key")),
+                    text, self.runtime,
                     stats=self.stats, stats_since=self.stats_since,
                     currently_rate_limited=bptf_client.is_rate_limited(),
                 )
@@ -1514,17 +953,10 @@ class Watcher:
 
     async def _startup_sanity_check(self):
         """
-        Proactively checks a few core assumptions against what actually
-        got loaded, right after startup, and sends an immediate Telegram
-        warning if any look wrong - rather than waiting for the user to
-        notice bad alerts and report them. Each of these bounds traces
-        back to a real, previously-hit bug in this project's history:
-        key_price_metal ending up None (a parsing bug that broke every
-        metal->keys conversion silently) and a schema fetch coming back
-        suspiciously small (would mean marketplace.tf items and Unusual
-        effect matching are both compromised) are exactly the kind of
-        thing that otherwise wasn't visible until an alert already looked
-        wrong.
+        Checks a few core assumptions right after startup and sends an
+        immediate Telegram warning if any look wrong, rather than waiting
+        for someone to notice bad alerts. E.g. key_price_metal ending up
+        None would silently break every metal->keys conversion.
         """
         problems = []
 
@@ -1544,11 +976,6 @@ class Watcher:
                 problems.append(
                     f"Загружено только {len(self.particle_name_to_id)} unusual-эффектов из схемы "
                     f"Steam (обычно 600+) - определение Unusual-предметов может работать не полностью."
-                )
-            if len(self.defindex_to_name) < 5000:
-                problems.append(
-                    f"Загружено только {len(self.defindex_to_name)} записей defindex->название "
-                    f"(обычно 10000+) - marketplace.tf и картинки предметов могут работать не полностью."
                 )
 
         if not self.mannco_key_usd_cents:
@@ -1570,7 +997,7 @@ class Watcher:
         # everything else (evaluate_listing, Steam inventory checks,
         # etc.) - NOT just a bigger shared pool. A real report showed
         # Telegram commands lagging once listing events started being
-        # dispatched concurrently (bptf_ws.py/mannco_ws.py's
+        # dispatched concurrently (bptf_ws.py's
         # _dispatch_semaphore, up to 60+60 potentially "in flight" at
         # once, each holding a worker thread for its entire throttled
         # request chain - tens of seconds of time.sleep() inside the
@@ -1606,12 +1033,10 @@ class Watcher:
         try:
             await asyncio.to_thread(self.refresh_prices)
         except Exception:
-            # A transient hiccup here (e.g. mannco.store still rate-limited
-            # even after login()'s own retry) shouldn't take down the whole
-            # process the way it used to - price_refresh_loop below retries
-            # this on its own schedule anyway, so it's fine to start the
-            # websocket listeners now and let prices catch up shortly after,
-            # rather than crash-and-let-systemd-restart over it.
+            # A transient hiccup here shouldn't take down the whole
+            # process - price_refresh_loop below retries on its own
+            # schedule anyway, so it's fine to start the websocket
+            # listeners now and let prices catch up shortly after.
             log.exception("Initial price load failed - continuing anyway, will retry on schedule.")
 
         try:
@@ -1661,10 +1086,6 @@ class Watcher:
             self.health_check_loop(),
             self.local_store_prune_loop(),
             self.local_store_snapshot_loop(),
-            self.known_tf2_ids_refresh_loop(),
-            self.marketplacetf_poll_loop(),
-            self.stntrading_poll_loop(),
-            mannco_ws.stream_listing_events(self.handle_mannco_event),
             bptf_ws.stream_listing_events(self.handle_bptf_event),
         )
         shutdown_waiter = asyncio.create_task(shutdown_event.wait())

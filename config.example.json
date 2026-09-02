@@ -6,11 +6,10 @@
   "telegram_bot_token": "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE",
   "telegram_chat_id": "PUT_YOUR_TELEGRAM_CHAT_ID_HERE",
   "steam_api_key": "OPTIONAL_BUT_RECOMMENDED_SEE_README",
-  "stntrading_api_key": "OPTIONAL_SEE_README",
 
   "watched_qualities": ["Unusual", "Strange", "Unique"],
   "watched_categories": ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"],
-  "excluded_types": ["War Paint", "Badge"],
+  "excluded_types": ["War Paint", "Badge", "Tool", "Strangifier", "Craft Item", "Crate", "Party Favor"],
   "min_price_keys": 5,
   "discount_threshold_percent": 5,
   "min_other_listings": 1,
@@ -21,8 +20,6 @@
   "health_check_auto_pause": true,
   "max_days_since_price_update": 90,
   "fetch_price_history_data": false,
-  "marketplacetf_poll_seconds": 300,
-  "stntrading_poll_seconds": 300,
 
   "price_refresh_seconds": 900,
   "key_price_refresh_seconds": 604800,

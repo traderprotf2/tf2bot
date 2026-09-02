@@ -1,21 +1,17 @@
 """
 backpack.tf price list client.
 
-Wraps GET https://backpack.tf/api/IGetPrices/v4 and turns the (fairly deeply
-nested) response into a flat lookup table:
+Wraps GET https://backpack.tf/api/IGetPrices/v4 into a flat lookup table:
 
     (item_name, quality_name, particle_id_or_None) -> price_in_keys
 
-TF2 quality name <-> id mapping is fixed by Valve and hasn't changed in
-over a decade, so it's safe to hard-code.
+TF2 quality name<->id mapping is fixed by Valve, safe to hard-code.
 
-Why "keys" as the common unit: backpack.tf prices things in either refined
-metal or keys. mannco.store prices things in real money (USD cents). To
-compare the two apples-to-apples we convert everything into "keys", using
-mannco.store's own live key price as the USD<->key exchange rate (see
-mannco_client.get_key_price_usd_cents). backpack.tf's own listed price for
-the key (in refined metal) is used to convert its metal-denominated prices
-into keys.
+Common unit is "keys": backpack.tf prices in refined metal or keys;
+comparing anything to a USD price uses mannco.store's own live key price
+as the USD<->key exchange rate (see mannco_client.get_key_price_usd_cents).
+backpack.tf's own listed key price (in refined metal) converts its
+metal-denominated prices into keys.
 """
 
 import json
@@ -29,19 +25,13 @@ import requests
 
 log = logging.getLogger("bptf")
 
-# Caps how many backpack.tf requests (snapshot + price-history endpoints -
-# the two that scale with how many items are being evaluated, not the
-# once-every-15-minutes bulk price refresh) can be in flight at once,
-# across every concurrent evaluate_listing() call. Without this, a burst
-# of many qualifying items at once (more likely now that pricier filters
-# are looser - more watched qualities, lower discount/price bars) could
-# fire a large, unbounded number of simultaneous requests, risking
-# backpack.tf's own rate limiting kicking in and every one of those
-# requests failing together, right when there's the most going on.
-# threading.Semaphore (not asyncio.Semaphore) because these calls run in
-# worker threads via asyncio.to_thread, not on the event loop itself.
-# Reconfigured to scale with the number of accounts in the pool below -
-# see configure_request_pacing.
+# Caps how many backpack.tf requests (snapshot + price-history - the two
+# that scale with items being evaluated, not the 15-min bulk price
+# refresh) can be in flight at once. Prevents a burst of qualifying
+# items from firing an unbounded number of simultaneous requests and
+# tripping backpack.tf's rate limit. threading.Semaphore (not asyncio) -
+# these calls run in worker threads via asyncio.to_thread. Reconfigured
+# to scale with the account pool below - see configure_request_pacing.
 MAX_CONCURRENT_REQUESTS = 4
 _request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
 
@@ -81,10 +71,6 @@ class _AccountPool:
             self._accounts = list(accounts)
             self._min_interval = min_interval_seconds
             self._last_used_at = [0.0] * len(self._accounts)
-
-    def account_count(self):
-        with self._lock:
-            return len(self._accounts)
 
     def acquire(self):
         """Blocks (in the calling thread) until some account's turn
@@ -524,59 +510,29 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
                            spell=None, paint=None, craftable: bool = True,
                            killstreaker=None, sheen=None) -> str:
     """
-    Link to backpack.tf's classifieds search, filtered down to this exact
-    item/quality/effect/spell - i.e. "the offer, as it appears on
-    backpack.tf". Built to include every attribute that distinguishes
-    this specific item (inclusion/exclusion by the traits that do or
-    don't apply), so the search actually narrows down to it instead of
-    returning every variant of the base item.
+    Link to backpack.tf's classifieds search, filtered to this exact
+    item/quality/effect/spell - the closest thing to a permalink that
+    exists (backpack.tf has no single-listing permalink - confirmed both
+    by their API 404ing on that and by their own users being told a
+    tightly-filtered search is the closest alternative).
 
-    HONEST LIMITATION: backpack.tf has no permalink page for a single
-    listing - confirmed both by their API (a "get listing by id" call
-    404s per their own forum: forums.backpack.tf/topic/69932) and by
-    their own users being told, when asking for exactly this, that a
-    tightly-filtered search link is the closest thing that exists. So
-    this is genuinely the best available link, not a shortcut.
+    Domain is plain backpack.tf, not next.backpack.tf - the redesigned
+    site filters via an in-app modal, not URL query params, so a query
+    string there wouldn't filter anything.
 
-    When `steamid` is supplied (the seller's, e.g. from a live backpack.tf
-    listing event), the search is filtered to that one seller too - in
-    practice this narrows it down to just their listing(s) of this item.
-
-    Domain: the plain backpack.tf domain (not next.backpack.tf) - the
-    redesigned next.backpack.tf classifieds page filters via an in-app
-    modal rather than URL query params (confirmed by their own
-    "Returning User Guide": "this replaces the item filter modal"), so a
-    query-string link there doesn't filter anything.
-
-    Params confirmed directly from a real, working search the user built
-    by hand and verified finds the exact right item:
+    Params confirmed from a real, hand-verified working search:
     "backpack.tf/classifieds?item=Ambassador&quality=11&spell=Exorcism
-    &australium=-1&killstreak_tier=0" - notably `australium` and
-    `killstreak_tier` are present even when NOT applicable (-1 and 0
-    respectively), and `tradable`/`craftable` are absent entirely at
-    their default (craftable). This replaces an earlier, incorrect
-    version of this function that always included tradable/craftable and
-    never included spell at all - the missing `spell` param in
-    particular meant a spelled item's search link wasn't actually
-    narrowed down to it. `craftable` IS added now, but only when the
-    item is uncraftable (mirroring the SKU convention where ";uncraftable"
-    is only appended when true, never omitted-but-implied) - an
-    uncraftable item is real and distinguishing, worth filtering by, not
-    an oversight to always skip. `paint` narrows to a specific painted
-    colour when recognised (see paint_rgb_decimal - confirmed real
-    colour values, best-effort packing format). `killstreaker`/`sheen`
-    (only meaningful on Professional/Specialized Killstreak items - see
-    VALID_KILLSTREAKERS/VALID_SHEENS, both confirmed against Valve's own
-    wiki) are added the same defensive way as spell: real listing
-    attributes per multiple third-party backpack.tf listing-data tools,
-    but not independently confirmed as *search* filter param names on
-    this specific page - unrecognised params are normally just ignored,
-    so this can't make a search less precise, only more if honoured.
+    &australium=-1&killstreak_tier=0" - notably `australium`,
+    `killstreak_tier`, and `spell` are present even when NOT applicable
+    (-1, 0, "None" respectively) - omitting them doesn't tell the search
+    to exclude those variants, only including the explicit sentinel does.
+    `craftable` is added only when the item is uncraftable (mirrors the
+    SKU convention). `killstreaker`/`sheen` aren't independently
+    confirmed as filter params on this page, but an unrecognised param
+    is normally just ignored, so including them can't hurt.
 
-    `name` can be passed in with or without Killstreak/Australium
-    prefixes still attached (e.g. "Australium Rocket Launcher") -
-    strip_variant_prefixes() is applied internally, so callers don't
-    need to remember to do it themselves.
+    `name` can be passed with or without Killstreak/Australium prefixes
+    still attached - strip_variant_prefixes() is applied internally.
     """
     from urllib.parse import urlencode
 
@@ -587,14 +543,10 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
         params["quality"] = quality_id
     if particle_id is not None:
         params["particle"] = particle_id
-    # Always present, not just when there IS a spell - confirmed directly
-    # by the user testing backpack.tf's own spell filter and sharing the
-    # resulting URL: "spell=None" (literally that string) is the real
-    # sentinel for "must have no spell", the same convention as
-    # australium=-1/killstreak_tier=0 below. Before this, an item with no
-    # spell just omitted the param entirely, which doesn't tell
-    # backpack.tf's search to exclude spelled listings - only including
-    # spell=None does that.
+    # "spell=None" (the literal string) is the real sentinel for "must
+    # have no spell" - the same convention as australium=-1/
+    # killstreak_tier=0 below. Omitting the param entirely doesn't
+    # exclude spelled listings.
     params["spell"] = spell if spell else "None"
     if killstreaker:
         params["killstreaker"] = killstreaker
@@ -605,18 +557,11 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
     paint_value = paint_rgb_decimal(paint) if paint else None
     if paint_value is not None:
         params["paint"] = paint_value
-    # Always present, even when not applicable - the confirmed working
-    # example includes both at their "not applicable" values (-1, 0)
-    # rather than omitting them.
+    # Present at their "not applicable" values (-1, 0) rather than omitted.
     params["australium"] = 1 if australium else -1
     params["killstreak_tier"] = killstreak_tier if killstreak_tier else 0
-    # Every listing this project evaluates is, by definition, actively
-    # for sale/trade - so always tradable, unconditionally (unlike
-    # craftable, there's no meaningful "untradeable listing" case to
-    # distinguish). Confirmed as part of the community-standard link
-    # pattern by multiple independent real examples
-    # ("...&tradable=1&craftable=1" turns up repeatedly across backpack.tf
-    # forum posts sharing search links for specific items).
+    # Every listing this project evaluates is, by definition, for sale -
+    # always tradable, unconditionally.
     params["tradable"] = 1
     if steamid:
         params["steamid"] = steamid
@@ -672,14 +617,12 @@ def _iter_price_entries(craft_block):
     particle id instead, to hold one price entry per effect.
 
     An earlier version of this parser only handled the dict shape and
-    used an isinstance() check to defensively skip anything else -
-    which meant the list shape was silently dropped entirely, including
-    the Key's own entry. That's a serious bug beyond just missing the
-    Key's price for its own sake: this project converts every
-    metal-denominated price (mannco.store listings priced in metal,
-    backpack.tf listings in scrap/reclaimed/refined) into keys using
-    that exact number, so losing it silently breaks that conversion
-    project-wide, not just for the Key itself.
+    used an isinstance() check to defensively skip anything else - which
+    silently dropped the list shape entirely, including the Key's own
+    entry. That's serious beyond just missing the Key's price: every
+    metal-denominated backpack.tf listing (scrap/reclaimed/refined) gets
+    converted to keys using that exact number, so losing it silently
+    breaks that conversion project-wide, not just for the Key itself.
     """
     if isinstance(craft_block, list):
         for entry in craft_block:
@@ -735,14 +678,15 @@ class LocalListingStore:
     def __init__(self, max_age_seconds=3600, buy_max_age_seconds=None, max_entries_per_key=300):
         self._entries = {}  # identity_key -> {listing_id: {listing_id, seller_id, price_keys, ts, intent}}
         self._max_age_seconds = max_age_seconds
-        # Matches get_max_buy_price's own BUY_ORDER_LIVE_WINDOW_SECONDS
-        # by default - no point RETAINING buy-order entries longer than
-        # the window that ever actually reads them (see that constant's
-        # own comment for the full reasoning: a buy order can genuinely
-        # go stale within minutes, with no live query available to
-        # re-verify one at decision time, so this project now only ever
-        # trusts genuinely recent sightings for that decision).
-        self._buy_max_age_seconds = buy_max_age_seconds if buy_max_age_seconds is not None else 5 * 60
+        # Matches get_max_buy_price's own BUY_ORDER_SAFETY_NET_SECONDS -
+        # retaining a buy order no longer than the window that could ever
+        # actually use it. See that constant's own comment for the full,
+        # corrected reasoning: a recorded buy order IS the live, current
+        # value (kept accurate by record()/remove_listing() as real
+        # update/delete events arrive), not something that goes stale on
+        # its own just from time passing - this window is only a safety
+        # net for a missed delete event, not the correctness mechanism.
+        self._buy_max_age_seconds = buy_max_age_seconds if buy_max_age_seconds is not None else 24 * 3600
         self._max_entries_per_key = max_entries_per_key
         self._lock = threading.Lock()
 
@@ -832,26 +776,57 @@ class LocalListingStore:
     # a number that's no longer real. There's no live query available
     # to verify a specific buy order at decision time (the only endpoint
     # that could - backpack.tf's own classifieds snapshot - is the
-    # confirmed-deprecated, severely rate-limited one this whole local-
-    # store approach exists to avoid), so a short, no-stale-fallback
-    # window is the most realistic substitute actually available: an
-    # active buy order from a genuinely live bot (the "24/7" auto-
-    # buying bots seen in real screenshots) gets bumped often enough to
-    # keep reappearing within a window this size; one that's gone stale
-    # simply stops qualifying, rather than being used anyway.
-    BUY_ORDER_LIVE_WINDOW_SECONDS = 5 * 60
+    # THE actual bug behind a real, severe complaint: backpack.tf's own
+    # websocket only fires "listing-update" on an actual create or CHANGE
+    # (confirmed via their docs earlier this session) - there is no
+    # periodic per-listing heartbeat. A buy order a bot posts once and
+    # never touches again generates exactly ONE event, then nothing, for
+    # as long as it stays posted (often days). Requiring one to have been
+    # RE-SEEN within the last few minutes - with no fallback - meant
+    # almost every real, still-active buy order aged out and became
+    # unusable within minutes of being recorded, long before any genuinely
+    # discounted sell listing had a chance to appear against it. That's
+    # not a tuning problem to fix with a bigger number - it's the wrong
+    # model: this project doesn't need "was this RE-CONFIRMED recently",
+    # it needs "is this the CURRENT value, as far as the websocket stream
+    # has told me" - which is a fundamentally different, event-driven
+    # question already answered correctly elsewhere: record() replaces a
+    # listing's price the moment an update event changes it, and
+    # remove_listing() deletes it the moment a delete event arrives (see
+    # both in this same class). A recorded buy order IS the live, current
+    # value - continuously kept correct by that same event stream, not by
+    # how recently it happened to be reconfirmed - right up until one of
+    # those two events says otherwise.
+    #
+    # This window is therefore a SAFETY NET, not the correctness
+    # mechanism: only relevant if a delete event was somehow missed
+    # entirely (e.g. during a brief reconnect gap - bptf_ws.py reconnects
+    # within seconds, so this gap is normally tiny). Set generously long
+    # so it essentially never fires in normal operation, while still
+    # eventually clearing a truly abandoned entry.
+    BUY_ORDER_SAFETY_NET_SECONDS = 24 * 3600
+    # A shorter window used ONLY to prefer more-recently-reconfirmed data
+    # when it happens to exist, for a slightly higher-confidence read -
+    # never a requirement, since falling back past it is exactly what
+    # fixes the bug above.
+    BUY_ORDER_HIGH_CONFIDENCE_SECONDS = 6 * 3600
 
     def get_max_buy_price(self, identity_key):
         """
-        Mirrors get_best_buy_order_keys's old return shape. Deliberately
-        does NOT fall back to older data when nothing is fresh enough -
-        see BUY_ORDER_LIVE_WINDOW_SECONDS above for why: an item with no
-        buy order seen in the last few minutes is treated as "no usable
-        buy order data right now", the same honest treatment as
-        genuinely having none, rather than showing a number that might
-        already be wrong.
+        Mirrors get_best_buy_order_keys's old return shape. Prefers a
+        value reconfirmed within BUY_ORDER_HIGH_CONFIDENCE_SECONDS if one
+        exists, but - unlike an earlier, broken version of this - ALWAYS
+        falls back to anything within BUY_ORDER_SAFETY_NET_SECONDS rather
+        than returning "no data" just because nothing has re-triggered an
+        event recently. See BUY_ORDER_SAFETY_NET_SECONDS above for why
+        that distinction is the actual fix, not a tuning tweak.
         """
-        values = self._fresh_values(identity_key, "buy", max_age=self.BUY_ORDER_LIVE_WINDOW_SECONDS)
+        recent = self._fresh_values(identity_key, "buy", max_age=self.BUY_ORDER_HIGH_CONFIDENCE_SECONDS)
+        recent_trustworthy = _filter_price_outliers(recent, floor_fraction=0.3, ceiling_fraction=3.0)
+        if recent_trustworthy:
+            return max(recent_trustworthy), len(recent_trustworthy)
+
+        values = self._fresh_values(identity_key, "buy", max_age=self.BUY_ORDER_SAFETY_NET_SECONDS)
         trustworthy = _filter_price_outliers(values, floor_fraction=0.3, ceiling_fraction=3.0)
         if not trustworthy:
             return None, 0
@@ -1125,282 +1100,6 @@ class BackpackTFPriceList:
             return None  # caller must handle pure-usd listings separately
         return total if got_any else None
 
-    def _fetch_snapshot_prices(self, name: str, quality_name: str, particle_id, craftable, intent: str,
-                                spell=None, australium: bool = False, killstreak_tier=None, paint=None,
-                                killstreaker=None, sheen=None, paint_decimal_override=None):
-        """
-        Shared fetch for backpack.tf's classifieds snapshot, used for both
-        sell listings (get_snapshot_min_other_keys) and buy orders
-        (get_best_buy_order_keys). Returns a list of (listing_id,
-        price_in_keys) tuples, cached briefly per (item, intent, spell,
-        australium, killstreak_tier, paint) so a burst of updates for the
-        same item doesn't hammer the endpoint. Returns None (not a list)
-        if unavailable (no token, or the request failed).
-
-        `name` can be passed in with or without Killstreak/Australium
-        prefixes - strip_variant_prefixes() is applied internally (see
-        that function's docstring for why: a direct report confirmed
-        baking them into the name breaks the matching search on the
-        classifieds webpage, and this endpoint shares the same
-        name+separate-filter convention rather than IGetPrices' fuller-
-        name-as-one-string convention).
-
-        `spell`/`australium`/`killstreak_tier`/`paint` are passed through
-        defensively - confirmed as real params on the classifieds
-        *webpage* search (see build_classifieds_url), not independently
-        confirmed for this specific API endpoint. If any aren't actually
-        supported here, the normal REST behaviour is to just ignore an
-        unrecognised param, and the existing try/except below already
-        falls back gracefully on any real request failure - so this
-        can't make a spelled/killstreak/australium/painted item's
-        reference price worse, only better if they're honoured. Filtering
-        by paint here specifically matters for accuracy: without it, a
-        painted cosmetic's reference price would be computed against a
-        mix of painted and unpainted listings, which trade at different
-        premiums.
-        """
-        if not self.token:
-            return None
-        if _currently_rate_limited():
-            return None
-        name = strip_variant_prefixes(name)
-        # An explicit override (one of the two RED/BLU decimals for a
-        # team-coloured paint - see team_color_paint_decimals) takes
-        # priority over resolving from the name, since team-coloured
-        # names have no single correct value to resolve to in the first
-        # place - the caller has already picked which of the two this
-        # particular attempt is trying.
-        paint_value = paint_decimal_override if paint_decimal_override is not None else (
-            paint_rgb_decimal(paint) if paint else None
-        )
-        cache_key = (name, quality_name, particle_id, intent, spell, australium, killstreak_tier, paint_value,
-                     killstreaker, sheen, craftable)
-        cached = self._snapshot_cache.get(cache_key)
-        now = time.time()
-        if cached and (now - cached[0]) < self.snapshot_cache_seconds:
-            return cached[1]
-
-        quality_id = QUALITY_NAME_TO_ID.get(quality_name)
-        params = {
-            "appid": 440,
-            # "key"/"token" deliberately NOT set here - _get_with_retry
-            # injects them per-request from whichever account the pool
-            # hands out (round-robin across every configured account).
-            "sku": name,
-            "intent": intent,
-            "craftable": 1 if craftable else 0,
-            "tradable": 1,
-            "australium": 1 if australium else -1,
-            "killstreak_tier": killstreak_tier if killstreak_tier else 0,
-        }
-        if quality_id is not None:
-            params["quality"] = quality_id
-        if particle_id is not None:
-            params["particle"] = particle_id
-        # Same "always present" reasoning as build_classifieds_url above -
-        # spell=None (confirmed real by testing the site's own filter) is
-        # the correct way to ask for "no spell", now that this is known.
-        # The client-side filter a few lines below this call (checking
-        # each returned listing's own spell data) is kept as a defensive
-        # backup regardless - cheap insurance if this param is ever
-        # ignored or behaves unexpectedly, not a sign it's not trusted.
-        params["spell"] = spell if spell else "None"
-        if paint_value is not None:
-            params["paint"] = paint_value
-        if killstreaker:
-            params["killstreaker"] = killstreaker
-        if sheen:
-            params["sheen"] = sheen
-
-        resp = None
-        try:
-            resp = _get_with_retry(self.session, SNAPSHOT_URL, params)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception:
-            # Status code (and a short body snippet) logged EXPLICITLY,
-            # up front in the message text itself - not left to whatever
-            # of the exception's own text happens to survive truncation
-            # in the /errors display. A real report showed a run of
-            # snapshot failures with NO accompanying "rate limit (429)"
-            # line, meaning these weren't 429s and (given _get_with_retry
-            # already retries 5xx once) very possibly weren't a plain 5xx
-            # either - something else was going wrong, and there was no
-            # way to tell what from the log as it stood. resp stays None
-            # if the failure was a connection-level exception (no
-            # response ever received) rather than a bad status code.
-            status = resp.status_code if resp is not None else "no response (connection-level failure)"
-            body_snippet = resp.text[:200] if resp is not None else ""
-            log.exception(
-                "backpack.tf snapshot request failed for %s (%s, intent=%s) - HTTP status: %s, body: %r",
-                name, quality_name, intent, status, body_snippet,
-            )
-            return None
-
-        listings = data.get("listings", data.get(intent, []))
-        if not isinstance(listings, list):
-            return None
-
-        prices = []
-        for listing in listings:
-            if not isinstance(listing, dict):
-                continue
-            listing_id = listing.get("id") or listing.get("listingId")
-            currencies = listing.get("currencies", {})
-            price_keys = self.currencies_to_keys(currencies)
-            if price_keys is None:
-                continue
-
-            listing_item = listing.get("item") or {}
-
-            # Verify craftable status client-side too, not just via the
-            # `craftable` request param above - same reasoning as the
-            # spell check below: a real report showed buy orders for
-            # CRAFTABLE Flip-Flops being used as if they applied to a
-            # NON-Craftable listing, right after the same kind of gap was
-            # found and fixed for spells. Rather than assume this one
-            # request param is reliably honored by backpack.tf's search
-            # (spell's very existence as a param didn't mean "omit it"
-            # correctly excluded spelled items either), checking each
-            # returned listing's own craftable flag directly is a small,
-            # cheap way to be sure rather than hope.
-            listing_craftable = listing_item.get("craftable")
-            if listing_craftable is not None and bool(listing_craftable) != bool(craftable):
-                continue
-
-            # Same defense-in-depth reasoning as craftable/spell above,
-            # now extended to killstreak tier, australium, and Unusual
-            # particle - a real report showed the EXACT same wrong buy
-            # order (70.41 keys) recurring for the item that originally
-            # exposed the spell-contamination bug, well after that fix
-            # shipped - meaning spell wasn't the only unguarded dimension
-            # for that listing. Rather than assume killstreak_tier=0 /
-            # australium=-1 (both have a "proper", documented sentinel
-            # value, unlike spell) are actually honored by backpack.tf's
-            # search just because the convention looks more official,
-            # every dimension that can silently misprice an item now gets
-            # the same client-side check as craftable and spell already
-            # had - trust the request param less, verify what actually
-            # came back.
-            #
-            # Checked at BOTH the listing level and nested under "item" -
-            # unlike spell (confirmed at the listing level by a real
-            # scraping library's own field list), there's no equally
-            # direct confirmation for exactly where backpack.tf puts
-            # killstreakTier/particle specifically, so this checks
-            # whichever of the two locations actually has a value rather
-            # than betting on one guess - cheap insurance against the
-            # exact kind of wrong-nesting bug that just caused spell's
-            # check to silently do nothing for who knows how long.
-            listing_killstreak_tier = listing_item.get("killstreakTier")
-            if listing_killstreak_tier is None:
-                listing_killstreak_tier = listing.get("killstreakTier")
-            wanted_tier = killstreak_tier or 0
-            if listing_killstreak_tier is not None and int(listing_killstreak_tier) != wanted_tier:
-                continue
-
-            listing_name = listing_item.get("name") or listing.get("name") or ""
-            listing_is_australium = listing_name.startswith("Australium ")
-            if listing_name and listing_is_australium != bool(australium):
-                continue
-
-            if particle_id is not None:
-                listing_particle_obj = listing_item.get("particle") or listing.get("particle") or {}
-                listing_particle_id = (
-                    listing_particle_obj.get("id") if isinstance(listing_particle_obj, dict)
-                    else (listing_item.get("particleId") or listing_item.get("particle_id")
-                          or listing.get("particleId") or listing.get("particle_id"))
-                )
-                if listing_particle_id is not None and int(listing_particle_id) != int(particle_id):
-                    continue
-
-            # MISSED in the earlier pass that added the checks above -
-            # paint had NO client-side verification at all, despite
-            # being requested via the exact same "trust but verify"
-            # request param as spell/killstreak_tier/etc. Direct,
-            # repeated evidence this was a real gap: the identical 80.42
-            # key buy order kept recurring for the same base item across
-            # SEVERAL different, individually-mapped paints (not team-
-            # coloured, not unmapped - paints that should each resolve
-            # to one specific, correct RGB value) - the one thing that
-            # explains the SAME number regardless of which paint was
-            # actually being evaluated is the paint filter never
-            # actually excluding anything, the exact shape of the
-            # spell bug found and fixed earlier. Checked at both
-            # possible locations (paint object with a "color" hex, or a
-            # raw numeric value) and both listing/item levels, same
-            # "don't bet on one guess" reasoning as killstreak_tier/
-            # particle above - there's no equally direct, independent
-            # confirmation of exactly where/how backpack.tf represents
-            # paint on a search RESULT specifically (as opposed to the
-            # original listing event, where this project does have that
-            # confirmation).
-            if paint_value is not None:
-                listing_paint_obj = listing_item.get("paint") or listing.get("paint")
-                listing_paint_decimal = None
-                if isinstance(listing_paint_obj, dict):
-                    raw_color = listing_paint_obj.get("color")
-                    if isinstance(raw_color, str):
-                        try:
-                            listing_paint_decimal = int(raw_color.lstrip("#"), 16)
-                        except ValueError:
-                            listing_paint_decimal = None
-                    if listing_paint_decimal is None and listing_paint_obj.get("id") is not None:
-                        # Paint can defindex, not an RGB decimal - not
-                        # comparable to paint_value directly, but its
-                        # mere presence still confirms this listing IS
-                        # painted, which is enough to catch the clearest
-                        # contamination case (an unpainted listing's
-                        # price leaking into a painted item's average).
-                        listing_paint_decimal = "has_paint_but_unknown_decimal"
-                elif isinstance(listing_paint_obj, (int, float)):
-                    listing_paint_decimal = int(listing_paint_obj)
-
-                if listing_paint_decimal is not None and listing_paint_decimal != "has_paint_but_unknown_decimal":
-                    if listing_paint_decimal != paint_value:
-                        continue
-                elif listing_paint_obj is None:
-                    # Asked for a specific paint but this listing shows
-                    # no paint data at all (e.g. genuinely unpainted) -
-                    # exclude it, the same way asking for spell=None
-                    # excludes anything WITH a spell.
-                    continue
-
-            if not spell:
-                # We asked for "no particular spell" (spell=None omits the
-                # filter entirely) - but per backpack.tf's own forum, there
-                # is no confirmed way to tell their search "must have NO
-                # spell" the way australium=-1/killstreak_tier=0 mean "not
-                # applicable" for those - the only documented way to
-                # exclude spelled items is the next.backpack.tf interactive
-                # filter UI, which (like everything else there) doesn't
-                # translate to a URL param. So when evaluating a spell-less
-                # item, a returned listing that DOES carry a spell has to be
-                # dropped here, client-side - otherwise a spell-less item's
-                # reference/buy-order price can get contaminated by a
-                # spelled listing's (often much higher) price, exactly a
-                # real report: a buy order that was actually for a SPELLED
-                # copy got shown as if it applied to a plain one.
-                # CRITICAL FIX: was reading listing_item.get("spells")
-                # (nested under "item") - direct, empirical user
-                # confirmation (checked backpack.tf directly: an 80-key
-                # buy order existed ONLY on a spelled copy, never on a
-                # plain one) proved this check was never actually
-                # matching anything, letting the exact contamination it
-                # was meant to prevent through the whole time. A real
-                # scraping library (Preport/getBackpackTFListings) that
-                # independently confirmed "details" sits at the LISTING
-                # level (not nested under "item") shows the SAME thing
-                # for spells/parts/sheen/killstreaker - all listing-level
-                # fields, siblings of "item", not properties of it.
-                listing_spells = listing.get("spells")
-                if listing_spells:
-                    continue
-            prices.append((listing_id, price_keys))
-
-        self._snapshot_cache[cache_key] = (now, prices)
-        return prices
-
     def get_snapshot_min_other_keys(self, name: str, quality_name: str, exclude_listing_id: str,
                                      particle_id=None, craftable=True, spell=None,
                                      australium: bool = False, killstreak_tier=None, paint=None,
@@ -1452,30 +1151,6 @@ class BackpackTFPriceList:
         key = listing_identity_key(name, quality_name, particle_id, paint_value, craftable,
                                     spell, killstreak_tier, australium, texture=texture)
         return self.local_listings.get_max_buy_price(key)
-
-    def _unused_get_snapshot_min_other_keys_OLD(self, name: str, quality_name: str, exclude_listing_id: str,
-                                     particle_id=None, craftable=True, spell=None,
-                                     australium: bool = False, killstreak_tier=None, paint=None,
-                                     killstreaker=None, sheen=None, paint_decimal_override=None):
-        """
-        DEAD CODE, kept only for reference during the transition -
-        queried backpack.tf's now-confirmed-deprecated v1 snapshot
-        endpoint directly. No longer called anywhere. Safe to delete in
-        a later cleanup pass once the local-store approach above has
-        been running long enough to trust fully.
-        """
-        prices = self._fetch_snapshot_prices(name, quality_name, particle_id, craftable, intent="sell",
-                                              spell=spell, australium=australium, killstreak_tier=killstreak_tier,
-                                              paint=paint, killstreaker=killstreaker, sheen=sheen,
-                                              paint_decimal_override=paint_decimal_override)
-        if prices is None:
-            return None, 0
-
-        others = [p for (lid, p) in prices if lid != exclude_listing_id]
-        if not others:
-            return None, 0
-        trustworthy = _filter_price_outliers(others)
-        return min(trustworthy), len(trustworthy)
 
     # -- liquidity (best-effort, via price-suggestion recency) ------------
 

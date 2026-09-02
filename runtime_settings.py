@@ -28,7 +28,7 @@ STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_s
 class RuntimeSettings:
     def __init__(self, min_price_keys, watched_qualities, watched_categories,
                  discount_threshold_percent, max_days_since_price_update,
-                 stn_watchlist=None, paused=False, australium_only=False):
+                 paused=False, australium_only=False):
         self.paused = paused
         self.australium_only = australium_only
         self.min_price_keys = min_price_keys
@@ -36,7 +36,6 @@ class RuntimeSettings:
         self.watched_categories = list(watched_categories)
         self.discount_threshold_percent = discount_threshold_percent
         self.max_days_since_price_update = max_days_since_price_update
-        self.stn_watchlist = list(stn_watchlist or [])
         self._lock = threading.Lock()
         # Bumped by save() below on every actual mutation - lets
         # Watcher.effective_cfg() (main.py) cache its merged dict and
@@ -61,7 +60,6 @@ class RuntimeSettings:
             watched_categories=cfg.get("watched_categories", ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"]),
             discount_threshold_percent=cfg["discount_threshold_percent"],
             max_days_since_price_update=cfg.get("max_days_since_price_update", 90),
-            stn_watchlist=[],
             paused=False,
         )
         if os.path.exists(STATE_PATH):
@@ -84,7 +82,6 @@ class RuntimeSettings:
                 settings.max_days_since_price_update = float(
                     saved.get("max_days_since_price_update", settings.max_days_since_price_update)
                 )
-                settings.stn_watchlist = list(saved.get("stn_watchlist", settings.stn_watchlist))
                 log.info("Loaded saved runtime settings from %s", STATE_PATH)
             except Exception:
                 log.exception("Could not read %s, starting from config.json defaults instead.", STATE_PATH)
@@ -101,7 +98,6 @@ class RuntimeSettings:
                 "watched_categories": self.watched_categories,
                 "discount_threshold_percent": self.discount_threshold_percent,
                 "max_days_since_price_update": self.max_days_since_price_update,
-                "stn_watchlist": self.stn_watchlist,
             }
             try:
                 tmp_path = STATE_PATH + ".tmp"

@@ -51,8 +51,6 @@ HELP_TEXT = (
     "/qualities, /addquality Название, /removequality Название\n"
     "/categories, /addcategory weapon|cosmetic|taunt|killstreak_kit|other, /removecategory ...\n"
     "/australium — переключить режим \"только Australium-оружие\" (в меню: кнопка внутри Категорий)\n"
-    "/watchstn Название, /unwatchstn Название, /stnwatchlist — точечно следить за "
-    "предметом на stntrading.eu (нужен STN Premium, иначе просто ничего не найдёт)\n"
     "/help — это сообщение"
 )
 
@@ -386,9 +384,6 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
     total_alerts = 0
     sources = [
         ("bptf", "backpack.tf"),
-        ("mannco", "mannco.store"),
-        ("mptf", "marketplace.tf"),
-        ("stn", "stntrading.eu"),
     ]
     for prefix, label in sources:
         received = stats.get(f"{prefix}_received", 0)
@@ -401,17 +396,7 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
         total_alerts += alerts
 
         if received == 0 and evaluated == 0:
-            if prefix == "stn":
-                lines.append(f"<b>{label}</b>: список наблюдения пуст или ключ не задан")
-            elif prefix == "mptf" and stats.get("mptf_no_key_price", 0):
-                # A real report showed this saying "0 событий - проверь
-                # подключение" while the actual cause (no mannco.store
-                # key price - see _check_marketplacetf_deals) had nothing
-                # to do with the connection at all, sending troubleshooting
-                # in the wrong direction entirely.
-                lines.append(f"<b>{label}</b>: ждёт цену ключа mannco.store (сама по себе не подключение)")
-            else:
-                lines.append(f"<b>{label}</b>: 0 событий - проверь подключение (см. журнал)")
+            lines.append(f"<b>{label}</b>: 0 событий - проверь подключение (см. журнал)")
             continue
 
         detail_bits = []
@@ -466,23 +451,6 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
         tier_inconsistent = stats.get(f"{prefix}_rejected_tier_inconsistency", 0)
         if tier_inconsistent:
             detail_bits.append(f"{tier_inconsistent} нестабильные тиры")
-        # mannco.store-specific stages, added after a real gap in this
-        # display: 4854 received with 0 evaluated and none of the counts
-        # above accounting for it - traced to a rate-limited details
-        # lookup (now fixed with throttling, see mannco_client.py), but
-        # invisible here until these existed to show it.
-        details_failed = stats.get(f"{prefix}_details_failed", 0)
-        if details_failed:
-            detail_bits.append(f"{details_failed} не удалось получить детали предмета")
-        wrong_game = stats.get(f"{prefix}_wrong_game", 0)
-        if wrong_game:
-            detail_bits.append(f"{wrong_game} не TF2")
-        malformed = stats.get(f"{prefix}_malformed", 0)
-        if malformed:
-            detail_bits.append(f"{malformed} неполные данные")
-        no_key_price = stats.get(f"{prefix}_no_key_price", 0)
-        if no_key_price:
-            detail_bits.append(f"{no_key_price} нет цены ключа")
         # backpack.tf only - buy-intent listings recorded into the local
         # store (see LocalListingStore) rather than evaluated for a deal.
         # Added after a real report where this bucket alone accounted
@@ -570,7 +538,7 @@ def _format_errors(error_entries) -> str:
     return text
 
 
-def handle_command(text: str, runtime, has_stn_key: bool = False, stats=None, stats_since=None,
+def handle_command(text: str, runtime, stats=None, stats_since=None,
                     currently_rate_limited: bool = False, error_entries=None) -> str:
     """Parses one typed command and applies it to `runtime`, returning
     the reply text. Any state change is saved to disk before returning."""
@@ -705,33 +673,5 @@ def handle_command(text: str, runtime, has_stn_key: bool = False, stats=None, st
         runtime.watched_categories.remove(category)
         runtime.save()
         return f"Убрал {category}. Сейчас: {', '.join(runtime.watched_categories) or '(пусто, алерты не будут приходить)'}"
-
-    if command == "watchstn":
-        if not arg:
-            return "Укажи точное название предмета: /watchstn The Team Captain"
-        if arg in runtime.stn_watchlist:
-            return f"{arg!r} уже отслеживается на stntrading.eu."
-        runtime.stn_watchlist.append(arg)
-        runtime.save()
-        if not has_stn_key:
-            return (
-                f"Добавил в список: {arg!r}. Но stntrading_api_key не задан в config.json — "
-                f"пока не будет проверяться вообще. Добавь ключ и перезапусти службу."
-            )
-        return f"Добавил в список наблюдения на stntrading.eu: {arg!r}."
-
-    if command == "unwatchstn":
-        if not arg:
-            return "Укажи точное название предмета: /unwatchstn The Team Captain"
-        if arg not in runtime.stn_watchlist:
-            return f"{arg!r} и так не отслеживается."
-        runtime.stn_watchlist.remove(arg)
-        runtime.save()
-        return f"Убрал {arg!r} из списка наблюдения на stntrading.eu."
-
-    if command == "stnwatchlist":
-        if not runtime.stn_watchlist:
-            return "Список наблюдения на stntrading.eu пуст. Добавить: /watchstn Название предмета"
-        return "Отслеживается на stntrading.eu:\n" + "\n".join(f"— {n}" for n in runtime.stn_watchlist)
 
     return f"Не знаю команду {command!r}. /help — список команд, /menu — меню с кнопками."

@@ -1,26 +1,18 @@
 """
-Deal-matching logic, unified across both listening sources
-(mannco.store and backpack.tf itself).
+Deal-matching logic for backpack.tf listings.
 
-Both bptf_ws.py and main.py's mannco handler produce a NormalizedListing
-for whatever they see; evaluate_listing() below is the single place that
-decides whether it's a deal worth alerting on, and assembles everything
-the notification needs. Keeping this as pure functions (no network calls
-except through the passed-in `bptf` client) makes it easy to reason about
-and unit-test.
+bptf_ws.py produces a NormalizedListing for each event it sees;
+evaluate_listing() below is the single place that decides whether it's a
+deal worth alerting on, and assembles everything the notification needs.
+Pure functions (no network calls except through the passed-in `bptf`
+client) - easy to reason about and unit-test.
 
-Reference price priority:
-  1. backpack.tf LIVE listings for this exact item (via the classifieds
-     snapshot), excluding the listing being evaluated - the actual going
-     rate right now, i.e. "the lowest price before this notification".
-     Requires cfg["min_other_listings"] other active listings to trust
-     the number.
-  2. backpack.tf's community-suggested price list (IGetPrices) - used
-     only when (1) isn't available (no backpacktf_token configured, or
-     just not enough live listings for that item yet).
-
-The average price (IGetPriceHistory) is only fetched for listings that
-already pass every other check, to keep API usage down.
+The discount decision runs entirely on backpack.tf's live buy order for
+the exact item (self-collected via the websocket stream into
+LocalListingStore, see bptf_client.py) - never on the community-
+suggested price (IGetPrices), which real cases showed disagreeing with
+what was actually for sale. Other live sell listings, when they exist,
+are shown as informational "Было: X" context only, never required.
 """
 
 import logging
@@ -33,7 +25,6 @@ from bptf_client import (
     paint_rgb_decimal,
     strip_killstreak_prefix,
     strip_quality_prefix,
-    strip_variant_prefixes,
     team_color_paint_decimals,
 )
 
@@ -69,14 +60,10 @@ class NormalizedListing:
 
 def clean_display_name(listing: NormalizedListing) -> str:
     """
-    The exact in-game name with quality shown exactly once (Unusual,
-    Strange, ...), regardless of whether the source's raw `name` field
-    happened to already include the quality prefix or not.
-
-    Australium weapons are always Strange quality, but nobody (in-game,
-    on backpack.tf, or in trader slang) calls one "Strange Australium
-    Rocket Launcher" - the name is just "Australium Rocket Launcher".
-    So that one case is left without a re-added prefix.
+    In-game name with quality shown exactly once, regardless of whether
+    the source's raw `name` already included the quality prefix.
+    Australium weapons are always Strange quality, but nobody calls one
+    "Strange Australium Rocket Launcher" - left without the prefix.
     """
     base = strip_quality_prefix(listing.name, listing.quality)
     if base.startswith("Australium "):
@@ -88,17 +75,12 @@ def clean_display_name(listing: NormalizedListing) -> str:
 
 def detect_special_variant(name: str):
     """
-    Flags well-known weapon variants that carry a real value premium but
-    aren't their own quality/category - just informational context added
-    to the alert, not a filterable toggle (they're still just "weapon"
-    for /addcategory purposes). Both names are confirmed straight from
-    backpack.tf's own pricelist category names
-    (backpack.tf/pricelist/c/botkillers lists "Botkillers" and "Festive
-    Weapons" as first-party categories).
-
-    Festive vs "Festivized" are two different things in TF2 (a built-in
-    holiday skin vs. an attribute added by a Festivizer tool) - this only
-    detects the former, by the name prefix Valve uses consistently.
+    Flags well-known weapon variants (Botkiller, Festive) that carry a
+    value premium but aren't their own quality/category - informational
+    context only, not a filterable toggle. Confirmed against backpack.tf's
+    own pricelist category names. Festive (a built-in holiday skin) is
+    distinct from "Festivized" (an added attribute) - only the former is
+    detected here, by Valve's consistent name prefix.
     """
     if "Botkiller" in name:
         return "Botkiller"
@@ -107,13 +89,10 @@ def detect_special_variant(name: str):
     return None
 
 
-# Confirmed against the official TF2 wiki + multiple community spell
-# guides: each Halloween Spell only ever applies to ONE item category,
-# never both. A spell showing up on the wrong category is not possible
-# in-game, so it's filtered out here the same way paint/killstreak are
-# filtered by slot in main.py - upstream data saying otherwise is either
-# a naming mismatch on our end or bad data, and either way should not be
-# shown as fact.
+# Each Halloween Spell only ever applies to ONE item category (weapon or
+# cosmetic), confirmed against the official wiki + community spell
+# guides - filtered here the same way paint/killstreak are filtered by
+# slot in main.py.
 WEAPON_ONLY_SPELLS = {
     "Exorcism",
     "Halloween Fire", "Spectral Flame",          # same spell, pre/post Tough Break name
@@ -152,28 +131,16 @@ def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, 
                                paint=None, killstreaker=None, sheen=None, paint_decimal_override=None,
                                texture=None):
     """
-    Live-snapshot-ONLY reference price lookup. Used both for the item
-    actually being evaluated, and (in check_killstreak_tier_pricing
-    below) for its OTHER killstreak tiers, so both use the exact same
-    logic to decide what "the going rate" is. Returns a single float in
-    keys, or None if not enough live data is available.
+    Live-buy-order-ONLY reference price lookup. Used both for the item
+    being evaluated, and (in check_killstreak_tier_pricing below) for its
+    OTHER killstreak tiers. Returns a float in keys, or None if not
+    enough live data exists.
 
-    Deliberately does NOT fall back to, or cross-check against, the
-    community-suggested price (backpack.tf's voted/aggregated IGetPrices
-    number) - per explicit correction: the entire point of comparing
-    against LIVE listings is to catch real, current underpricing, and a
-    community-suggested number doesn't reflect what's actually for sale
-    right now. Two real, concrete cases showed a "suggested" price being
-    used instead of - or overriding - real, currently-live listings that
-    told a different (truer) story, which is the opposite of what this
-    project is supposed to do. If there isn't enough live data to trust,
-    the honest answer is "can't evaluate this one right now", not "use a
-    number that isn't from an actual current listing".
-
-    A Steam Community Market fallback was briefly added and then
-    explicitly removed per direct correction: only backpack.tf data
-    should ever factor into this project's comparisons, full stop - no
-    other marketplace, regardless of how it's used or disclosed.
+    Never falls back to the community-suggested price (IGetPrices) - real
+    cases showed that number disagreeing with what was actually for sale.
+    If there isn't enough live data, the honest answer is "skip this one
+    right now", not "use a number that isn't from an actual listing".
+    Only ever backpack.tf data - no other marketplace factors in here.
     """
     ref_keys, other_count = bptf.get_snapshot_min_other_keys(
         name, quality_name, exclude_listing_id=exclude_listing_id,
@@ -203,63 +170,33 @@ def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, 
 def check_killstreak_tier_pricing(bptf, listing: "NormalizedListing", lookup_name: str,
                                    ref_keys: float, cfg: dict) -> bool:
     """
-    "Price boost" sanity check, e.g. for a Strange Festive Ambassador:
-    mannco.store/backpack.tf list it in 4 killstreak tiers (none, Killstreak,
-    Specialized, Professional). In TF2, a higher tier is never LESS
-    desirable than a lower one - same weapon, plus extra kill-effects -
-    so its reference price should never be lower than a lesser tier's.
+    "Price boost" sanity check: a higher killstreak tier (Killstreak <
+    Specialized < Professional) should never be priced BELOW a lower one
+    for the same weapon - if it is, that's a bugged/unreliable number for
+    the whole item's pricing, not a genuine bargain (and typically harder
+    to resell at the implied price, since the market has settled lower).
 
-    Checks the FULL ladder (all 4 tiers) against each other, not just
-    "is a lower tier priced higher than the one being evaluated" - a
-    one-directional version of this check only ever suppressed the
-    higher, anomalously-cheap tier, but a real report pointed out the
-    gap: if e.g. Professional Killstreak is priced BELOW plain for the
-    same weapon, that's not evidence the Professional listing alone is
-    bugged - it's evidence the market data for THIS ITEM, across every
-    tier, is currently unreliable (thin trading, stale suggestions,
-    whatever the cause). The plain version isn't a genuine bargain
-    either just because it happens to be the tier someone's evaluating -
-    it's sitting in the same unreliable pricing pool. So this now also
-    runs for plain (tier 0) items, checking them against tiers 1-3, not
-    only for items that themselves have a killstreak tier.
+    Checks the full ladder both directions, including plain (tier 0)
+    weapons against tiers 1-3, not just the tier actually being
+    evaluated - a one-directional, self-only check missed the case where
+    a HIGHER tier being cheap meant the item's whole pricing was
+    unreliable, not just that one listing.
 
-    A "cheap" tier that's actually priced below a lesser tier isn't an
-    underpriced grail, it's a bugged number - and it also tends to be
-    harder to resell at the price the alert implies, since the market
-    has typically already settled at (or near) the lower tier's price
-    instead.
-
-    Only applies to weapons (killstreak tiers don't exist elsewhere).
-    Returns True if every tier pair checked out consistent (or couldn't
-    be checked - missing data isn't treated as an anomaly), False if any
-    pair is confirmed priced backwards - the caller should suppress the
-    alert regardless of which tier triggered it.
+    Only applies to weapons. Returns True if every checked pair is
+    consistent (or couldn't be checked - missing data isn't an anomaly),
+    False if any pair is confirmed backwards.
     """
     if listing.category != "weapon":
         return True
 
     tier = listing.killstreak_tier or 0
 
-    # OPTIMIZED, per direct feedback that the full 4-tier check was
-    # taking up to a minute per killstreak weapon once backpack.tf's
-    # real rate limit (6 requests/60s on a non-premium key - see
-    # bptf_min_request_interval_seconds in config.py) forced requests
-    # 11 seconds apart: checking all 3 OTHER tiers cost 3 extra requests
-    # on top of the 3 already needed for any weapon (reference, buy
-    # order, average price) - 6 total, ~66s sequential.
-    #
-    # Narrowed to checking ONLY against tier 0 (plain) - the single
-    # comparison that catches the actual bug this check exists for
-    # ("Professional priced below plain" - a real report), for 1 extra
-    # request instead of 3. A tier-0 listing itself has nothing lower to
-    # compare against, so it skips this check entirely now rather than
-    # also checking upward against tiers 1-3 (a broader protection added
-    # after a separate real report, now deliberately traded for speed -
-    # tier-0 weapons are also by far the most common weapon listings, so
-    # this also removes the cost from the majority case, not just the
-    # killstreak one). The remaining gap - a plain listing whose OWN
-    # price looks fine even though a higher tier is mispriced - is a
-    # real but narrower loss than what this recovers in speed.
+    # Checks ONLY against tier 0 (plain) - the comparison that catches
+    # the main real-world bug ("Professional priced below plain"), at 1
+    # extra request instead of 3 for the full ladder. Tier-0 listings
+    # skip this check entirely (nothing lower to compare against) -
+    # they're also the most common weapon listings, so this keeps the
+    # cost off the majority case too.
     if tier == 0:
         return True
 
@@ -310,26 +247,17 @@ def is_watched(listing: NormalizedListing, cfg: dict) -> bool:
     return True
 
 
-def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stn_client=None, stats=None):
+def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
     """
     Returns a deal dict if this listing qualifies, otherwise None.
     `stats` (a collections.Counter, typically main.py's self.stats) is
-    optional and purely diagnostic - when given, specific rejection
-    reasons get their own counter, incremented on the way to returning
-    None, rather than every rejection collapsing into one "rejected by
-    accuracy checks" bucket. Added after a real /stats report (263558
-    received, 23610 evaluated, only 31 found) where that single bucket
-    made it impossible to tell "this item genuinely isn't discounted"
-    apart from "this item has no comparable live data yet" (the local
-    store's own cold-start reality, not a bug) - two very different
-    situations that call for very different responses (nothing to do
-    about the first; possibly loosen min_other_listings or wait longer
-    for the second) but were indistinguishable in the numbers as they
-    stood.
+    optional and purely diagnostic - when given, each rejection reason
+    gets its own counter (via reject() below) instead of collapsing into
+    one generic "rejected" bucket, so /stats can distinguish "genuinely
+    not a deal" from "no comparable data yet" and similar.
     """
     _STATS_SOURCE_PREFIX = {
-        "backpack.tf": "bptf", "mannco.store": "mannco",
-        "marketplace.tf": "mptf", "stntrading.eu": "stn",
+        "backpack.tf": "bptf",
     }
 
     def reject(reason):
@@ -572,20 +500,6 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stn_client=Non
     # labeled, so a big gap between them is visible rather than hidden.
     suggested_keys = bptf.get_price_keys(lookup_name, listing.quality, listing.particle_id)
 
-    # STN.Trading's own buy order, shown alongside backpack.tf's as
-    # another independent data point - same "informational only, never
-    # decision-relevant" treatment as suggested_keys above. Only
-    # attempted when a client was actually supplied (main.py only passes
-    # one when stntrading_api_key is configured) and wrapped defensively
-    # - this is a nice-to-have on an already-qualifying deal, so any
-    # failure here must never cost the alert itself.
-    stn_buy_keys = None
-    if stn_client is not None:
-        try:
-            stn_buy_keys = stn_client.get_item_buy_price_keys(lookup_name, bptf.key_price_metal)
-        except Exception:
-            log.warning("STN buy-order lookup failed for %s - showing the alert without it.", lookup_name)
-
     # Best current buy order - "could I flip this for an instant, guaranteed
     # profit". Also only fetched now, same reasoning as the average price.
     #
@@ -640,7 +554,6 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stn_client=Non
         "previous_low_keys": ref_keys,
         "average_keys": avg_keys,
         "suggested_keys": suggested_keys,
-        "stn_buy_keys": stn_buy_keys,
         "suggested_updated_days_ago": days_since_update,
         "buy_order_keys": buy_order_keys,
         "buy_order_count": buy_order_count,
