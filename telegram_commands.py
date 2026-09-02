@@ -436,9 +436,9 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
         # no_particle_id, unmapped_paint, tier_inconsistency) stay folded
         # into the aggregate above rather than cluttering this line
         # further.
-        no_ref_data = stats.get(f"{prefix}_rejected_no_reference_data", 0)
+        no_ref_data = stats.get(f"{prefix}_rejected_no_live_buy_order", 0)
         if no_ref_data:
-            detail_bits.append(f"{no_ref_data} нет данных для сравнения")
+            detail_bits.append(f"{no_ref_data} нет живого buy order")
         too_small = stats.get(f"{prefix}_rejected_discount_too_small", 0)
         if too_small:
             detail_bits.append(f"{too_small} скидка меньше порога")

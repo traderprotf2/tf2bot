@@ -55,6 +55,7 @@ class NormalizedListing:
     price_usd: Optional[float] = None
     link: Optional[str] = None
     extra_excluded_hint: bool = False    # set True for things like War Paint skins detected structurally
+    texture: Optional[str] = None        # item "grade" for decorated weapons/certain cosmetics (Civilian..Elite) - see listing_identity_key's own docstring in bptf_client.py
     spells: List[str] = field(default_factory=list)     # Halloween spell names, e.g. "Voices from Below"
     strange_parts: List[str] = field(default_factory=list)  # e.g. "Strange Part: Domination Kills"
     paint: Optional[str] = None                          # paint-can colour name, if painted
@@ -148,7 +149,8 @@ def filter_spells_for_category(spells, category: str):
 
 def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, spell, australium,
                                killstreak_tier, min_other_listings, exclude_listing_id="",
-                               paint=None, killstreaker=None, sheen=None, paint_decimal_override=None):
+                               paint=None, killstreaker=None, sheen=None, paint_decimal_override=None,
+                               texture=None):
     """
     Live-snapshot-ONLY reference price lookup. Used both for the item
     actually being evaluated, and (in check_killstreak_tier_pricing
@@ -167,13 +169,18 @@ def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, 
     project is supposed to do. If there isn't enough live data to trust,
     the honest answer is "can't evaluate this one right now", not "use a
     number that isn't from an actual current listing".
+
+    A Steam Community Market fallback was briefly added and then
+    explicitly removed per direct correction: only backpack.tf data
+    should ever factor into this project's comparisons, full stop - no
+    other marketplace, regardless of how it's used or disclosed.
     """
     ref_keys, other_count = bptf.get_snapshot_min_other_keys(
         name, quality_name, exclude_listing_id=exclude_listing_id,
         particle_id=particle_id, craftable=craftable, spell=spell,
         australium=australium, killstreak_tier=killstreak_tier,
         paint=paint, killstreaker=killstreaker, sheen=sheen,
-        paint_decimal_override=paint_decimal_override,
+        paint_decimal_override=paint_decimal_override, texture=texture,
     )
 
     if ref_keys is not None and other_count >= min_other_listings:
@@ -183,17 +190,6 @@ def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, 
         )
         return ref_keys
 
-    # No longer branches on is_rate_limited() - that check made sense
-    # back when this queried backpack.tf's API live and a 429 cooldown
-    # was a real, distinct reason "no data" could mean "we didn't even
-    # ask" rather than "genuinely nothing there". Now that this reads
-    # purely from the self-collected local store (no HTTP call in this
-    # path at all - see LocalListingStore in bptf_client.py),
-    # backpack.tf's rate-limit state is unrelated to whether enough of
-    # THIS exact item has been seen via the websocket - branching on it
-    # here risked blaming a rate limit (possibly active for a completely
-    # different reason, like the optional price-history fetch) for what
-    # is actually just "not enough self-collected data yet".
     log.info(
         "Skipping %s - only %s listing(s) self-collected so far (needed >= %d) for "
         "this exact item. Not a stale/community price - genuinely no comparable live "
@@ -451,6 +447,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stn_client=Non
             spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
             min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
             paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
+            texture=listing.texture,
             paint_decimal_override=listing.paint_decimal_hint,
         )
         if ref_keys is not None:
@@ -462,6 +459,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stn_client=Non
                 spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
                 min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
                 paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
+                texture=listing.texture,
                 paint_decimal_override=candidate,
             )
             if ref_keys is not None:
@@ -473,34 +471,55 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stn_client=Non
             spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
             min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
             paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
+            texture=listing.texture,
         )
 
     if ref_keys is None or ref_keys <= 0:
-        # THE key distinction a real /stats report couldn't make: no
-        # comparable live SELL data has been self-collected yet for this
-        # EXACT identity (name+quality+particle+paint+craftable+spell+
-        # killstreak+australium - see LocalListingStore/listing_identity_
-        # key in bptf_client.py) - not "this item isn't discounted", but
-        # "there's nothing to compare it against yet". Inherent to a
-        # cold-started, self-collected store for a specific-enough
-        # identity combination that hasn't recurred yet in the current
-        # window, not necessarily a bug.
-        return reject("no_reference_data")
+        # No longer a rejection - the sell-side reference is now purely
+        # informational ("Было: X") when available, not required. The
+        # actual discount decision now runs entirely on the buy order
+        # fetched below, per direct correction: comparing against OTHER
+        # active sell listings needed at least one other exact-match
+        # listing to exist at the same time, which for anything not
+        # extremely popular could take a long time to happen even once -
+        # a buy order is a single standing signal that, once posted,
+        # doesn't need a SECOND coincidental listing to compare against.
+        ref_keys = None
 
-    discount_percent = (ref_keys - listing.price_keys) / ref_keys * 100
+    buy_order_keys, buy_order_count = bptf.get_best_buy_order_keys(
+        lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable,
+        spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
+        paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
+        texture=listing.texture,
+        paint_decimal_override=winning_paint_decimal,
+    )
+    if buy_order_keys is None or buy_order_keys <= 0:
+        # THE actual decision-blocking case now: no buy order seen
+        # recently enough to trust (see LocalListingStore.
+        # BUY_ORDER_LIVE_WINDOW_SECONDS in bptf_client.py - a short,
+        # no-stale-fallback window, since a buy order can genuinely go
+        # stale within minutes and there's no live query available to
+        # re-verify one at decision time). Not "this item isn't
+        # discounted" - "there's no live enough buy order to compare
+        # against right now".
+        return reject("no_live_buy_order")
+
+    discount_percent = (buy_order_keys - listing.price_keys) / buy_order_keys * 100
     if discount_percent < cfg["discount_threshold_percent"]:
-        # The OTHER half of that same distinction: there WAS comparable
-        # live data, and this listing simply isn't priced low enough
-        # relative to it - a genuine "not a deal", not a data gap.
         return reject("discount_too_small")
+
+    flip_profit_keys = buy_order_keys - listing.price_keys
 
     # Price-boost sanity check across the whole killstreak tier ladder
     # (0=plain through 3=Professional) - applies even to a plain item
     # being evaluated, not just killstreak-tiered ones: if any tier of
     # this weapon is priced backwards relative to any other, the pricing
     # data for the whole item looks unreliable right now, whichever tier
-    # triggered the alert - see check_killstreak_tier_pricing().
-    if not check_killstreak_tier_pricing(bptf, listing, lookup_name, ref_keys, cfg):
+    # triggered the alert - see check_killstreak_tier_pricing(). Only
+    # runs when a sell-side reference actually exists (ref_keys) - the
+    # discount decision above no longer depends on it, so there's
+    # nothing for this specific sanity check to validate without it.
+    if ref_keys is not None and not check_killstreak_tier_pricing(bptf, listing, lookup_name, ref_keys, cfg):
         return reject("tier_inconsistency")
 
     # Liquidity check: skip items whose price hasn't been revised by the
@@ -570,25 +589,6 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stn_client=Non
     # Best current buy order - "could I flip this for an instant, guaranteed
     # profit". Also only fetched now, same reasoning as the average price.
     #
-    # A buy order priced ABOVE the sell reference is NOT itself a red flag
-    # (an earlier version of this treated it as one and discarded the buy
-    # order whenever this happened - wrong, per direct correction: TF2
-    # marketplaces aren't efficient markets with instant arbitrage. Anyone
-    # can list an item well below a standing buy order and it just sits
-    # there unsold - sellers don't necessarily know about the buy order,
-    # and nothing auto-matches them - so this gap is exactly the kind of
-    # real opportunity this whole feature exists to surface, not a data
-    # bug to suppress).
-    buy_order_keys, buy_order_count = bptf.get_best_buy_order_keys(
-        lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable,
-        spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
-        paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
-        paint_decimal_override=winning_paint_decimal,
-    )
-    flip_profit_keys = None
-    if buy_order_keys is not None:
-        flip_profit_keys = buy_order_keys - listing.price_keys
-
     # This same link doubles as: (a) a way to manually double-check the
     # alert against the live market, and (b) after buying, a ready-made
     # search to jump straight into listing/selling it - no re-searching

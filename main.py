@@ -800,6 +800,15 @@ class Watcher:
         if deal["average_keys"] is not None:
             avg_line = f"\nСредняя цена (~30 дней): {deal['average_keys']:.2f} ключей"
 
+        # Now purely informational (may not exist at all - the discount
+        # decision itself runs entirely on the buy order, see
+        # evaluate_listing's own comments in matcher.py for why), so
+        # this line is only shown when a sell-side reference actually
+        # happened to be available too, never required for an alert to fire.
+        sell_reference_line = ""
+        if deal.get("previous_low_keys") is not None:
+            sell_reference_line = f"\nБыло: {deal['previous_low_keys']:.2f} ключей"
+
         suggested_line = ""
         if deal.get("suggested_keys") is not None:
             date_part = ""
@@ -869,8 +878,8 @@ class Watcher:
             f"🔥 <b>-{deal['discount_percent']:.0f}%</b> — {deal['source']}\n"
             f"<b>{deal['display_name']}</b>{effect}{variant}"
             f"{special_block}\n"
-            f"Цена в объявлении: <b>{deal['price_keys']:.2f} ключей</b>{usd}\n"
-            f"Было: {deal['previous_low_keys']:.2f} ключей"
+            f"Цена в объявлении: <b>{deal['price_keys']:.2f} ключей</b>{usd}"
+            f"{sell_reference_line}"
             f"{avg_line}"
             f"{suggested_line}"
             f"{buy_order_line}"
@@ -918,9 +927,11 @@ class Watcher:
         deal["is_first_time_seller_item"] = last_alerted is None
 
         log.info(
-            "DEAL [%s]: %s - %.2f keys vs %.2f keys before (%.0f%% off)",
+            "DEAL [%s]: %s - %.2f keys vs %s keys buy order (%.0f%% off)",
             deal["source"], deal["display_name"],
-            deal["price_keys"], deal["previous_low_keys"], deal["discount_percent"],
+            deal["price_keys"],
+            f"{deal['previous_low_keys']:.2f}" if deal["previous_low_keys"] is not None else "?",
+            deal["discount_percent"],
         )
         alert_text = self.format_alert(deal)
         keyboard = self._build_alert_keyboard(deal)
@@ -1285,7 +1296,25 @@ class Watcher:
 
         seller_steamid = payload.get("steamid")
 
-        is_skin = bool(item.get("texture") or item.get("wearTier"))
+        # wearTier is the actual weapon-skin-specific signal (Factory
+        # New through Battle-Scarred wear only applies to War Paints/
+        # Decorated weapons - confirmed via the official TF2 wiki's own
+        # Grade article - cosmetics don't have a wear dimension at all).
+        # texture alone, WITHOUT wearTier, means a graded COSMETIC (a
+        # hat with an intrinsic Civilian-through-Elite rarity grade -
+        # same wiki source, "Grade is an intrinsic sub-quality of
+        # Decorated weapons AND certain cosmetic items") - a real,
+        # separate, often valuable category that was previously being
+        # unconditionally dropped here (is_skin used to fire on texture
+        # alone), conflating it with actual weapon skins. Grade/texture
+        # is captured below and threaded into the identity key instead -
+        # see listing_identity_key's own docstring for why this can
+        # never be read from the item's own display NAME text (backpack.
+        # tf's own forums document real items whose name contains a
+        # DIFFERENT grade's word than their true one).
+        is_skin = bool(item.get("wearTier"))
+        texture_obj = item.get("texture")
+        texture = texture_obj.get("name") if isinstance(texture_obj, dict) else texture_obj
         craftable = item.get("craftable")
         if craftable is None:
             craftable = True
@@ -1319,6 +1348,7 @@ class Watcher:
         identity_key = bptf_client.listing_identity_key(
             name, quality, particle_id, paint_value_for_identity, bool(craftable),
             spells[0] if spells else None, killstreak_tier, name.startswith("Australium "),
+            texture=texture,
         )
         self.bptf.local_listings.record(
             identity_key, str(listing_id), seller_steamid, price_keys, intent,
@@ -1353,6 +1383,7 @@ class Watcher:
             price_usd=price_usd,
             link=link,
             extra_excluded_hint=is_skin,
+            texture=texture,
             spells=spells,
             strange_parts=strange_parts,
             paint=paint,

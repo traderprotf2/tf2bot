@@ -735,22 +735,14 @@ class LocalListingStore:
     def __init__(self, max_age_seconds=3600, buy_max_age_seconds=None, max_entries_per_key=300):
         self._entries = {}  # identity_key -> {listing_id: {listing_id, seller_id, price_keys, ts, intent}}
         self._max_age_seconds = max_age_seconds
-        # Buy orders get their own, MUCH longer freshness window by
-        # default (10x the sell-side one) - per direct feedback that
-        # requiring buy orders to be re-seen within the same short
-        # window as sell listings was starving alerts of profit-flip
-        # info far more than necessary. A sell listing genuinely can
-        # vanish (sold to someone else) at any moment, so a short window
-        # there is the right caution - but a BUY order is a standing
-        # offer that stays live until its owner cancels it; it doesn't
-        # need to be "re-bumped" recently to still be real. Confirmed via
-        # backpack.tf's own websocket docs that listing-update only fires
-        # on an actual create/update (no periodic re-announce), so an
-        # existing buy order that hasn't changed simply won't generate a
-        # new event for a long time - a short window would mean re-
-        # "forgetting" it before this project ever gets a chance to see
-        # it again.
-        self._buy_max_age_seconds = buy_max_age_seconds if buy_max_age_seconds is not None else max_age_seconds * 10
+        # Matches get_max_buy_price's own BUY_ORDER_LIVE_WINDOW_SECONDS
+        # by default - no point RETAINING buy-order entries longer than
+        # the window that ever actually reads them (see that constant's
+        # own comment for the full reasoning: a buy order can genuinely
+        # go stale within minutes, with no live query available to
+        # re-verify one at decision time, so this project now only ever
+        # trusts genuinely recent sightings for that decision).
+        self._buy_max_age_seconds = buy_max_age_seconds if buy_max_age_seconds is not None else 5 * 60
         self._max_entries_per_key = max_entries_per_key
         self._lock = threading.Lock()
 
@@ -831,37 +823,35 @@ class LocalListingStore:
             return None, 0
         return min(trustworthy), len(trustworthy)
 
-    # How recent a buy order needs to be to count as "high confidence" -
-    # see get_max_buy_price below. Deliberately much shorter than the
-    # full buy freshness window (10x the sell one by default): taking
-    # the single HIGHEST value among everything in a long window is
-    # exactly the aggregation most vulnerable to one old, since-
-    # fulfilled-or-cancelled order lingering for hours before this
-    # project ever sees the matching listing-delete event (if one even
-    # arrives) - a real report showed a buy order divergence pattern
-    # consistent with this. "min" (used for sell listings) doesn't have
-    # the same risk in reverse - a stale HIGH sell listing just gets
-    # ignored by min() automatically, but a stale HIGH buy order is
-    # exactly what max() would pick out.
-    HIGH_CONFIDENCE_BUY_WINDOW_SECONDS = 2 * 3600
+    # How recent a buy order needs to be to count as usable for the
+    # discount DECISION - deliberately short, and with NO fallback to
+    # older data (see get_max_buy_price below): per direct correction,
+    # a buy order can genuinely go stale within minutes (fulfilled,
+    # cancelled, or repriced without this project necessarily seeing a
+    # matching event in time), so using anything older risks acting on
+    # a number that's no longer real. There's no live query available
+    # to verify a specific buy order at decision time (the only endpoint
+    # that could - backpack.tf's own classifieds snapshot - is the
+    # confirmed-deprecated, severely rate-limited one this whole local-
+    # store approach exists to avoid), so a short, no-stale-fallback
+    # window is the most realistic substitute actually available: an
+    # active buy order from a genuinely live bot (the "24/7" auto-
+    # buying bots seen in real screenshots) gets bumped often enough to
+    # keep reappearing within a window this size; one that's gone stale
+    # simply stops qualifying, rather than being used anyway.
+    BUY_ORDER_LIVE_WINDOW_SECONDS = 5 * 60
 
     def get_max_buy_price(self, identity_key):
         """
-        Mirrors get_best_buy_order_keys's old return shape. Prefers
-        recent data: tries the highest trustworthy value seen within
-        HIGH_CONFIDENCE_BUY_WINDOW_SECONDS first, only reaching into the
-        full (much longer) buy freshness window if nothing that recent
-        exists - giving the best of both without the single-stale-
-        outlier risk of just taking max() over the whole long window
-        unconditionally. See HIGH_CONFIDENCE_BUY_WINDOW_SECONDS above
-        for why this asymmetry exists between buy and sell.
+        Mirrors get_best_buy_order_keys's old return shape. Deliberately
+        does NOT fall back to older data when nothing is fresh enough -
+        see BUY_ORDER_LIVE_WINDOW_SECONDS above for why: an item with no
+        buy order seen in the last few minutes is treated as "no usable
+        buy order data right now", the same honest treatment as
+        genuinely having none, rather than showing a number that might
+        already be wrong.
         """
-        recent_values = self._fresh_values(identity_key, "buy", max_age=self.HIGH_CONFIDENCE_BUY_WINDOW_SECONDS)
-        recent_trustworthy = _filter_price_outliers(recent_values, floor_fraction=0.3, ceiling_fraction=3.0)
-        if recent_trustworthy:
-            return max(recent_trustworthy), len(recent_trustworthy)
-
-        values = self._fresh_values(identity_key, "buy")
+        values = self._fresh_values(identity_key, "buy", max_age=self.BUY_ORDER_LIVE_WINDOW_SECONDS)
         trustworthy = _filter_price_outliers(values, floor_fraction=0.3, ceiling_fraction=3.0)
         if not trustworthy:
             return None, 0
@@ -981,7 +971,7 @@ class LocalListingStore:
 
 
 def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftable,
-                          spell, killstreak_tier, australium):
+                          spell, killstreak_tier, australium, texture=None):
     """
     The exact tuple LocalListingStore keys entries by. Every field here
     is something this project ALREADY extracts and validates itself from
@@ -991,10 +981,30 @@ def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftab
     - see the DIAGNOSTIC SAMPLE-driven fixes earlier this session), not
     a guessed one, so two listings only share a bucket when they are
     genuinely the same exact item in every tracked dimension.
+
+    texture identifies a specific "grade" for cosmetics and decorated
+    weapons - a separate, intrinsic sub-quality from the normal 9-colour
+    quality system, introduced in the Gun Mettle Update (confirmed via
+    the official TF2 wiki's own Grade article): Civilian, Freelance,
+    Mercenary, Commando, Assassin, Elite, lowest to highest, each with
+    real, often large value differences on otherwise-identical-looking
+    items. Was previously NOT tracked at all here - worse, any item
+    carrying this field was being unconditionally dropped from
+    consideration entirely (see main.py's is_skin/extra_excluded_hint -
+    conflating genuinely graded cosmetics with actual weapon skins,
+    which are a different, wear-having item type - see wear_tier's own
+    separate, real reason for exclusion). Critically, grade can NOT be
+    read off the item's own display name - the backpack.tf forums
+    themselves warn of items whose name text contains a DIFFERENT
+    grade's word than their real one (their own example: "Commando
+    Elite" is a hat's actual NAME, but its real grade is Mercenary) -
+    so this must come from the structured texture field itself, never
+    inferred from name text.
     """
     return (
         strip_variant_prefixes(name), quality_name, particle_id, paint_decimal,
         bool(craftable), spell or None, killstreak_tier or 0, bool(australium),
+        texture or None,
     )
 
 
@@ -1394,12 +1404,14 @@ class BackpackTFPriceList:
     def get_snapshot_min_other_keys(self, name: str, quality_name: str, exclude_listing_id: str,
                                      particle_id=None, craftable=True, spell=None,
                                      australium: bool = False, killstreak_tier=None, paint=None,
-                                     killstreaker=None, sheen=None, paint_decimal_override=None):
+                                     killstreaker=None, sheen=None, paint_decimal_override=None,
+                                     texture=None):
         """
         Returns (min_price_in_keys_among_OTHER_sell_listings,
         count_of_other_listings), or (None, 0) if not enough fresh,
         trustworthy data has been self-collected yet for this exact item
-        (same name/quality/effect/spell/australium/killstreak/paint).
+        (same name/quality/effect/spell/australium/killstreak/paint/
+        texture-grade).
 
         Reads from self.local_listings (see LocalListingStore's own
         docstring for why this replaced a direct backpack.tf API call:
@@ -1417,12 +1429,13 @@ class BackpackTFPriceList:
             paint_rgb_decimal(paint) if paint else None
         )
         key = listing_identity_key(name, quality_name, particle_id, paint_value, craftable,
-                                    spell, killstreak_tier, australium)
+                                    spell, killstreak_tier, australium, texture=texture)
         return self.local_listings.get_min_sell_price(key, exclude_listing_id=exclude_listing_id)
 
     def get_best_buy_order_keys(self, name: str, quality_name: str, particle_id=None, craftable=True,
                                  spell=None, australium: bool = False, killstreak_tier=None, paint=None,
-                                 killstreaker=None, sheen=None, paint_decimal_override=None):
+                                 killstreaker=None, sheen=None, paint_decimal_override=None,
+                                 texture=None):
         """
         Highest current self-collected BUY-intent price for this exact
         item, in keys, along with how many fresh buy-intent listings
@@ -1437,7 +1450,7 @@ class BackpackTFPriceList:
             paint_rgb_decimal(paint) if paint else None
         )
         key = listing_identity_key(name, quality_name, particle_id, paint_value, craftable,
-                                    spell, killstreak_tier, australium)
+                                    spell, killstreak_tier, australium, texture=texture)
         return self.local_listings.get_max_buy_price(key)
 
     def _unused_get_snapshot_min_other_keys_OLD(self, name: str, quality_name: str, exclude_listing_id: str,
