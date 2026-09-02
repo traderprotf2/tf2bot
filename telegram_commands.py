@@ -51,6 +51,11 @@ HELP_TEXT = (
     "/qualities, /addquality Название, /removequality Название\n"
     "/categories, /addcategory weapon|cosmetic|taunt|killstreak_kit|other, /removecategory ...\n"
     "/australium — переключить режим \"только Australium-оружие\" (в меню: кнопка внутри Категорий)\n"
+    "/checkitem Название — показать, что бот прямо сейчас знает про этот "
+    "предмет (buy order, sell-референс, когда видели в последний раз)\n"
+    "/priority, /addpriority Название, /removepriority Название — список "
+    "приоритетных предметов (⭐ в алерте + живой запрос к backpack.tf, если "
+    "в базе ещё нет buy order); Unusual и так всегда приоритетны\n"
     "/help — это сообщение"
 )
 
@@ -655,6 +660,32 @@ def handle_command(text: str, runtime, stats=None, stats_since=None,
             f"Сейчас отслеживаются: {', '.join(runtime.watched_categories) or '(пусто)'}\n"
             f"Доступные значения: {', '.join(VALID_CATEGORIES)}"
         )
+
+    if command == "priority":
+        return (
+            f"Приоритетные предметы (⭐, плюс живой запрос к backpack.tf, если в "
+            f"локальной базе ещё нет buy order): {', '.join(runtime.priority_item_names) or '(пусто)'}\n"
+            f"Unusual-качество и так всегда приоритетное, независимо от этого списка."
+        )
+
+    if command == "addpriority":
+        if not arg:
+            return "Укажи точное название предмета: /addpriority Max's Severed Head"
+        if any(arg.lower() == n.lower() for n in runtime.priority_item_names):
+            return f"{arg!r} уже в списке приоритетных."
+        runtime.priority_item_names.append(arg)
+        runtime.save()
+        return f"Добавил {arg!r}. Сейчас: {', '.join(runtime.priority_item_names)}"
+
+    if command == "removepriority":
+        if not arg:
+            return "Укажи точное название предмета: /removepriority Max's Severed Head"
+        match = next((n for n in runtime.priority_item_names if n.lower() == arg.lower()), None)
+        if not match:
+            return f"{arg!r} и так не в списке. Сейчас: {', '.join(runtime.priority_item_names) or '(пусто)'}"
+        runtime.priority_item_names.remove(match)
+        runtime.save()
+        return f"Убрал {match!r}. Сейчас: {', '.join(runtime.priority_item_names) or '(пусто)'}"
 
     if command == "addcategory":
         category = _find_category(arg)

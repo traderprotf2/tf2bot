@@ -154,6 +154,18 @@ class Watcher:
         # ever turns out wrong, not building an ongoing log of every item.
         self._sampled_item_kinds = set()
 
+        # Lightweight name -> identity_key(s) index, updated as events
+        # arrive, purely to support /checkitem (see that command's own
+        # handling) - lets a person look up "what does the bot's local
+        # store currently know about item X" by NAME (identity keys
+        # themselves may be defindex-anchored, not name-based - see
+        # listing_identity_key's own docstring in bptf_client.py - so
+        # this is the only way to search by name at all). Bounded size
+        # isn't enforced here deliberately: distinct item NAMES (not
+        # listings) are a small, slowly-growing set relative to the
+        # listing volume itself.
+        self._name_to_identity_keys = collections.defaultdict(set)
+
         if not cfg.get("backpacktf_token"):
             log.warning(
                 "No backpacktf_token configured - comparisons will use backpack.tf's "
@@ -194,6 +206,7 @@ class Watcher:
             "watched_categories": self.runtime.watched_categories,
             "discount_threshold_percent": self.runtime.discount_threshold_percent,
             "max_days_since_price_update": self.runtime.max_days_since_price_update,
+            "priority_item_names": self.runtime.priority_item_names,
         }
         self._effective_cfg_cache = merged
         self._effective_cfg_cache_version = version
@@ -465,6 +478,77 @@ class Watcher:
             f"{history_line}"
             f"{links_block}"
         )
+
+    def _check_item(self, name_query: str) -> str:
+        """
+        /checkitem <name> - direct diagnostic: shows exactly what the
+        local store currently holds for a given item, by name, rather
+        than requiring anyone to interpret aggregate /stats numbers to
+        guess where a specific expected alert went missing. Added after
+        a real, repeated report that fixes verified via unit tests still
+        left "why didn't THIS SPECIFIC listing alert" unanswerable
+        without a live, real payload to trace by hand - this lets a
+        person check the bot's own live state themselves, immediately,
+        for the exact item they just listed.
+        """
+        name_query = name_query.strip()
+        if not name_query:
+            return "Укажи название предмета: /checkitem Max's Severed Head"
+
+        query_lower = name_query.lower()
+        matched_names = [n for n in self._name_to_identity_keys if query_lower in n]
+        if not matched_names:
+            return (
+                f"Бот ещё ни разу не видел ни одного события (buy или sell) с названием, "
+                f"содержащим {name_query!r}, с момента последнего запуска."
+            )
+
+        store = self.bptf.local_listings
+        lines = []
+        for matched_name in sorted(matched_names)[:5]:
+            for key in self._name_to_identity_keys[matched_name]:
+                _, quality_name, particle_id, paint_dec, craftable, spell, ks_tier, australium, texture = key
+                bits = [quality_name]
+                if not craftable:
+                    bits.append("Non-Craftable")
+                if ks_tier:
+                    bits.append(f"KS-tier {ks_tier}")
+                if australium:
+                    bits.append("Australium")
+                if particle_id is not None:
+                    bits.append(f"particle={particle_id}")
+                if paint_dec is not None:
+                    bits.append(f"paint={paint_dec}")
+                if spell:
+                    bits.append(f"spell={spell}")
+                if texture:
+                    bits.append(f"grade={texture}")
+                variant_desc = ", ".join(bits)
+
+                buy_price, buy_count = store.get_max_buy_price(key)
+                sell_price, sell_count = store.get_min_sell_price(key)
+                now = time.time()
+                bucket = store._entries.get(key, {})
+                buy_ages = [now - e["ts"] for e in bucket.values() if e["intent"] == "buy"]
+                sell_ages = [now - e["ts"] for e in bucket.values() if e["intent"] == "sell"]
+
+                buy_line = (
+                    f"💰 Buy order: {buy_price:.2f} ключей ({buy_count} шт., самый свежий "
+                    f"{min(buy_ages)/60:.0f} мин назад)" if buy_price is not None
+                    else f"💰 Buy order: нет в пределах {bptf_client.LocalListingStore.BUY_ORDER_SAFETY_NET_SECONDS // 3600}ч"
+                    + (f" (есть {len(buy_ages)} более старых, самый свежий {min(buy_ages)/60:.0f} мин назад)" if buy_ages else " (не видели вообще)")
+                )
+                sell_line = (
+                    f"🏷 Sell: {sell_price:.2f} ключей ({sell_count} шт., самый свежий "
+                    f"{min(sell_ages)/60:.0f} мин назад)" if sell_price is not None
+                    else "🏷 Sell: нет свежих данных" + (f" (есть {len(sell_ages)} старых)" if sell_ages else "")
+                )
+                lines.append(f"<b>{matched_name}</b> [{variant_desc}]\n{buy_line}\n{sell_line}")
+
+        header = f"Найдено вариантов: {sum(len(self._name_to_identity_keys[n]) for n in matched_names)}"
+        if len(matched_names) > 5:
+            header += f" (показаны первые 5 из {len(matched_names)} совпавших названий)"
+        return header + "\n\n" + "\n\n".join(lines)
 
     async def send_deal(self, deal):
         # Per-SELLER cooldown: don't re-alert on the same item from the
@@ -858,6 +942,7 @@ class Watcher:
             spells[0] if spells else None, killstreak_tier, name.startswith("Australium "),
             texture=texture, defindex=defindex,
         )
+        self._name_to_identity_keys[name.lower()].add(identity_key)
         self.bptf.local_listings.record(
             identity_key, str(listing_id), seller_steamid, price_keys, intent,
         )
@@ -995,6 +1080,9 @@ class Watcher:
                 # other typed commands below, which are plain text.
                 errors_text, keyboard = telegram_commands.build_errors_view(_error_buffer.recent(100))
                 await self._run_telegram(self.telegram.send, errors_text, keyboard)
+            elif command == "checkitem":
+                reply = self._check_item(text.split(maxsplit=1)[1] if " " in text else "")
+                await self._run_telegram(self.telegram.send, reply)
             else:
                 reply = telegram_commands.handle_command(
                     text, self.runtime,

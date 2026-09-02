@@ -1026,6 +1026,75 @@ class BackpackTFPriceList:
                                     spell, killstreak_tier, australium, texture=texture, defindex=defindex)
         return self.local_listings.get_max_buy_price(key)
 
+    def fetch_live_buy_order_keys(self, name: str, quality_name: str, particle_id=None,
+                                   craftable=True, australium: bool = False, killstreak_tier=None):
+        """
+        LIVE query to the snapshot API (SNAPSHOT_URL) for this item's
+        current best buy order - a deliberate, narrow exception to this
+        project's own "local store only" rule (see LocalListingStore's
+        docstring for why that rule exists project-wide: the endpoint
+        this hits is backpack.tf's own confirmed-deprecated v1 listings
+        API, rate-limited to 6 req/60s on a free key). Only ever called
+        for PRIORITY items (see matcher.py's evaluate_listing) - a real,
+        production autopricer (jack-richards/bptf-autopricer, whose own
+        config.json has "alwaysQuerySnapshotAPI": true) does exactly
+        this same trade-off: live-query IS affordable and used, but only
+        for a small, curated set of specific items being tracked, never
+        for the whole marketplace at once. cfg["priority_item_names"]
+        (already user-curated) is that same small set here.
+
+        Returns (buy_keys, count) matching get_best_buy_order_keys' own
+        shape, or (None, 0) on any failure/empty result - a failure here
+        must never be worse than not having tried; the local-store value
+        (if any) remains the fallback either way, this only supplements it.
+        """
+        try:
+            params = {
+                "item": strip_variant_prefixes(name),
+                "quality": QUALITY_NAME_TO_ID.get(quality_name),
+                "intent": "buy",
+                "craftable": 1 if craftable else 0,
+            }
+            if particle_id is not None:
+                params["particle"] = particle_id
+            if australium:
+                params["australium"] = 1
+            if killstreak_tier:
+                params["killstreak_tier"] = killstreak_tier
+            resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            log.warning("Live snapshot buy-order query failed for %s - falling back to local store only.", name)
+            return None, 0
+
+        listings = data.get("listings")
+        if not isinstance(listings, list):
+            # Diagnostic sample, not a guess acted on silently - this
+            # endpoint's exact response shape for a LIVE, current call
+            # isn't independently re-confirmed in this codebase (the
+            # function that USED to call it was removed as dead code
+            # earlier this session, before this narrower use existed) -
+            # if this shape assumption is wrong, this makes it visible
+            # in the logs immediately rather than silently mispricing.
+            log.warning(
+                "Live snapshot response for %s had an unexpected shape - raw (truncated): %r",
+                name, str(data)[:500],
+            )
+            return None, 0
+
+        prices = []
+        for entry in listings:
+            if not isinstance(entry, dict) or entry.get("intent") != "buy":
+                continue
+            price_keys = self.currencies_to_keys(entry.get("currencies") or {})
+            if price_keys is not None and price_keys > 0:
+                prices.append(price_keys)
+        if not prices:
+            return None, 0
+        trustworthy = _filter_price_outliers(prices, floor_fraction=0.3, ceiling_fraction=3.0)
+        return max(trustworthy), len(trustworthy)
+
     # -- liquidity (best-effort, via price-suggestion recency) ------------
 
     def get_liquidity_days_since_update(self, name: str, quality_name: str, particle_id=None,
