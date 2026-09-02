@@ -481,15 +481,10 @@ class Watcher:
 
     def _check_item(self, name_query: str) -> str:
         """
-        /checkitem <name> - direct diagnostic: shows exactly what the
-        local store currently holds for a given item, by name, rather
-        than requiring anyone to interpret aggregate /stats numbers to
-        guess where a specific expected alert went missing. Added after
-        a real, repeated report that fixes verified via unit tests still
-        left "why didn't THIS SPECIFIC listing alert" unanswerable
-        without a live, real payload to trace by hand - this lets a
-        person check the bot's own live state themselves, immediately,
-        for the exact item they just listed.
+        /checkitem <name> - shows exactly what the local store currently
+        holds for a given item, by name, instead of requiring aggregate
+        /stats numbers to be interpreted to guess where one specific
+        expected alert went missing.
         """
         name_query = name_query.strip()
         if not name_query:
@@ -642,27 +637,11 @@ class Watcher:
         if not name:
             return
 
-        # The base item type's own numeric schema ID - confirmed real in
-        # backpack.tf's own listing payload (multiple independent
-        # third-party API docs/libraries: "The item being sold...
-        # Contains keys like defindex and quality"; also the basis of
-        # the tf2-sku-2 format real trading tools use, e.g. "202;11;
-        # australium"). Used below as the PRIMARY identity anchor instead
-        # of `name` when available - a real, repeated pattern this
-        # session: name-text-based identity (stripping "Non-Craftable",
-        # killstreak-tier, Australium, effect prefixes) turned out to be
-        # fragile in ways that caused the exact same real item to
-        # silently resolve to two different identity keys between
-        # events (a craftable-field/name-text disagreement fixed
-        # earlier, a particle-name casing inconsistency fixed after
-        # that) - each was a different symptom of the same root issue:
-        # matching by string text is inherently more fragile than
-        # matching by the stable, numeric id Valve assigns per distinct
-        # item variant (a craftable/non-craftable, or Australium/non,
-        # or different killstreak tier of the "same" weapon are each
-        # already their OWN separate defindex in Valve's schema - so
-        # using it sidesteps needing to parse any of that from text at
-        # all, not just work around individual bugs one at a time).
+        # Base item type's own numeric schema ID - confirmed real in
+        # backpack.tf's payload (multiple third-party API docs: "item...
+        # Contains keys like defindex and quality"). Preferred identity
+        # anchor over name text - see listing_identity_key's own
+        # docstring in bptf_client.py for why.
         defindex = item.get("defindex")
 
         # Action items excluded unconditionally, not via watched_categories
@@ -827,6 +806,27 @@ class Watcher:
         raw_killstreak_tier = item.get("killstreakTier")
         killstreak_tier = raw_killstreak_tier if slot in WEAPON_SLOTS else None
 
+        # Per explicit request: only Professional Killstreak (tier 3) is
+        # watched now - plain (tier 0, no kit at all) still is too, only
+        # tier 1 ("Killstreak") and tier 2 ("Specialized Killstreak") are
+        # excluded. Checked here, early, same reasoning as the Action-
+        # item/category checks above - skip the more expensive parsing
+        # below entirely for a tier that's never going to be watched,
+        # not just suppress the alert for it later.
+        if killstreak_tier in (1, 2):
+            self.stats["bptf_rejected_category"] += 1
+            return
+        # Killstreak Kits/Fabricators have no weapon slot (killstreak_tier
+        # above is always None for them), so the same tier restriction is
+        # applied by name instead, mirroring classify_category's own
+        # Kit/Fabricator name-pattern detection. Only "Professional
+        # Killstreak ... Kit/Fabricator" passes; plain "Killstreak ..."
+        # and "Specialized Killstreak ..." are excluded the same way.
+        if "Killstreak" in name and (name.endswith("Kit") or name.endswith("Fabricator")):
+            if not name.startswith("Professional Killstreak "):
+                self.stats["bptf_rejected_category"] += 1
+                return
+
         # Killstreaker/sheen only exist on weapons with a killstreak tier
         # (sheen from tier 2+, killstreaker from tier 3 only - see
         # bptf_client.VALID_KILLSTREAKERS/VALID_SHEENS) - same game-logic
@@ -903,27 +903,6 @@ class Watcher:
 
         intent = payload.get("intent")
 
-        # Excludes the listing from the local store entirely (both sell
-        # AND buy intent) when its own seller note matches a known spam/
-        # scam-bot pattern - a real, proven technique borrowed directly
-        # from bptf-autopricer/tf2-autopricer (the same real, production
-        # pricer whose "listings" database table this project's own
-        # LocalListingStore mirrors - see that class's own docstring):
-        # their own config has an "excludedListingDescriptions" option
-        # for exactly this. Added after a real, concrete case: a bulk-
-        # reseller bot's own seller note literally said "Quicksell.store"
-        # and "Over 10k items for sale", paired with a buy order wildly
-        # above the item's real value on a cheap item - a DIFFERENT
-        # instance of the same underlying risk the buy-order sanity
-        # ceiling in matcher.py already guards against, but catching it
-        # here, before the listing is ever recorded at all, stops it
-        # contaminating the store for ANY future comparison, not just
-        # the one alert.
-        seller_note_text = (payload.get("details") or "").lower()
-        excluded_keywords = self.cfg.get("excluded_listing_keywords", [])
-        if seller_note_text and any(kw.lower() in seller_note_text for kw in excluded_keywords):
-            self.stats["bptf_rejected_spam_listing"] += 1
-            return
 
         # Record EVERY listing this project sees (both sell AND buy
         # intent, now that bptf_ws.py passes buy-intent events through

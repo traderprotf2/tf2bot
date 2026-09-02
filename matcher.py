@@ -430,15 +430,10 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         paint_decimal_override=winning_paint_decimal,
     )
     if buy_order_keys is None or buy_order_keys <= 0:
-        # Live-query supplement, but ONLY for priority items - same
-        # trade-off a real, production autopricer's own config makes
-        # ("alwaysQuerySnapshotAPI": true, but only for a small, user-
-        # curated item list, never the whole marketplace at once - see
-        # fetch_live_buy_order_keys' own docstring in bptf_client.py).
-        # cfg["priority_item_names"] (already user-curated) plays that
-        # same role here; Unusual quality is priority unconditionally,
-        # matching the SAME rule used for the alert's own "⭐ ПРИОРИТЕТ"
-        # marker further down, not a second, different definition.
+        # Live-query supplement, ONLY for priority items - see
+        # fetch_live_buy_order_keys' own docstring in bptf_client.py for
+        # why. Same priority rule as the alert's own "⭐ ПРИОРИТЕТ" marker
+        # further down (Unusual always, plus cfg["priority_item_names"]).
         name_lower = listing.name.lower()
         is_priority_for_live_query = listing.quality == "Unusual" or any(
             hype_name.lower() in name_lower for hype_name in cfg.get("priority_item_names", [])
@@ -450,14 +445,9 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
                 killstreak_tier=listing.killstreak_tier,
             )
     if buy_order_keys is None or buy_order_keys <= 0:
-        # No live buy order in the local store, AND (for priority items)
-        # the live-query supplement above also came back empty - not
-        # "this item isn't discounted", "there's genuinely nothing to
-        # compare against right now" for a NON-priority item, where no
-        # live query was even attempted (see LocalListingStore.
-        # BUY_ORDER_SAFETY_NET_SECONDS in bptf_client.py for why the
-        # local store alone is the right, affordable default for
-        # everything else this project watches).
+        # No live buy order in the local store, and (for priority items)
+        # the live-query supplement above also came back empty. Not
+        # "this item isn't discounted" - "nothing to compare against".
         return reject("no_live_buy_order")
 
     # Sanity ceiling against buy-order manipulation: a real report showed

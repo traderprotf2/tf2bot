@@ -110,25 +110,18 @@ def configure_request_pacing(accounts, max_concurrent: int, min_interval_seconds
     _request_semaphore = threading.Semaphore(max_concurrent)
     _account_pool.reconfigure(accounts, min_interval_seconds)
 
-# On top of capping concurrency, back off entirely for a bit once
-# backpack.tf actually returns 429 - real production logs showed repeated
-# 429s in quick succession right as they started, meaning concurrency
-# alone doesn't prevent a burst of requests from tripping the limit and
-# then immediately tripping it again on the very next one. Once that
-# happens, every snapshot/history request just returns "unavailable"
-# (evaluate_listing treats that as "can't evaluate this one right now"
-# and skips it, never falling back to a less-reliable number) until the
-# cooldown clears, instead of continuing to hammer an endpoint that's
-# already said no.
+# On top of capping concurrency, backs off entirely once backpack.tf
+# actually returns 429 - concurrency limits alone don't prevent a burst
+# from tripping the limit again immediately. While active, every
+# snapshot/history request just returns "unavailable" (evaluate_listing
+# treats that as "can't evaluate this one right now", never falling back
+# to a less-reliable number).
 #
-# The cooldown itself is adaptive, not a flat 10s every time: if we get
-# rate-limited AGAIN shortly after a previous cooldown already ended,
-# that's evidence the wait wasn't long enough for genuinely sustained
-# overload (not just a momentary burst), so it doubles (capped at 5
-# minutes) rather than repeating the same too-short wait indefinitely.
-# It resets back to the base duration once we go a while without hitting
-# a 429 at all - an old bad patch shouldn't keep the backoff escalated
-# forever once things have actually settled down.
+# Adaptive, not a flat wait: getting rate-limited again shortly after a
+# previous cooldown ended means that wait wasn't long enough, so it
+# doubles (capped at 5 min) instead of repeating the same short wait
+# indefinitely - and resets to the base duration after a while without
+# hitting a 429 at all.
 _RATE_LIMIT_BASE_COOLDOWN_SECONDS = 10
 _RATE_LIMIT_MAX_COOLDOWN_SECONDS = 300
 _RATE_LIMIT_RESET_AFTER_SECONDS = 300
@@ -225,29 +218,14 @@ VALID_SHEENS = [
     "Mean Green", "Team Shine", "Villainous Violet",
 ]
 
-# RGB values cross-checked against THREE independent, mutually-agreeing
-# Steam Community reference guides (not just one - an earlier version of
-# this table used a single source and turned out to have several wrong
-# entries, caught by cross-checking: Radigan Conagher Brown, Noble
-# Hatter's Violet, Peculiarly Drab Tincture, The Bitter Taste of Defeat
-# and Lime, The Color of a Gentlemann's Business Pants, Ye Olde Rustic
-# Colour, and Zepheniah's Greed were all wrong before this fix - a wrong
-# decimal here would make the search link look precise while actually
-# filtering to the wrong colour, worse than not filtering at all, so
-# this was worth re-verifying properly rather than trusting one source.
-# Team-coloured paints (different RGB per RED/BLU) are left out - not
-# because they're unmapped, but because a SINGLE RGB value genuinely
-# doesn't exist for them: the colour shown depends on which team the
-# CURRENT wearer is on during gameplay, not a fixed value chosen when
-# the paint was applied - there's no "one correct decimal" to encode for
-# an item sitting in a listing. Confirmed complete, not partial: Valve's
-# own wiki states Paint Cans come in exactly 29 colours total; this
-# table's 22 entries plus the 7 team-coloured ones (An Air of Debonair,
-# Balaclavas Are Forever, Cream Spirit, Operator's Overalls, Team
-# Spirit, The Value of Teamwork, Waterlogged Lab Coat) account for all
-# 29 - there is nothing missing here to "add", the 7 are correctly
-# excluded on principle (evaluate_listing skips rather than guesses at
-# them - see the paint_rgb_decimal() check there), not a gap.
+# RGB values cross-checked against three independent Steam Community
+# reference guides (a single-source version had several wrong entries).
+# Team-coloured paints (7 of them) are deliberately excluded - a single
+# RGB doesn't exist for them (colour depends on which team the CURRENT
+# wearer is on, not a fixed value) - not a gap: Valve's wiki confirms 29
+# total Paint Cans, and this table's 22 entries + those 7 account for
+# all 29 (evaluate_listing skips rather than guesses for the 7 - see
+# paint_rgb_decimal()'s own check).
 PAINT_NAME_TO_RGB = {
     "A Color Similar to Slate": (47, 79, 79),
     "A Deep Commitment to Purple": (125, 64, 113),
@@ -355,9 +333,23 @@ def strip_quality_prefix(full_name: str, quality_name: str) -> str:
     "Rocket Launcher" for Unique). backpack.tf's own price list is indexed
     by that de-prefixed name (quality is a separate dimension), so this is
     needed to turn a listing's display name into a price-list lookup key.
+
+    Checks for the quality prefix both at the very start AND right after
+    a leading "Non-Craftable " - a real, confirmed bug: some items'
+    raw names put "Non-Craftable " BEFORE the quality ("Non-Craftable
+    Unusual Taunt: Luxury Lounge Unusualifier"), which the start-of-
+    string-only check never matched, so nothing got stripped - and this
+    function's own caller then added the quality prefix a SECOND time
+    on top of the already-present one ("Unusual Non-Craftable Unusual
+    Taunt: ..."), corrupting both the display name and, more seriously,
+    the classifieds search link built from it.
     """
-    if quality_name and quality_name != "Unique" and full_name.startswith(quality_name + " "):
-        return full_name[len(quality_name) + 1:]
+    if quality_name and quality_name != "Unique":
+        prefix = quality_name + " "
+        if full_name.startswith(prefix):
+            return full_name[len(prefix):]
+        if full_name.startswith("Non-Craftable " + prefix):
+            return "Non-Craftable " + full_name[len("Non-Craftable " + prefix):]
     return full_name
 
 
@@ -848,13 +840,11 @@ def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftab
     text contains a different grade's word than their real one) - must
     come from the structured texture field.
 
-    defindex (the base item type's own numeric schema id) is used
-    INSTEAD of the name-text-based strip_variant_prefixes() below,
-    whenever the caller has one - see main.py's own comment on why:
-    matching by this stable, numeric id sidesteps a whole class of
-    name-text fragility (prefix-stripping edge cases, casing/phrasing
-    variation) that caused two real, confirmed bugs this session, each a
-    different symptom of the same underlying issue. Falls back to the
+    defindex (the base item type's own numeric schema id) is preferred
+    over the name-text-based strip_variant_prefixes() below, when the
+    caller has one - a stable, numeric id sidesteps name-text fragility
+    (prefix-stripping edge cases, casing/phrasing variation) that caused
+    two real, confirmed matching bugs this session. Falls back to the
     name-based key when defindex isn't available (e.g. a payload shape
     that doesn't include it) - never a hard requirement.
     """
@@ -1029,24 +1019,19 @@ class BackpackTFPriceList:
     def fetch_live_buy_order_keys(self, name: str, quality_name: str, particle_id=None,
                                    craftable=True, australium: bool = False, killstreak_tier=None):
         """
-        LIVE query to the snapshot API (SNAPSHOT_URL) for this item's
-        current best buy order - a deliberate, narrow exception to this
-        project's own "local store only" rule (see LocalListingStore's
-        docstring for why that rule exists project-wide: the endpoint
-        this hits is backpack.tf's own confirmed-deprecated v1 listings
-        API, rate-limited to 6 req/60s on a free key). Only ever called
-        for PRIORITY items (see matcher.py's evaluate_listing) - a real,
-        production autopricer (jack-richards/bptf-autopricer, whose own
-        config.json has "alwaysQuerySnapshotAPI": true) does exactly
-        this same trade-off: live-query IS affordable and used, but only
-        for a small, curated set of specific items being tracked, never
-        for the whole marketplace at once. cfg["priority_item_names"]
-        (already user-curated) is that same small set here.
+        LIVE query to the snapshot API for this item's current best buy
+        order - a deliberate, narrow exception to this project's "local
+        store only" rule (the endpoint is backpack.tf's own confirmed-
+        deprecated v1 API, rate-limited to 6 req/60s on a free key).
+        Only called for PRIORITY items (see matcher.py's evaluate_
+        listing) - matches a real production autopricer's own trade-off
+        (jack-richards/bptf-autopricer's config has
+        "alwaysQuerySnapshotAPI": true, but only for its own small,
+        curated item list, never the whole marketplace).
 
         Returns (buy_keys, count) matching get_best_buy_order_keys' own
-        shape, or (None, 0) on any failure/empty result - a failure here
-        must never be worse than not having tried; the local-store value
-        (if any) remains the fallback either way, this only supplements it.
+        shape, or (None, 0) on failure - never worse than not trying,
+        the local-store value (if any) remains the fallback either way.
         """
         try:
             params = {
