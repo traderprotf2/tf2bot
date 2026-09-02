@@ -20,6 +20,7 @@ See README.md for setup instructions.
 import asyncio
 import collections
 import concurrent.futures
+import json
 import logging
 import os
 import signal
@@ -300,6 +301,7 @@ class Watcher:
             await asyncio.sleep(90)
             try:
                 await asyncio.to_thread(self.bptf.local_listings.save_to_disk, bptf_client.LOCAL_LISTINGS_STATE_PATH)
+                await asyncio.to_thread(self._save_alert_cooldowns)
             except Exception:
                 log.exception("Local listing store snapshot save failed, will retry next cycle.")
 
@@ -478,6 +480,43 @@ class Watcher:
             f"{history_line}"
             f"{links_block}"
         )
+
+    ALERT_COOLDOWNS_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_cooldowns_state.json")
+
+    def _save_alert_cooldowns(self):
+        """
+        Persists item_type_last_alerted (the per-seller "don't re-alert
+        within N minutes" cooldown - see send_deal) to disk, the same
+        list/dict-of-entries pattern LocalListingStore's own save_to_disk
+        uses for its tuple keys. Added after a real, confirmed case: this
+        dict was purely in-memory, so a restart (routine during a
+        deploy, or systemd's own auto-restart) silently wiped every
+        cooldown, letting the exact same seller/item combination alert
+        again well within what should have been a 60-minute window.
+        """
+        try:
+            serializable = [
+                {"key": list(key), "ts": ts}
+                for key, ts in self.item_type_last_alerted.items()
+            ]
+            tmp_path = f"{self.ALERT_COOLDOWNS_STATE_PATH}.{os.getpid()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(serializable, f)
+            os.replace(tmp_path, self.ALERT_COOLDOWNS_STATE_PATH)
+        except Exception:
+            log.exception("Could not save alert cooldowns to disk.")
+
+    def _load_alert_cooldowns(self):
+        if not os.path.exists(self.ALERT_COOLDOWNS_STATE_PATH):
+            return
+        try:
+            with open(self.ALERT_COOLDOWNS_STATE_PATH, "r", encoding="utf-8") as f:
+                serializable = json.load(f)
+            for item in serializable:
+                self.item_type_last_alerted[tuple(item["key"])] = item["ts"]
+            log.info("Loaded %d saved alert cooldowns from disk.", len(self.item_type_last_alerted))
+        except Exception:
+            log.exception("Could not load alert cooldowns from disk - starting fresh.")
 
     def _check_item(self, name_query: str) -> str:
         """
@@ -1165,6 +1204,7 @@ class Watcher:
         # listing evaluated after a restart already has recent
         # comparison data available, not an empty store.
         await asyncio.to_thread(self.bptf.local_listings.load_from_disk, bptf_client.LOCAL_LISTINGS_STATE_PATH)
+        self._load_alert_cooldowns()
 
         log.info("Starting up: loading initial prices...")
         try:
@@ -1233,6 +1273,7 @@ class Watcher:
             log.info("Shutdown signal received - saving local listing store before exiting...")
             try:
                 await asyncio.to_thread(self.bptf.local_listings.save_to_disk, bptf_client.LOCAL_LISTINGS_STATE_PATH)
+                await asyncio.to_thread(self._save_alert_cooldowns)
                 log.info("Final save complete.")
             except Exception:
                 log.exception("Final save on shutdown failed.")
@@ -1258,6 +1299,7 @@ class Watcher:
             log.warning("A core loop exited unexpectedly - saving local listing store before the crash propagates...")
             try:
                 await asyncio.to_thread(self.bptf.local_listings.save_to_disk, bptf_client.LOCAL_LISTINGS_STATE_PATH)
+                await asyncio.to_thread(self._save_alert_cooldowns)
             except Exception:
                 log.exception("Emergency save before crash failed.")
             await main_tasks

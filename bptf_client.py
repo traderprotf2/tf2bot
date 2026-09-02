@@ -467,9 +467,8 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
     (-1, 0, "None" respectively) - omitting them doesn't tell the search
     to exclude those variants, only including the explicit sentinel does.
     `craftable` is added only when the item is uncraftable (mirrors the
-    SKU convention). `killstreaker`/`sheen` aren't independently
-    confirmed as filter params on this page, but an unrecognised param
-    is normally just ignored, so including them can't hurt.
+    SKU convention). `killstreaker`/`sheen` are deliberately NOT sent -
+    see the comment right before those params are skipped, below.
 
     `name` can be passed with or without Killstreak/Australium prefixes
     still attached - strip_variant_prefixes() is applied internally.
@@ -488,10 +487,16 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
     # killstreak_tier=0 below. Omitting the param entirely doesn't
     # exclude spelled listings.
     params["spell"] = spell if spell else "None"
-    if killstreaker:
-        params["killstreaker"] = killstreaker
-    if sheen:
-        params["sheen"] = sheen
+    # killstreaker/sheen deliberately NOT included as search params - a
+    # real, confirmed case showed the resulting search page displaying
+    # "unknown" for both filters (the name-string format this project
+    # was sending clearly isn't what backpack.tf's search expects, and
+    # the correct format - likely a numeric id, similar to particle -
+    # isn't confirmed anywhere reliable). "unknown" risks actively
+    # filtering to the WRONG subset rather than just being ignored, so
+    # omitting these entirely is safer than sending a guessed, wrong
+    # value - the search is still correctly filtered by every other
+    # confirmed dimension (item/quality/spell/paint/killstreak_tier/etc).
     if not craftable:
         params["craftable"] = 0
     paint_value = paint_rgb_decimal(paint) if paint else None
