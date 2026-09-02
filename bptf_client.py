@@ -162,22 +162,9 @@ def _currently_rate_limited():
 
 
 def is_rate_limited() -> bool:
-    """
-    Public check for whether backpack.tf's snapshot/history endpoints are
-    currently in the post-429 cooldown (see _note_rate_limited above).
-    Used by matcher.py to distinguish "no live data because there
-    genuinely isn't any" from "no live data because we're deliberately
-    not asking right now" - the two look identical from inside
-    _fetch_snapshot_prices (both just return None), but they call for
-    different handling: the first is a legitimate reason to fall back to
-    the (possibly stale) community price, the second is not - falling
-    back during a cooldown risks trusting a stale community number for
-    an item that actually has an abundance of live listings, just not
-    ones we asked about right now. A real report showed exactly this:
-    a "reference" of 6.90 keys shown for an item with 6+ live listings
-    all sitting at 6.55 - the gap was too small for the community-price
-    cross-check (which only catches wildly-off numbers) to catch.
-    """
+    """Whether backpack.tf's snapshot/history endpoints are in the
+    post-429 cooldown (see _note_rate_limited above). Used for /stats'
+    "currently throttled" display."""
     return _currently_rate_limited()
 
 
@@ -185,19 +172,12 @@ def _get_with_retry(session, url, params, timeout=20):
     """
     Shared GET for the two backpack.tf endpoints that scale with
     evaluation volume (snapshot + price-history). Tracks 429s into the
-    shared cooldown above. Retries ONCE, after a short pause, on a 5xx
-    response - a real production log showed a 503 from backpack.tf's own
-    infrastructure (their side being briefly overloaded/restarting, not
-    something caused by our request volume or pattern the way a 429 is)
-    - these tend to be momentary, so it's worth one quick retry rather
-    than immediately falling back to the less-precise community price
-    for what might just be a one-second blip.
+    shared cooldown above. Retries once, after a short pause, on a 5xx
+    (backpack.tf's own infra briefly overloaded - usually momentary).
 
     `params` should NOT include "key"/"token" - _AccountPool.acquire()
-    picks which account's credentials to use for THIS specific request
-    (round-robin across every configured account) and injects them here,
-    so a retry after a 5xx also goes through the pool fresh rather than
-    reusing whichever account happened to be picked the first time.
+    picks which account's credentials to use for this specific request,
+    so a retry after a 5xx goes through the pool fresh too.
     """
     api_key, token = _account_pool.acquire()
     request_params = dict(params, key=api_key, token=token)
@@ -320,19 +300,9 @@ TEAM_COLOR_PAINT_RGB = {
 
 def paint_rgb_decimal(paint_name: str):
     """
-    Packs a known paint's RGB into the single decimal integer format the
-    classifieds `paint` search param expects (see build_classifieds_url).
-    Returns None for anything not in PAINT_NAME_TO_RGB above - never
-    guesses at an unmapped colour's value.
-
-    HONEST LIMITATION: the RGB *source values* are solid (real published
-    reference), but the R*65536+G*256+B packing formula used here is the
-    universal standard for encoding an RGB triple as one integer, not a
-    backpack.tf-specific confirmation - a single real example of this
-    exact param wasn't independently reproduced. Worst case if this
-    formula is wrong: the paint filter doesn't narrow the search
-    correctly for painted items, same as before this was added, not a
-    regression.
+    Packs a known paint's RGB into the decimal integer the classifieds
+    `paint` search param expects (see build_classifieds_url). Returns
+    None for anything not in PAINT_NAME_TO_RGB - never guesses.
     """
     rgb = PAINT_NAME_TO_RGB.get(paint_name)
     if rgb is None:
@@ -402,23 +372,16 @@ _KILLSTREAK_PREFIXES = ["Professional Killstreak ", "Specialized Killstreak ", "
 
 def strip_killstreak_prefix(name: str) -> str:
     """Strips only the Killstreak-tier prefix, leaving Australium (and
-    everything else) intact - e.g. "Professional Killstreak Australium
-    Rocket Launcher" -> "Australium Rocket Launcher". Used to recover the
-    tier-independent base name so another tier's name can be
-    reconstructed (see name_for_killstreak_tier).
+    everything else) intact - used to recover the tier-independent base
+    name so another tier's name can be reconstructed (see
+    name_for_killstreak_tier).
 
-    Does NOT strip the prefix on a Killstreak Kit/Kit Fabricator itself
-    (e.g. "Professional Killstreak Medi Gun Kit Fabricator") - a real
-    report showed this producing wrong reference prices, traced to
-    exactly this: unlike a weapon, a Kit/Fabricator has no tier-
-    independent "base item" underneath it - "Killstreak X Kit",
-    "Specialized Killstreak X Kit", and "Professional Killstreak X Kit"
-    are three entirely separate, independently-priced items, not one
-    item with a stripped-off tier modifier. Stripping the prefix here
-    searched backpack.tf for a name that doesn't exist ("Medi Gun Kit
-    Fabricator" alone isn't a real item), and whatever price came back
-    for that mismatched query was reference-price noise, not the real
-    Fabricator's price.
+    Does NOT strip on a Killstreak Kit/Kit Fabricator itself - unlike a
+    weapon, a Kit/Fabricator has no tier-independent base item: each
+    tier's Kit is a separate, independently-priced item, not one item
+    with a stripped-off modifier. Stripping there searched for a name
+    that doesn't exist, producing wrong reference prices (a real, fixed
+    bug).
     """
     if name.endswith("Kit") or name.endswith("Fabricator"):
         return name
@@ -437,24 +400,16 @@ def name_for_killstreak_tier(name_without_killstreak: str, tier: int) -> str:
 def strip_effect_prefix(name: str, particle_name: str) -> str:
     """
     Strips an Unusual particle effect name from the FRONT of the item
-    name, e.g. strip_effect_prefix("Circling Heart Hot Dogger", "Circling
-    Heart") -> "Hot Dogger". Needed because backpack.tf's own item.name
-    field already includes the effect as a display prefix (confirmed by
-    a real alert AND the real classifieds listings behind it both
-    showing "Circling Heart Hot Dogger" as one string) - without this,
-    the effect name ends up duplicated in an alert's own display text
-    ("Unusual Circling Heart Hot Dogger (Circling Heart)"), and more
-    importantly the classifieds search link ends up searching for an
-    item literally named "Circling Heart Hot Dogger" while ALSO passing
-    particle=<id> separately, which doesn't match anything real - a
-    direct report confirmed the resulting link simply didn't work,
-    exactly like strip_variant_prefixes' own docstring describes for a
-    stale name mismatch elsewhere.
+    name, e.g. ("Circling Heart Hot Dogger", "Circling Heart") ->
+    "Hot Dogger". backpack.tf's own item.name already includes the
+    effect as a display prefix - without this, the effect ends up
+    duplicated in an alert ("Unusual Circling Heart Hot Dogger (Circling
+    Heart)") and the classifieds search link ends up searching for a
+    name that doesn't match anything real once particle=<id> is also
+    passed separately.
 
     Only strips when the name genuinely starts with "<particle_name> "
-    (case-sensitive, matching backpack.tf's own capitalization) - if it
-    doesn't (e.g. a source that DOESN'T prefix the effect this way), the
-    name is returned unchanged rather than guessing.
+    (case-sensitive) - otherwise returned unchanged rather than guessing.
     """
     if not particle_name:
         return name
@@ -467,34 +422,20 @@ def strip_effect_prefix(name: str, particle_name: str) -> str:
 def strip_variant_prefixes(name: str) -> str:
     """
     Strips "Non-Craftable", Killstreak-tier, and Australium prefixes on
-    top of strip_quality_prefix(), e.g. "Non-Craftable Professional
+    top of strip_quality_prefix() - e.g. "Non-Craftable Professional
     Killstreak Australium Rocket Launcher" -> "Rocket Launcher". Needed
-    for the classifieds *search* family (the live snapshot API and the
-    webpage link) - a real search the user built by hand and confirmed
-    working uses just the bare weapon name ("Ambassador"), with
-    killstreak_tier/australium/craftable as their own separate filter
-    params, NOT baked into the name text; a name like "Non-Craftable
-    Spine-Chilling Skull" doesn't match anything there (confirmed by a
-    real report: the search came back empty, and the reference/buy-order
-    numbers computed from that broken lookup were themselves wrong -
-    once the name doesn't match the real item, nothing downstream that
-    depends on it can be trusted either).
+    for the classifieds search family (snapshot API + webpage link),
+    which filters killstreak_tier/australium/craftable as separate
+    params, NOT baked into the name text - a name still carrying these
+    prefixes matches nothing there.
 
-    "Non-Craftable " is checked first, since (best available
-    understanding of Valve's naming order, not independently verified
-    the way the killstreak/australium order was) it comes immediately
-    after quality and before killstreak-tier/Australium - if that
-    ordering assumption is ever wrong for some combination, the fix is
-    almost always just reordering the checks here.
-
-    Deliberately NOT used for IGetPrices / IGetPriceHistory (see
-    get_price_keys / _fetch_price_history) - those are a different,
-    older API family, independently confirmed to index Australium items
-    by their full name ("Australium Rocket Launcher" is genuinely its
-    own top-level entry, not "Rocket Launcher" + a flag, there). Craftable
-    status there is instead read from which JSON branch the entry came
-    from (Tradable.Craftable vs Tradable.Non-Craftable) - see
-    _iter_price_entries - never from name text, on that endpoint either.
+    "Non-Craftable " is checked first (best understanding of Valve's
+    naming order - if wrong for some combination, reorder the checks
+    here). NOT used for IGetPrices/IGetPriceHistory (see get_price_keys/
+    _fetch_price_history) - that older API family indexes Australium
+    items by full name, and reads craftable status from which JSON
+    branch an entry came from (see _iter_price_entries), never from name
+    text either.
     """
     if name.startswith("Non-Craftable "):
         name = name[len("Non-Craftable "):]
@@ -570,21 +511,16 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
 
 def _filter_price_outliers(prices, floor_fraction: float = 0.3, ceiling_fraction=None):
     """
-    Drops prices priced suspiciously far below (and, if `ceiling_fraction`
-    is given, above) the rest of the pack before a reference price is
-    computed from them - the same principle the community's
-    bptf-autopricer project uses ("Filters Outliers... removes listings
-    with prices that deviate too much from the average"). Used for sell
-    listings (floor only, guards the discount calculation against a
-    troll/mistake listing dragging the reference down) and for buy orders
-    (floor + ceiling, since a single implausibly-high buy order would
-    otherwise make a flip look more profitable than it really is).
+    Drops prices far below (and, if `ceiling_fraction` given, above) the
+    rest of the pack before computing a reference price - same principle
+    the community's bptf-autopricer project uses. Sell listings use
+    floor only (guards against a troll/mistake listing dragging the
+    reference down); buy orders use floor + ceiling (guards against one
+    implausibly-high buy order overstating flip profit).
 
-    Needs at least 3 prices to bother - with fewer there's no reliable
-    "pack" to judge outliers against, so nothing is dropped. Never
-    returns an empty list: if everything gets filtered out (extremely
-    wide spread), the original unfiltered list is returned instead of
-    leaving the caller with nothing to work with.
+    Needs 3+ prices to bother (no reliable "pack" with fewer). Never
+    returns empty - if everything gets filtered (extremely wide spread),
+    the original unfiltered list is returned instead.
     """
     if len(prices) < 3:
         return list(prices)
@@ -605,24 +541,16 @@ def _filter_price_outliers(prices, floor_fraction: float = 0.3, ceiling_fraction
 def _iter_price_entries(craft_block):
     """
     Yields (particle_id, entry) pairs from one Craftable/Non-Craftable
-    block of backpack.tf's IGetPrices response.
+    block of backpack.tf's IGetPrices response. This block has two
+    shapes depending on the item (confirmed via a real, working third-
+    party script reading this API): items that can't be Unusual (Key,
+    Refined Metal, ...) get a plain LIST of price entries; items that
+    can be Unusual get a DICT keyed by particle id, one entry per effect.
 
-    CONFIRMED (via a real, working third-party script that reads this
-    exact API) that this block has two genuinely different shapes
-    depending on the item: for anything that CAN'T carry an Unusual
-    effect (the Mann Co. Supply Crate Key itself, Refined Metal, and
-    presumably others), it's a plain LIST of price entries directly -
-    `prices['6']['Tradable']['Craftable'][0]['value']` in that script's
-    own indexing. For items that CAN be Unusual, it's a DICT keyed by
-    particle id instead, to hold one price entry per effect.
-
-    An earlier version of this parser only handled the dict shape and
-    used an isinstance() check to defensively skip anything else - which
-    silently dropped the list shape entirely, including the Key's own
-    entry. That's serious beyond just missing the Key's price: every
-    metal-denominated backpack.tf listing (scrap/reclaimed/refined) gets
-    converted to keys using that exact number, so losing it silently
-    breaks that conversion project-wide, not just for the Key itself.
+    An earlier version only handled the dict shape, silently dropping
+    the list shape entirely (including the Key's own entry) - serious
+    since every metal-denominated backpack.tf listing converts to keys
+    using that exact number.
     """
     if isinstance(craft_block, list):
         for entry in craft_block:
@@ -692,17 +620,9 @@ class LocalListingStore:
 
     def record(self, identity_key, listing_id, seller_id, price_keys, intent, timestamp=None):
         """
-        Each bucket is a dict keyed by listing_id (not a plain list) -
-        deliberately, after profiling against a real /stats report's
-        actual scale (211315 buy-side records alone for backpack.tf in
-        135 minutes): a list required scanning every existing entry on
-        EVERY call just to drop a possible duplicate for the same
-        listing_id before appending, an O(bucket size) cost paid on the
-        single hottest path in this whole project, for what's usually a
-        brand new listing_id with nothing to actually find. Dict
-        assignment (bucket[listing_id] = ...) inherently replaces any
-        existing entry for that key - same "no duplicate accumulation"
-        behavior as before, now O(1) instead of O(n).
+        Each bucket is a dict keyed by listing_id (not a list) - O(1)
+        duplicate replacement instead of scanning the whole bucket on
+        every call, the hottest path in this project.
         """
         if price_keys is None or price_keys <= 0:
             return
@@ -714,26 +634,17 @@ class LocalListingStore:
                 "price_keys": price_keys, "ts": ts, "intent": intent,
             }
             if len(bucket) > self._max_entries_per_key:
-                # Only reached once a bucket genuinely exceeds the cap
-                # (rare - most items never see 300+ distinct fresh
-                # listings) - trimming itself is still O(n log n), but
-                # that cost is no longer paid on every single call the
-                # way the old duplicate-scan was.
+                # Rare (most items never see 300+ distinct fresh
+                # listings) - O(n log n) trim only paid when it happens.
                 oldest_first = sorted(bucket.values(), key=lambda e: e["ts"])
                 for stale in oldest_first[:len(bucket) - self._max_entries_per_key]:
                     del bucket[stale["listing_id"]]
 
     def remove_listing(self, listing_id):
-        """Removes a specific listing by id from every bucket it might be
-        in, immediately - called on backpack.tf's own "listing-delete"
-        websocket event (a real, confirmed event type, see main.py),
-        rather than waiting for it to time out of the freshness window
-        naturally. Doesn't know which bucket a listing_id lives in
-        without the full identity key, so this still scans every
-        BUCKET (deletes are far rarer than records, and there are many
-        fewer buckets than total entries) - but within each bucket, the
-        removal itself is now O(1) (a dict pop) rather than O(bucket
-        size), the same dict-keyed-by-listing_id change as record()."""
+        """Removes a listing from every bucket it might be in, called on
+        backpack.tf's "listing-delete" event. Scans every bucket (no
+        identity key to jump straight to one), but the removal itself is
+        O(1) per bucket (dict pop)."""
         with self._lock:
             for bucket in self._entries.values():
                 bucket.pop(listing_id, None)
@@ -858,19 +769,12 @@ class LocalListingStore:
 
     def save_to_disk(self, path):
         """
-        Snapshots the entire store to a JSON file - see load_from_disk
-        and main.py's local_store_snapshot_loop for why this exists: a
-        real, direct point made clear that restarting for every update
-        (which happens often during active development) was wiping out
-        everything this store had learned each time, meaning the
-        project's own accuracy - the whole reason it exists - kept
-        resetting to zero right when it was needed most. Called
-        periodically from a background loop, not on every record() -
-        writing a whole file per event would be real, needless overhead
-        on the hot path; a snapshot every minute or two loses at most
-        that much of the MOST recent data on a restart, not everything.
-        Identity-key tuples become JSON-compatible lists here - see
-        load_from_disk for the reverse.
+        Snapshots the store to a JSON file (see load_from_disk and
+        main.py's local_store_snapshot_loop) - so a restart doesn't wipe
+        out everything the store has learned. Called periodically, not
+        on every record() - a snapshot every minute or two loses at most
+        that much of the newest data on a restart. Identity-key tuples
+        become JSON lists here - see load_from_disk for the reverse.
         """
         try:
             with self._lock:
@@ -878,18 +782,10 @@ class LocalListingStore:
                     {"key": list(key), "bucket": bucket}
                     for key, bucket in self._entries.items()
                 ]
-            # Unique per call (pid + a random suffix), not a fixed
-            # "path + .tmp" - a real production error showed os.replace
-            # failing with FileNotFoundError, traced to exactly this: the
-            # periodic save (local_store_snapshot_loop, every 90s) and
-            # the graceful-shutdown save (Watcher.run(), on SIGTERM) can
-            # both call this within moments of each other during a
-            # restart, and with a SHARED temp filename, whichever finishes
-            # first renames it away from under the other - the second
-            # save's own os.replace then finds nothing there to rename.
-            # A unique name per call means two concurrent saves can never
-            # collide on the same temp file, regardless of which finishes
-            # first.
+            # Unique per call (pid + random suffix), not a fixed
+            # "path + .tmp" - two saves close together (periodic +
+            # shutdown) sharing one temp filename could collide, with
+            # the second's os.replace finding nothing left to rename.
             tmp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(serializable, f)
@@ -900,32 +796,16 @@ class LocalListingStore:
     def load_from_disk(self, path):
         """
         Restores a previous save_to_disk snapshot, if one exists -
-        called once at startup, before the websocket listeners begin,
-        so evaluations can use recently-collected data immediately after
-        a restart instead of starting completely cold. Deliberately does
-        NOT special-case staleness here: entries loaded from an old
-        snapshot go through the exact same freshness-window check
-        (_fresh_values) as any other entry - if the snapshot itself is
-        old enough that its entries have expired, they're correctly
-        ignored the normal way, not because loading did anything special
-        for them.
+        called once at startup so evaluations can use recent data
+        immediately instead of starting cold. Entries go through the
+        normal freshness check on read, same as anything else - no
+        special-casing for age here.
 
-        Migrates old-format buckets on the fly: a real, severe production
-        incident (every single event failing) traced to exactly this -
-        an update that changed each bucket's own type from a plain list
-        to a dict keyed by listing_id (for O(1) record() instead of an
-        O(n) duplicate-scan on every call - see record()'s own
-        docstring) shipped without accounting for state a PREVIOUS
-        version had already saved to disk in the old, list-shaped
-        format. On restart, that old file loaded straight into the new
-        code with no conversion, meaning bucket[listing_id] = ... hit a
-        TypeError (list indices must be integers, not str) on every
-        single record() call that touched an old-format bucket - which,
-        given the store had been running a while, was most of them.
-        Converting on load, keyed by each entry's own listing_id (same
-        as record() itself would), means old saved state keeps working
-        transparently across this kind of internal format change,
-        without the person needing to know or do anything about it.
+        Migrates old-format buckets on the fly (each bucket used to be a
+        plain list, now a dict keyed by listing_id for O(1) record() -
+        see record()'s own docstring) so a file saved by an older
+        version still loads correctly instead of crashing every record()
+        call that touches it.
         """
         if not os.path.exists(path):
             return
@@ -948,33 +828,18 @@ class LocalListingStore:
 def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftable,
                           spell, killstreak_tier, australium, texture=None):
     """
-    The exact tuple LocalListingStore keys entries by. Every field here
-    is something this project ALREADY extracts and validates itself from
-    the raw websocket payload (see main.py's handle_bptf_event) - paint_
-    decimal in particular should be the precise value from paint.color
-    when available (confirmed real for both mannco.store and backpack.tf
-    - see the DIAGNOSTIC SAMPLE-driven fixes earlier this session), not
-    a guessed one, so two listings only share a bucket when they are
-    genuinely the same exact item in every tracked dimension.
+    The exact tuple LocalListingStore keys entries by - every field is
+    already extracted/validated from the raw websocket payload (see
+    main.py's handle_bptf_event), so two listings only share a bucket
+    when genuinely identical in every tracked dimension.
 
-    texture identifies a specific "grade" for cosmetics and decorated
-    weapons - a separate, intrinsic sub-quality from the normal 9-colour
-    quality system, introduced in the Gun Mettle Update (confirmed via
-    the official TF2 wiki's own Grade article): Civilian, Freelance,
-    Mercenary, Commando, Assassin, Elite, lowest to highest, each with
-    real, often large value differences on otherwise-identical-looking
-    items. Was previously NOT tracked at all here - worse, any item
-    carrying this field was being unconditionally dropped from
-    consideration entirely (see main.py's is_skin/extra_excluded_hint -
-    conflating genuinely graded cosmetics with actual weapon skins,
-    which are a different, wear-having item type - see wear_tier's own
-    separate, real reason for exclusion). Critically, grade can NOT be
-    read off the item's own display name - the backpack.tf forums
-    themselves warn of items whose name text contains a DIFFERENT
-    grade's word than their real one (their own example: "Commando
-    Elite" is a hat's actual NAME, but its real grade is Mercenary) -
-    so this must come from the structured texture field itself, never
-    inferred from name text.
+    texture is a cosmetic/weapon "grade" (Civilian..Elite, introduced in
+    the Gun Mettle Update) - a separate, intrinsic sub-quality from the
+    normal 9-colour quality system, with real value differences on
+    otherwise-identical-looking items. Can NOT be read off the item's
+    display name (backpack.tf's own forums document items whose name
+    text contains a different grade's word than their real one) - must
+    come from the structured texture field.
     """
     return (
         strip_variant_prefixes(name), quality_name, particle_id, paint_decimal,
@@ -1108,21 +973,14 @@ class BackpackTFPriceList:
         """
         Returns (min_price_in_keys_among_OTHER_sell_listings,
         count_of_other_listings), or (None, 0) if not enough fresh,
-        trustworthy data has been self-collected yet for this exact item
-        (same name/quality/effect/spell/australium/killstreak/paint/
-        texture-grade).
+        trustworthy data has been self-collected yet for this exact item.
 
-        Reads from self.local_listings (see LocalListingStore's own
-        docstring for why this replaced a direct backpack.tf API call:
-        the endpoint this used to query is backpack.tf's own deprecated
-        v1 listings API, confirmed via their Developer Centre changelog,
-        with no v2 replacement for general market search as of the most
-        recent community discussion found). "Live" now means "seen
-        recently via the websocket stream this project already
-        consumes" rather than "queried on demand" - the accuracy
-        principle (never fall back to a stale/community price, skip
-        rather than guess when data is thin) is unchanged, only the
-        SOURCE of the live data is different.
+        Reads from self.local_listings - replaced a direct call to
+        backpack.tf's now-deprecated v1 listings API (confirmed via
+        their Developer Centre changelog, no v2 replacement exists).
+        "Live" now means "seen recently via the websocket stream" rather
+        than "queried on demand" - same accuracy principle either way
+        (skip rather than guess when data is thin), different source.
         """
         paint_value = paint_decimal_override if paint_decimal_override is not None else (
             paint_rgb_decimal(paint) if paint else None
@@ -1137,13 +995,11 @@ class BackpackTFPriceList:
                                  texture=None):
         """
         Highest current self-collected BUY-intent price for this exact
-        item, in keys, along with how many fresh buy-intent listings
-        that reflects. Returns (None, 0) if nothing fresh has been
-        collected yet. Same LocalListingStore reasoning as
-        get_snapshot_min_other_keys above - not excluding any particular
-        listing_id here (unlike the sell-side reference) since this
-        isn't evaluating one specific listing, just asking "what's on
-        offer right now for this exact item".
+        item, in keys, plus how many fresh buy-intent listings that
+        reflects. Returns (None, 0) if nothing fresh has been collected.
+        Not excluding any listing_id here (unlike the sell-side
+        reference) since this asks "what's on offer right now", not
+        about one specific listing.
         """
         paint_value = paint_decimal_override if paint_decimal_override is not None else (
             paint_rgb_decimal(paint) if paint else None
@@ -1157,18 +1013,13 @@ class BackpackTFPriceList:
     def get_liquidity_days_since_update(self, name: str, quality_name: str, particle_id=None,
                                          craftable=True):
         """
-        Returns how many days ago this item's price was last revised by
-        the community (via IGetPriceHistory - the same fetch used for the
-        average price, but only the single most recent entry matters
-        here), or None if unavailable.
-
-        HONEST LIMITATION: backpack.tf's actual confirmed-sale history is
-        a paid Premium feature, not exposed by the free API (confirmed:
-        their own forum repeatedly tells free users "you need Premium to
-        search sale history"). This uses price-suggestion recency as the
-        closest available free proxy for "is this item actively being
-        traded" - not verified sales. A long-untouched suggestion isn't
-        proof nobody's buying, just a signal worth weighing.
+        Days since this item's price was last revised by the community
+        (via IGetPriceHistory's most recent entry), or None if
+        unavailable. backpack.tf's real sale-confirmation history is a
+        paid Premium feature, not exposed by the free API - this uses
+        price-suggestion recency as the closest free proxy for "is this
+        actively traded" (not verified sales; a long-untouched
+        suggestion isn't proof nobody's buying, just a signal).
         """
         history = self._fetch_price_history(name, quality_name, particle_id, craftable)
         if not history:
@@ -1183,22 +1034,16 @@ class BackpackTFPriceList:
 
     def _fetch_price_history(self, name: str, quality_name: str, particle_id=None, craftable=True):
         """
-        Shared fetch for IGetPriceHistory/v1, used by both
-        get_average_price_keys() and get_liquidity_days_since_update().
-        Cached briefly (same window as the snapshot cache) so a single
-        qualifying deal - which wants both the average price and the
-        liquidity signal - triggers one history request, not two.
+        Shared fetch for IGetPriceHistory/v1, used by get_average_price_
+        keys() and get_liquidity_days_since_update() - cached briefly so
+        one qualifying deal (wanting both) triggers one request, not two.
         Returns the raw `history` list, or None on failure/empty.
 
-        HONESTY NOTE: this is the least-documented endpoint used in this
-        project. The item/craftable/tradable params match the rest of the
-        API family and are solid; the parameter name for filtering by
-        Unusual particle effect on THIS SPECIFIC endpoint is not confirmed
-        the way it is for the snapshot endpoint (see get_snapshot_min_other_keys) -
-        "priceindex" is the best available guess based on this API
-        family's older naming convention. If it's wrong, the request
-        simply comes back empty and callers skip the feature - it won't
-        silently show a wrong number for the wrong effect.
+        The filter param name for Unusual particle effect on this
+        specific endpoint isn't confirmed the way it is on the snapshot
+        endpoint - "priceindex" is the best guess from this API family's
+        naming convention. If wrong, the request just comes back empty
+        and callers skip the feature, never a silently wrong number.
         """
         cache_key = (name, quality_name, particle_id, craftable)
         cached = self._history_cache.get(cache_key)
