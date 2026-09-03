@@ -1032,7 +1032,7 @@ class BackpackTFPriceList:
                                     killstreaker=killstreaker, sheen=sheen)
         return self.local_listings.get_max_buy_price(key)
 
-    def fetch_and_record_all_unusual_buy_orders(self, name: str) -> int:
+    def fetch_and_record_all_unusual_buy_orders(self, name: str, defindex: int) -> int:
         """
         Bulk proactive scan: ONE snapshot API request for this base item
         (Unusual, buy intent), covering EVERY particle effect at once -
@@ -1042,14 +1042,25 @@ class BackpackTFPriceList:
         order already waiting - no live-query wait needed. Returns how
         many listings were recorded.
 
-        Missing texture/defindex (unlike handle_bptf_event's fuller
-        extraction) - a supplementary cache-warming pass, not the final
-        decision path. craftable/killstreaker/sheen ARE derived the same
-        careful way as the main path, since buy orders here can sit
-        unrefreshed for hours before their own next real event.
+        Queries by "sku" (defindex;quality), NOT "item"+"quality" text -
+        a real, confirmed correction: backpack.tf's own forums show the
+        snapshot endpoint's real, working param is sku (e.g.
+        "sku=233;6&appid=440&token=..."), not the item-name-based params
+        this project assumed until now (which returned "'sku' param is
+        required" once the earlier, separate "'appid' param is required"
+        was fixed - each error only surfaces once the previous one no
+        longer masks it). Requires defindex - the caller (main.py's
+        proactive worker) only offers items it already has one for.
+
+        Missing texture (unlike handle_bptf_event's fuller extraction) -
+        a supplementary cache-warming pass, not the final decision path.
+        craftable/killstreaker/sheen ARE derived the same careful way as
+        the main path, since buy orders here can sit unrefreshed for
+        hours before their own next real event.
         """
         try:
-            params = {"item": name, "appid": 440, "quality": QUALITY_NAME_TO_ID.get("Unusual"), "intent": "buy"}
+            sku = f"{defindex};{QUALITY_NAME_TO_ID.get('Unusual')}"
+            params = {"sku": sku, "appid": 440, "intent": "buy"}
             resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=10)
             resp.raise_for_status()
             data = resp.json()
@@ -1101,17 +1112,32 @@ class BackpackTFPriceList:
             # genuinely different, quality=Unusual item sharing the same
             # particle_id - wrong buy order matched to the wrong item.
             entry_quality = ((item.get("quality") or {}).get("name")) or "Unusual"
+            # defindex was missing here entirely until now - a real,
+            # serious bug: main.py's real websocket path prefers
+            # defindex over name text for the identity key whenever it's
+            # available (see listing_identity_key's own docstring for
+            # why), but this bulk-scan path never extracted it, so a
+            # buy order recorded here for an item WITH a defindex ended
+            # up keyed by NAME instead - a completely different bucket
+            # from the one a real sell event for the exact same item
+            # would look up (keyed by defindex). The whole proactive
+            # scan's data was invisible to real evaluations for any item
+            # that has a defindex, which per this project's own research
+            # is most of them - the appid fix alone wasn't enough to
+            # make this feature actually work.
+            defindex = item.get("defindex")
             key = listing_identity_key(
                 name, entry_quality, particle_id, None, craftable,
                 None, item.get("killstreakTier") or 0, name.startswith("Australium "),
                 killstreaker=killstreaker_obj.get("name"), sheen=sheen_obj.get("name"),
+                defindex=defindex,
             )
             self.local_listings.record(key, str(listing_id or f"bulk-{seller}-{particle_id}"),
                                         str(seller), price_keys, "buy")
             recorded += 1
         return recorded
 
-    def fetch_live_buy_order_keys(self, name: str, quality_name: str, particle_id=None,
+    def fetch_live_buy_order_keys(self, name: str, quality_name: str, defindex: int, particle_id=None,
                                    craftable=True, australium: bool = False, killstreak_tier=None):
         """
         LIVE query to the snapshot API for this item's current best buy
@@ -1124,24 +1150,25 @@ class BackpackTFPriceList:
         "alwaysQuerySnapshotAPI": true, but only for its own small,
         curated item list, never the whole marketplace).
 
+        Queries by "sku" (defindex;quality) - confirmed the real,
+        working param straight from backpack.tf's own forums (a real,
+        working example: "sku=233;6&appid=440&token=..."), NOT the
+        item/quality/particle/australium/killstreak_tier text params
+        this project used until now, which returned "'sku' param is
+        required" once the earlier, separate appid error was fixed.
+        Only the confirmed defindex;quality part of the SKU format is
+        used here - particle/killstreak/craftable/australium aren't
+        independently confirmed as SKU sub-fields for this specific
+        endpoint, so those are filtered CLIENT-SIDE from the response
+        instead of guessed at in the query string.
+
         Returns (buy_keys, count) matching get_best_buy_order_keys' own
         shape, or (None, 0) on failure - never worse than not trying,
         the local-store value (if any) remains the fallback either way.
         """
         try:
-            params = {
-                "item": strip_variant_prefixes(name),
-                "appid": 440,
-                "quality": QUALITY_NAME_TO_ID.get(quality_name),
-                "intent": "buy",
-                "craftable": 1 if craftable else 0,
-            }
-            if particle_id is not None:
-                params["particle"] = particle_id
-            if australium:
-                params["australium"] = 1
-            if killstreak_tier:
-                params["killstreak_tier"] = killstreak_tier
+            sku = f"{defindex};{QUALITY_NAME_TO_ID.get(quality_name)}"
+            params = {"sku": sku, "appid": 440, "intent": "buy"}
             # timeout kept short (5s, not the usual 15-20s elsewhere in
             # this file) - a real, confirmed case: this call runs inside
             # evaluate_listing, itself dispatched via asyncio.to_thread's
@@ -1179,13 +1206,31 @@ class BackpackTFPriceList:
         for entry in listings:
             if not isinstance(entry, dict) or entry.get("intent") != "buy":
                 continue
+            item = entry.get("item") or {}
             # Quality must match what was actually requested - a real,
             # confirmed case: a "Strange Unusual" item (Strange quality,
             # but still carrying a particle effect) came back from a
             # quality-filtered query anyway, which would have silently
             # let a different item's price into this max() otherwise.
-            entry_quality = ((entry.get("item") or {}).get("quality") or {}).get("name")
+            entry_quality = (item.get("quality") or {}).get("name")
             if entry_quality and entry_quality != quality_name:
+                continue
+            # particle/craftable/killstreak_tier/australium are now
+            # filtered HERE, client-side, instead of as query params -
+            # the query only sends the confirmed sku=defindex;quality
+            # part (see this function's own docstring for why).
+            if particle_id is not None:
+                entry_particle = (item.get("particle") or {}).get("id")
+                if entry_particle != particle_id:
+                    continue
+            entry_name = item.get("name") or ""
+            entry_craftable = not entry_name.startswith("Non-Craftable ")
+            if bool(craftable) != entry_craftable:
+                continue
+            if bool(australium) != entry_name.startswith("Australium "):
+                continue
+            entry_ks_tier = item.get("killstreakTier") or 0
+            if (killstreak_tier or 0) != entry_ks_tier:
                 continue
             price_keys = self.currencies_to_keys(entry.get("currencies") or {})
             if price_keys is not None and price_keys > 0:

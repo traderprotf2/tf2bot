@@ -352,19 +352,28 @@ class Watcher:
             # rather than uselessly re-hammering the same tiny set of
             # items, whenever known items are fewer than workers.
             now = time.time()
+            # Also requires a known defindex - the snapshot endpoint's
+            # real query param is "sku" (defindex;quality), confirmed
+            # directly from backpack.tf's own forums, not the item/
+            # quality text params this project used until now. An item
+            # whose defindex was never seen (rare - only if a payload
+            # shape genuinely lacked it) simply can't be scanned this
+            # way yet, rather than sending a query known to be wrong.
             eligible = {
                 n: v for n, v in self._known_unusual_items.items()
                 if v["category"] in self.runtime.watched_categories
+                and v.get("defindex") is not None
                 and now - v["ts"] >= self.PROACTIVE_MIN_REFRESH_INTERVAL_SECONDS
             }
             if not eligible:
                 await asyncio.sleep(5)
                 continue
             item_name = min(eligible, key=lambda n: eligible[n]["ts"])
+            item_defindex = eligible[item_name]["defindex"]
             self._known_unusual_items[item_name]["ts"] = time.time()  # claimed immediately, before awaiting
             try:
                 recorded = await asyncio.to_thread(
-                    self.bptf.fetch_and_record_all_unusual_buy_orders, item_name
+                    self.bptf.fetch_and_record_all_unusual_buy_orders, item_name, item_defindex
                 )
                 self.stats["proactive_unusual_scans"] += 1
                 self.stats["proactive_unusual_buy_orders_recorded"] += recorded
@@ -1200,7 +1209,7 @@ class Watcher:
             for excluded in self.cfg.get("excluded_types", [])
         )
         if quality == "Unusual" and not is_excluded_type and name not in self._known_unusual_items:
-            self._known_unusual_items[name] = {"ts": 0.0, "category": category}
+            self._known_unusual_items[name] = {"ts": 0.0, "category": category, "defindex": defindex}
         self.bptf.local_listings.record(
             identity_key, str(listing_id), seller_steamid, price_keys, intent,
         )
