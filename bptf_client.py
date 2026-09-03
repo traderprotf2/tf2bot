@@ -882,6 +882,13 @@ class BackpackTFPriceList:
         self._snapshot_cache = {}  # (name, quality_id, particle_id, intent) -> (timestamp, [(listing_id, price_keys)])
         self._history_cache = {}  # (name, quality_id, particle_id) -> (timestamp, history_list)
         self.local_listings = LocalListingStore()
+        # Logs at most ONE raw sample of a bulk-scan entry that has no
+        # resolvable particle_id, across this process's whole lifetime -
+        # see fetch_and_record_all_unusual_buy_orders' own diagnostic
+        # comment for why. One real sample is enough to check a field-
+        # name assumption against; a warning on every one of potentially
+        # thousands of scans would just spam the log for no extra value.
+        self._bulk_scan_sample_logged = False
 
     def refresh(self):
         log.info("Refreshing backpack.tf price list...")
@@ -1032,7 +1039,7 @@ class BackpackTFPriceList:
                                     killstreaker=killstreaker, sheen=sheen)
         return self.local_listings.get_max_buy_price(key)
 
-    def fetch_and_record_all_unusual_buy_orders(self, name: str, defindex: int) -> int:
+    def fetch_and_record_all_unusual_buy_orders(self, name: str) -> int:
         """
         Bulk proactive scan: ONE snapshot API request for this base item
         (Unusual, buy intent), covering EVERY particle effect at once -
@@ -1042,15 +1049,14 @@ class BackpackTFPriceList:
         order already waiting - no live-query wait needed. Returns how
         many listings were recorded.
 
-        Queries by "sku" (defindex;quality), NOT "item"+"quality" text -
-        a real, confirmed correction: backpack.tf's own forums show the
-        snapshot endpoint's real, working param is sku (e.g.
-        "sku=233;6&appid=440&token=..."), not the item-name-based params
-        this project assumed until now (which returned "'sku' param is
-        required" once the earlier, separate "'appid' param is required"
-        was fixed - each error only surfaces once the previous one no
-        longer masks it). Requires defindex - the caller (main.py's
-        proactive worker) only offers items it already has one for.
+        Queries by "sku" - confirmed directly on backpack.tf's own
+        forums (a trusted community member correcting another user's
+        exact same "'sku' param is required" / bare-acknowledgement-
+        only-response confusion) that despite the name, THIS endpoint's
+        "sku" is just the item's plain display name ("The Head Prize"),
+        NOT the defindex;quality format the wider tf2-sku community
+        standard uses - a real, confirmed correction to two of this
+        project's own previous, wrong attempts at this same endpoint.
 
         Missing texture (unlike handle_bptf_event's fuller extraction) -
         a supplementary cache-warming pass, not the final decision path.
@@ -1059,8 +1065,19 @@ class BackpackTFPriceList:
         hours before their own next real event.
         """
         try:
-            sku = f"{defindex};{QUALITY_NAME_TO_ID.get('Unusual')}"
-            params = {"sku": sku, "appid": 440, "intent": "buy"}
+            # "sku" here means backpack.tf's OWN term for it, confirmed
+            # directly on their forums by a trusted community member
+            # (Report Moderators role) after another user hit this exact
+            # same "'sku' param is required" error: it's the item's
+            # plain display NAME ("The Head Prize"), NOT the defindex;
+            # quality format the wider tf2-sku community standard uses -
+            # a real, confirmed correction to this project's own
+            # previous attempt, which sent defindex;quality and got back
+            # a bare acknowledgement with no listings at all, silently.
+            params = {
+                "sku": strip_variant_prefixes(name), "appid": 440,
+                "quality": QUALITY_NAME_TO_ID.get("Unusual"), "intent": "buy",
+            }
             resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=10)
             resp.raise_for_status()
             data = resp.json()
@@ -1077,6 +1094,7 @@ class BackpackTFPriceList:
             return 0
 
         recorded = 0
+        sample_logged = False
         for entry in listings:
             if not isinstance(entry, dict) or entry.get("intent") != "buy":
                 continue
@@ -1084,6 +1102,21 @@ class BackpackTFPriceList:
             particle_obj = item.get("particle") or {}
             particle_id = particle_obj.get("id")
             if particle_id is None:
+                if not sample_logged and not self._bulk_scan_sample_logged:
+                    # Diagnostic sample - a real, confirmed case: the
+                    # response CAN be a valid list (no "unexpected shape"
+                    # warning fires) while every entry still fails to
+                    # record anything, if this project's field-name
+                    # assumptions about EACH entry's own structure (not
+                    # the outer response) are wrong. One real, raw sample
+                    # makes that visible instead of silently recording
+                    # zero forever with no error anywhere.
+                    log.warning(
+                        "DIAGNOSTIC SAMPLE (bulk scan entry with no resolvable particle_id) "
+                        "for %s - raw entry: %r", name, entry,
+                    )
+                    sample_logged = True
+                    self._bulk_scan_sample_logged = True
                 continue  # not actually the Unusual variant - skip rather than guess
             price_keys = self.currencies_to_keys(entry.get("currencies") or {})
             if price_keys is None or price_keys <= 0:
@@ -1137,7 +1170,7 @@ class BackpackTFPriceList:
             recorded += 1
         return recorded
 
-    def fetch_live_buy_order_keys(self, name: str, quality_name: str, defindex: int, particle_id=None,
+    def fetch_live_buy_order_keys(self, name: str, quality_name: str, particle_id=None,
                                    craftable=True, australium: bool = False, killstreak_tier=None):
         """
         LIVE query to the snapshot API for this item's current best buy
@@ -1150,25 +1183,26 @@ class BackpackTFPriceList:
         "alwaysQuerySnapshotAPI": true, but only for its own small,
         curated item list, never the whole marketplace).
 
-        Queries by "sku" (defindex;quality) - confirmed the real,
-        working param straight from backpack.tf's own forums (a real,
-        working example: "sku=233;6&appid=440&token=..."), NOT the
-        item/quality/particle/australium/killstreak_tier text params
-        this project used until now, which returned "'sku' param is
-        required" once the earlier, separate appid error was fixed.
-        Only the confirmed defindex;quality part of the SKU format is
-        used here - particle/killstreak/craftable/australium aren't
-        independently confirmed as SKU sub-fields for this specific
-        endpoint, so those are filtered CLIENT-SIDE from the response
-        instead of guessed at in the query string.
+        Queries by "sku" - confirmed directly on backpack.tf's own
+        forums that despite the name, this endpoint's "sku" is just the
+        item's plain display name, NOT the defindex;quality format the
+        wider tf2-sku community standard uses (see fetch_and_record_all_
+        unusual_buy_orders' own docstring for the same correction, and
+        the two wrong attempts at this endpoint it replaces). Only
+        item/quality are sent - particle/killstreak/craftable/australium
+        aren't independently confirmed as filterable on this endpoint at
+        all, so those are filtered CLIENT-SIDE from the response instead
+        of guessed at in the query string.
 
         Returns (buy_keys, count) matching get_best_buy_order_keys' own
         shape, or (None, 0) on failure - never worse than not trying,
         the local-store value (if any) remains the fallback either way.
         """
         try:
-            sku = f"{defindex};{QUALITY_NAME_TO_ID.get(quality_name)}"
-            params = {"sku": sku, "appid": 440, "intent": "buy"}
+            params = {
+                "sku": strip_variant_prefixes(name), "appid": 440,
+                "quality": QUALITY_NAME_TO_ID.get(quality_name), "intent": "buy",
+            }
             # timeout kept short (5s, not the usual 15-20s elsewhere in
             # this file) - a real, confirmed case: this call runs inside
             # evaluate_listing, itself dispatched via asyncio.to_thread's

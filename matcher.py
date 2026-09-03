@@ -448,9 +448,9 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         is_priority_for_live_query = listing.quality == "Unusual" or any(
             hype_name.lower() in name_lower for hype_name in cfg.get("priority_item_names", [])
         )
-        if is_priority_for_live_query and not listing.killstreaker and not listing.sheen and listing.defindex is not None:
+        if is_priority_for_live_query and not listing.killstreaker and not listing.sheen:
             buy_order_keys, buy_order_count = bptf.fetch_live_buy_order_keys(
-                lookup_name, listing.quality, listing.defindex, listing.particle_id,
+                lookup_name, listing.quality, listing.particle_id,
                 craftable=listing.craftable, australium=australium,
                 killstreak_tier=listing.killstreak_tier,
             )
