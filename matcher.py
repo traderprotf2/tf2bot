@@ -235,7 +235,9 @@ def is_watched(listing: NormalizedListing, cfg: dict) -> bool:
     covered_by_australium_toggle = cfg.get("australium_only") and is_australium_weapon
 
     if not covered_by_australium_toggle:
-        if listing.quality not in cfg["watched_qualities"]:
+        # Unusual is unconditionally watched, same as main.py's own
+        # early-reject check - never gated by watched_qualities.
+        if listing.quality != "Unusual" and listing.quality not in cfg["watched_qualities"]:
             return False
         if listing.category not in cfg.get("watched_categories", ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"]):
             return False

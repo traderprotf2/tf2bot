@@ -1035,6 +1035,79 @@ class BackpackTFPriceList:
                                     killstreaker=killstreaker, sheen=sheen)
         return self.local_listings.get_max_buy_price(key)
 
+    def fetch_and_record_all_unusual_buy_orders(self, name: str) -> int:
+        """
+        Bulk proactive scan: ONE snapshot API request for this base item
+        (Unusual quality, buy intent), covering EVERY particle effect at
+        once - not scoped to a single effect, unlike fetch_live_buy_
+        order_keys above. Records every listing found directly into
+        LocalListingStore, so by the time a real sell listing for any of
+        these effects arrives via the websocket, a fresh buy order is
+        very likely already sitting in the store - no live-query wait
+        needed at that moment. Returns how many listings were recorded.
+
+        Deliberately simpler extraction than handle_bptf_event's careful,
+        edge-case-covered version in main.py (particle name resolution,
+        the "#Attrib_Particle" strip, defindex, texture) - this is a
+        supplementary cache-warming pass, not the final decision path.
+        Anything this gets slightly wrong for some edge case is
+        overwritten the moment a real websocket event for that same
+        listing arrives, which already goes through the careful path.
+        """
+        try:
+            params = {"item": name, "quality": QUALITY_NAME_TO_ID.get("Unusual"), "intent": "buy"}
+            resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            log.warning("Bulk Unusual buy-order scan failed for %s.", name)
+            return 0
+
+        listings = data.get("listings")
+        if not isinstance(listings, list):
+            log.warning(
+                "Bulk scan response for %s had an unexpected shape - raw (truncated): %r",
+                name, str(data)[:500],
+            )
+            return 0
+
+        recorded = 0
+        for entry in listings:
+            if not isinstance(entry, dict) or entry.get("intent") != "buy":
+                continue
+            item = entry.get("item") or {}
+            particle_obj = item.get("particle") or {}
+            particle_id = particle_obj.get("id")
+            if particle_id is None:
+                continue  # not actually the Unusual variant - skip rather than guess
+            price_keys = self.currencies_to_keys(entry.get("currencies") or {})
+            if price_keys is None or price_keys <= 0:
+                continue
+            listing_id = entry.get("id") or entry.get("listing_id")
+            seller = ((entry.get("user") or {}).get("id")
+                      or (entry.get("steamid")) or "unknown")
+            # Derived from name text, NOT the raw item.craftable field -
+            # same confirmed-unreliable field, same fix, as main.py's own
+            # handle_bptf_event. Matters MORE here than it first looks:
+            # this populates the buy-order side of the store, which can
+            # sit unrefreshed for hours until that specific buy order's
+            # own next websocket event - "a later real event corrects
+            # it" doesn't hold for a long time if that later event may
+            # not come for hours.
+            entry_name = item.get("name") or name
+            craftable = not entry_name.startswith("Non-Craftable ")
+            killstreaker_obj = item.get("killstreaker") or {}
+            sheen_obj = item.get("sheen") or {}
+            key = listing_identity_key(
+                name, "Unusual", particle_id, None, craftable,
+                None, item.get("killstreakTier") or 0, name.startswith("Australium "),
+                killstreaker=killstreaker_obj.get("name"), sheen=sheen_obj.get("name"),
+            )
+            self.local_listings.record(key, str(listing_id or f"bulk-{seller}-{particle_id}"),
+                                        str(seller), price_keys, "buy")
+            recorded += 1
+        return recorded
+
     def fetch_live_buy_order_keys(self, name: str, quality_name: str, particle_id=None,
                                    craftable=True, australium: bool = False, killstreak_tier=None):
         """

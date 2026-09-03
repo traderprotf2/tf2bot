@@ -56,6 +56,8 @@ HELP_TEXT = (
     "/priority, /addpriority Название, /removepriority Название — список "
     "приоритетных предметов (⭐ в алерте + живой запрос к backpack.tf, если "
     "в базе ещё нет buy order); Unusual и так всегда приоритетны\n"
+    "/setaccounts — настроить несколько аккаунтов backpack.tf для "
+    "проактивного сканирования Unusual (по одной паре ключ+токен на строку)\n"
     "/help — это сообщение"
 )
 
@@ -145,7 +147,21 @@ def build_main_menu(runtime):
         [{"text": "✨ Качества", "callback_data": "m:qual"},
          {"text": "📦 Категории", "callback_data": "m:cat"}],
         [{"text": "📈 Ликвидность", "callback_data": "m:liquidity"}],
+        [{"text": "🔑 Аккаунты backpack.tf", "callback_data": "m:accounts"}],
     ]
+    return text, keyboard
+
+
+def build_accounts_menu(runtime):
+    text = (
+        "🔑 <b>Аккаунты backpack.tf</b>\n\n"
+        "Чтобы настроить несколько аккаунтов для более быстрого сканирования "
+        "Unusual-предметов, отправь команду:\n\n"
+        "<code>/setaccounts\nключ1 токен1\nключ2 токен2\nключ3 токен3</code>\n\n"
+        "По одной паре api_key и token (через пробел или запятую) на строку - "
+        "основной аккаунт из конфига добавляется автоматически, его повторять не нужно."
+    )
+    keyboard = [[{"text": "⬅️ Назад", "callback_data": "m:main"}]]
     return text, keyboard
 
 
@@ -288,6 +304,8 @@ def handle_callback(data: str, runtime, error_entries=None):
         return build_discount_menu(runtime)
     if data == "m:liquidity":
         return build_liquidity_menu(runtime)
+    if data == "m:accounts":
+        return build_accounts_menu(runtime)
 
     if data == "t:pause":
         runtime.paused = not runtime.paused
@@ -472,6 +490,15 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
         )
 
     lines.append(f"\nИтого алертов: {total_alerts}")
+
+    scans = stats.get("proactive_unusual_scans", 0)
+    if scans:
+        recorded = stats.get("proactive_unusual_buy_orders_recorded", 0)
+        lines.append(
+            f"\n🔄 Проактивное сканирование Unusual: {scans} запрос(ов), "
+            f"{recorded} buy-заявок обновлено"
+        )
+
     return header + "\n".join(lines)
 
 
@@ -634,10 +661,13 @@ def handle_command(text: str, runtime, stats=None, stats_since=None,
     if command == "qualities":
         return (
             f"Сейчас отслеживаются: {', '.join(runtime.watched_qualities) or '(пусто)'}\n"
-            f"Доступные значения: {', '.join(VALID_QUALITIES)}"
+            f"+ Unusual — всегда включён, без переключения\n"
+            f"Доступные для переключения значения: {', '.join(VALID_QUALITIES)}"
         )
 
     if command == "addquality":
+        if arg.strip().lower() == "unusual":
+            return "Unusual и так всегда отслеживается, переключать не нужно."
         quality = _find_quality(arg)
         if not quality:
             return f"Не знаю качество {arg!r}. Доступные: {', '.join(VALID_QUALITIES)}"
@@ -648,6 +678,8 @@ def handle_command(text: str, runtime, stats=None, stats_since=None,
         return f"Добавил {quality}. Сейчас: {', '.join(runtime.watched_qualities)}"
 
     if command == "removequality":
+        if arg.strip().lower() == "unusual":
+            return "Unusual нельзя отключить - он отслеживается всегда, по дизайну."
         quality = _find_quality(arg)
         if not quality or quality not in runtime.watched_qualities:
             return f"{arg!r} и так не отслеживается. Сейчас: {', '.join(runtime.watched_qualities) or '(пусто)'}"

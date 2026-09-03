@@ -115,7 +115,19 @@ class Watcher:
         # common case) behaves exactly as before - this list just has
         # one entry in it.
         bptf_accounts = [{"api_key": cfg["backpacktf_api_key"], "token": cfg.get("backpacktf_token", "")}]
-        bptf_accounts.extend(cfg.get("backpacktf_accounts", []))
+        # Extra accounts set via /setaccounts (persisted to their own
+        # file - see _save_accounts/_load_accounts) take priority over
+        # whatever's in config.json, since they're the more recent,
+        # explicit choice; config.json's own backpacktf_accounts is the
+        # fallback for a fresh install that's never used /setaccounts.
+        saved_accounts = self._load_accounts()
+        bptf_accounts.extend(saved_accounts if saved_accounts is not None else cfg.get("backpacktf_accounts", []))
+        # Kept in sync with what actually ended up in the pool (the
+        # extras only, matching this key's own meaning elsewhere) - so
+        # proactive_buy_order_refresh_loop's own worker_count (computed
+        # from this same key) reflects accounts loaded from disk here,
+        # not just ones set via /setaccounts during THIS run.
+        cfg["backpacktf_accounts"] = bptf_accounts[1:]
         # At least one concurrent request slot per account, so N accounts
         # can genuinely have N requests in flight together rather than
         # being bottlenecked by a smaller concurrency cap sized for the
@@ -177,6 +189,24 @@ class Watcher:
         # listings) are a small, slowly-growing set relative to the
         # listing volume itself.
         self._name_to_identity_keys = collections.defaultdict(set)
+
+        # Base item name -> unix timestamp of the last proactive bulk
+        # Base item name -> {"ts": last-proactive-refresh unix
+        # timestamp (0.0 = never, sorts first), "category": this item's
+        # classify_category() result} - drives proactive_buy_order_
+        # refresh_loop below. category is stored so the loop can re-
+        # check, on every pick, whether this item's category is still
+        # currently watched (a category toggled off mid-run stops
+        # wasting requests immediately, not just at next discovery).
+        # Grown purely from observation (any Unusual-quality item seen
+        # via the websocket gets added here) rather than from Valve's
+        # schema - per explicit request: cover exactly what's actually
+        # being traded in practice, not a theoretical full item list.
+        # Not persisted across restarts deliberately - at the real event
+        # volume this project sees, the list rebuilds itself within
+        # minutes, and a fresh start (every item "never refreshed") is
+        # the same safe default as a genuinely first-ever run.
+        self._known_unusual_items = {}
 
         if not cfg.get("backpacktf_token"):
             log.warning(
@@ -293,6 +323,92 @@ class Watcher:
                 await asyncio.to_thread(self.bptf.local_listings.prune_expired)
             except Exception:
                 log.exception("Local listing store prune failed, will retry next cycle.")
+
+    # Floor between two proactive refreshes of the SAME item, regardless
+    # of how "stale" it looks relative to others - without this, a
+    # small known-items set (very possible early after startup, or with
+    # few categories watched) relative to worker count would have
+    # workers just hammering the same handful of items back-to-back with
+    # no real benefit, rather than correctly idling until a refresh is
+    # genuinely due. 30 minutes comfortably keeps every item far fresher
+    # than LocalListingStore's own multi-hour trust windows need.
+    PROACTIVE_MIN_REFRESH_INTERVAL_SECONDS = 1800
+
+    async def _proactive_unusual_refresh_worker(self, worker_id: int):
+        """
+        One worker of proactive_buy_order_refresh_loop below - see that
+        method's own docstring for the overall design. Each worker picks
+        the single stalest known Unusual item, claims it (bumps its
+        timestamp immediately, synchronously, before awaiting anything -
+        two workers can't race to pick the same item, since nothing else
+        runs on the event loop between the pick and the claim), then
+        spends its own time on the actual network request. With N
+        workers (matched to the number of configured accounts), N of
+        these requests are in flight at once, each naturally paced by
+        _AccountPool's own per-account throttle - no extra sleep needed
+        here, acquire() itself blocks the calling thread until an
+        account's turn comes up.
+        """
+        while True:
+            # Only consider items whose category is CURRENTLY watched
+            # (re-checked every pick, not just at discovery time - see
+            # class comment) AND that are actually due for a refresh
+            # (see PROACTIVE_MIN_REFRESH_INTERVAL_SECONDS above) - the
+            # second condition is what makes workers correctly idle,
+            # rather than uselessly re-hammering the same tiny set of
+            # items, whenever known items are fewer than workers.
+            now = time.time()
+            eligible = {
+                n: v for n, v in self._known_unusual_items.items()
+                if v["category"] in self.runtime.watched_categories
+                and now - v["ts"] >= self.PROACTIVE_MIN_REFRESH_INTERVAL_SECONDS
+            }
+            if not eligible:
+                await asyncio.sleep(5)
+                continue
+            item_name = min(eligible, key=lambda n: eligible[n]["ts"])
+            self._known_unusual_items[item_name]["ts"] = time.time()  # claimed immediately, before awaiting
+            try:
+                recorded = await asyncio.to_thread(
+                    self.bptf.fetch_and_record_all_unusual_buy_orders, item_name
+                )
+                self.stats["proactive_unusual_scans"] += 1
+                self.stats["proactive_unusual_buy_orders_recorded"] += recorded
+            except Exception:
+                log.exception("Proactive Unusual buy-order scan failed for %s (worker %d).",
+                               item_name, worker_id)
+
+    async def proactive_buy_order_refresh_loop(self):
+        """
+        Per explicit request: keep buy-order data for every Unusual item
+        this project has ever seen traded "perpetually fresh", rather
+        than only fetching one on demand when a matching sell listing
+        happens to arrive with nothing usable in the store yet (the
+        existing, narrower fetch_live_buy_order_keys path, still used as
+        a fallback for anything this hasn't gotten to yet).
+
+        One worker task per configured backpack.tf account (see
+        cfg["backpacktf_accounts"] - more accounts means more workers
+        means the full cycle through every known item completes faster,
+        by explicit, confirmed choice: backpack.tf has confirmed running
+        several accounts' worth of requests in parallel is fine - see
+        _AccountPool's own docstring). Each worker continuously refreshes
+        whichever known item has gone longest without a refresh - so
+        with enough accounts/workers, no single item's data is ever far
+        from the front of the queue for long, keeping the whole known-
+        item set close to "just refreshed" on a rolling basis rather
+        than in separate, synchronized batches.
+        """
+        # +1 for the primary account (backpacktf_api_key/token) -
+        # cfg["backpacktf_accounts"] holds only the EXTRA accounts (see
+        # __init__), matching that key's meaning everywhere else, but
+        # the primary account is also a real slot in the pool and can
+        # also do proactive-scan work.
+        worker_count = 1 + len(self.cfg.get("backpacktf_accounts") or [])
+        log.info("Starting %d proactive Unusual buy-order refresh worker(s).", worker_count)
+        await asyncio.gather(*(
+            self._proactive_unusual_refresh_worker(i) for i in range(worker_count)
+        ))
 
     async def local_store_snapshot_loop(self):
         """
@@ -529,6 +645,95 @@ class Watcher:
         except Exception:
             log.exception("Could not load alert cooldowns from disk - starting fresh.")
 
+    ACCOUNTS_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backpacktf_accounts_state.json")
+
+    def _save_accounts(self, accounts):
+        """
+        Persists cfg["backpacktf_accounts"] to its OWN dedicated file,
+        deliberately separate from runtime_state.json - these are live
+        API credentials, and keeping them in their own, narrowly-scoped
+        file limits the damage if that OTHER file is ever accidentally
+        committed to git again (a real, confirmed case this session -
+        see runtime_state.json's own history), rather than credentials
+        riding along with ordinary filter settings in the same blast
+        radius.
+        """
+        try:
+            tmp_path = f"{self.ACCOUNTS_STATE_PATH}.{os.getpid()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(accounts, f)
+            os.replace(tmp_path, self.ACCOUNTS_STATE_PATH)
+        except Exception:
+            log.exception("Could not save backpack.tf accounts to disk.")
+
+    def _load_accounts(self):
+        if not os.path.exists(self.ACCOUNTS_STATE_PATH):
+            return None
+        try:
+            with open(self.ACCOUNTS_STATE_PATH, "r", encoding="utf-8") as f:
+                accounts = json.load(f)
+            if isinstance(accounts, list) and accounts:
+                return accounts
+        except Exception:
+            log.exception("Could not load backpack.tf accounts from disk.")
+        return None
+
+    def _set_accounts(self, raw_text: str) -> str:
+        """
+        /setaccounts, followed by one "api_key token" pair per line (a
+        space OR a comma between the two) - per explicit request, a way
+        to configure the multi-account pool (see _AccountPool in
+        bptf_client.py) entirely from Telegram, no config.json editing
+        or restart needed. Reconfigures the pool immediately - the very
+        next proactive-scan worker pick (see proactive_buy_order_
+        refresh_loop) already runs with the new account count, since
+        worker_count itself is read from cfg["backpacktf_accounts"] at
+        the top of each loop's own next cycle... actually taking effect
+        requires this loop to be restarted, noted in the reply below.
+        """
+        lines = [ln.strip() for ln in raw_text.strip().splitlines() if ln.strip()]
+        if not lines:
+            return (
+                "Пришли по одной паре api_key и token на строку, например:\n"
+                "ключ1 токен1\nключ2 токен2\nключ3 токен3"
+            )
+        accounts = []
+        bad_lines = []
+        for i, line in enumerate(lines, start=1):
+            parts = line.replace(",", " ").split()
+            if len(parts) != 2:
+                bad_lines.append(i)
+                continue
+            accounts.append({"api_key": parts[0], "token": parts[1]})
+        if bad_lines:
+            return (
+                f"Не понял строку(и) {', '.join(map(str, bad_lines))} - в каждой должно быть "
+                f"ровно два значения (api_key и token), через пробел или запятую. Ничего не изменил."
+            )
+        self.cfg["backpacktf_accounts"] = accounts
+        # Primary account (backpacktf_api_key/token) is ALWAYS included
+        # alongside whatever /setaccounts adds - same as __init__ builds
+        # the pool at startup. Without this, the account this project
+        # was originally configured with would simply stop being used
+        # the moment /setaccounts is run - a real loss of throughput,
+        # not the intended gain, if the person doesn't think to re-paste
+        # their original credentials into the new list too.
+        primary = {"api_key": self.cfg["backpacktf_api_key"], "token": self.cfg.get("backpacktf_token", "")}
+        pool_accounts = [primary] + accounts
+        max_concurrent = max(self.cfg.get("bptf_max_concurrent_requests", 4), len(pool_accounts))
+        bptf_client.configure_request_pacing(
+            pool_accounts, max_concurrent, self.cfg.get("bptf_min_request_interval_seconds", 11.0),
+        )
+        self._save_accounts(accounts)
+        return (
+            f"Настроено дополнительных аккаунтов: {len(accounts)} (плюс основной - итого "
+            f"{len(pool_accounts)} в пуле). Пул запросов и лимит одновременных запросов "
+            f"обновлены сразу.\n"
+            f"Для проактивного сканирования Unusual (см. /stats) число воркеров тоже "
+            f"вырастет до {len(pool_accounts)}, но только после перезапуска службы - "
+            f"systemctl restart tf2-deal-watcher."
+        )
+
     def _check_item(self, name_query: str) -> str:
         """
         /checkitem <name> - shows exactly what the local store currently
@@ -552,7 +757,8 @@ class Watcher:
         lines = []
         for matched_name in sorted(matched_names)[:5]:
             for key in self._name_to_identity_keys[matched_name]:
-                _, quality_name, particle_id, paint_dec, craftable, spell, ks_tier, australium, texture = key
+                (_, quality_name, particle_id, paint_dec, craftable, spell, ks_tier, australium,
+                 texture, killstreaker, sheen) = key
                 bits = [quality_name]
                 if not craftable:
                     bits.append("Non-Craftable")
@@ -568,6 +774,10 @@ class Watcher:
                     bits.append(f"spell={spell}")
                 if texture:
                     bits.append(f"grade={texture}")
+                if killstreaker:
+                    bits.append(f"killstreaker={killstreaker}")
+                if sheen:
+                    bits.append(f"sheen={sheen}")
                 variant_desc = ", ".join(bits)
 
                 buy_price, buy_count = store.get_max_buy_price(key)
@@ -679,7 +889,11 @@ class Watcher:
         item = payload.get("item") or {}
         quality_obj = item.get("quality") or {}
         quality = quality_obj.get("name")
-        if quality not in self.runtime.watched_qualities:
+        # Unusual is unconditionally watched, per explicit request -
+        # never toggleable via /addquality-/removequality, unlike every
+        # other quality. Everything else still goes through the normal
+        # watched_qualities check.
+        if quality != "Unusual" and quality not in self.runtime.watched_qualities:
             self.stats["bptf_rejected_quality"] += 1
             return
 
@@ -983,6 +1197,20 @@ class Watcher:
             texture=texture, defindex=defindex, killstreaker=killstreaker, sheen=sheen,
         )
         self._name_to_identity_keys[name.lower()].add(identity_key)
+        # Same name-text check evaluate_listing's own excluded_types
+        # filter uses (matcher.py's item_type is never actually
+        # populated for backpack.tf, so that filter is name-text-only in
+        # practice too - see its own comment) - an Unusual item whose
+        # name matches an excluded type would never pass evaluate_listing
+        # anyway, so there's no point spending proactive-scan requests
+        # keeping its buy-order data fresh.
+        name_lower_for_exclusion = name.lower()
+        is_excluded_type = any(
+            excluded.lower() in name_lower_for_exclusion
+            for excluded in self.cfg.get("excluded_types", [])
+        )
+        if quality == "Unusual" and not is_excluded_type and name not in self._known_unusual_items:
+            self._known_unusual_items[name] = {"ts": 0.0, "category": category}
         self.bptf.local_listings.record(
             identity_key, str(listing_id), seller_steamid, price_keys, intent,
         )
@@ -1122,6 +1350,10 @@ class Watcher:
                 await self._run_telegram(self.telegram.send, errors_text, keyboard)
             elif command == "checkitem":
                 reply = self._check_item(text.split(maxsplit=1)[1] if " " in text else "")
+                await self._run_telegram(self.telegram.send, reply)
+            elif command == "setaccounts":
+                raw = text.split(maxsplit=1)[1] if " " in text or "\n" in text else ""
+                reply = self._set_accounts(raw)
                 await self._run_telegram(self.telegram.send, reply)
             else:
                 reply = telegram_commands.handle_command(
@@ -1285,6 +1517,7 @@ class Watcher:
             self.health_check_loop(),
             self.local_store_prune_loop(),
             self.local_store_snapshot_loop(),
+            self.proactive_buy_order_refresh_loop(),
             bptf_ws.stream_listing_events(self.handle_bptf_event),
         )
         shutdown_waiter = asyncio.create_task(shutdown_event.wait())

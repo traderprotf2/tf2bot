@@ -3,6 +3,7 @@ webhook_secret.txt
 runtime_state.json
 local_listings_state.json
 alert_cooldowns_state.json
+backpacktf_accounts_state.json
 error_log.jsonl
 __pycache__/
 *.pyc
