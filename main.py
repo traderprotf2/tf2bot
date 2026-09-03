@@ -69,6 +69,17 @@ def classify_category(name, slot=None):
     if "Killstreak" in name and (name.endswith("Kit") or name.endswith("Fabricator")):
         return "killstreak_kit"
 
+    # Unusualifiers are TOOLS (consumed to apply an Unusual effect to a
+    # taunt) - checked BEFORE the "Taunt: " check below, since their own
+    # name legitimately contains "Taunt: " (naming which taunt they
+    # apply to, e.g. "Taunt: The Box Trot Unusualifier"), which would
+    # otherwise misclassify them as an actual, performable taunt - a
+    # real, confirmed case: enabling only the "taunt" category started
+    # showing Unusualifier tools too, which isn't what "taunt" means to
+    # someone using that filter.
+    if name.endswith("Unusualifier"):
+        return "other"
+
     # Valve always names taunt items "Taunt: <Name>" - reliable regardless
     # of whether slot happens to be populated.
     if "Taunt: " in name:
@@ -675,6 +686,17 @@ class Watcher:
         name = item.get("name") or item.get("marketName") or item.get("baseName")
         if not name:
             return
+        # backpack.tf's own particle-name resolution occasionally fails
+        # for some effects, leaving a raw, unresolved internal token
+        # appended to the name instead of (or alongside) the real effect
+        # name - a real, confirmed case: "Sakura Smoke Bomb Blast Bowl
+        # (#Attrib_Particle288)". Stripped here, at the source, since an
+        # unreliable suffix like this (present for some events of the
+        # same effect, absent for others) risks the same kind of
+        # identity-key mismatch already fixed twice this session for
+        # similar name-text inconsistencies - not just an ugly display.
+        if " (#Attrib_Particle" in name and name.endswith(")"):
+            name = name[:name.index(" (#Attrib_Particle")]
 
         # Base item type's own numeric schema ID - confirmed real in
         # backpack.tf's payload (multiple third-party API docs: "item...
