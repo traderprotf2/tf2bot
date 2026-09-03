@@ -1021,7 +1021,7 @@ class BackpackTFPriceList:
         unrefreshed for hours before their own next real event.
         """
         try:
-            params = {"item": name, "quality": QUALITY_NAME_TO_ID.get("Unusual"), "intent": "buy"}
+            params = {"item": name, "appid": 440, "quality": QUALITY_NAME_TO_ID.get("Unusual"), "intent": "buy"}
             resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=10)
             resp.raise_for_status()
             data = resp.json()
@@ -1094,6 +1094,7 @@ class BackpackTFPriceList:
         try:
             params = {
                 "item": strip_variant_prefixes(name),
+                "appid": 440,
                 "quality": QUALITY_NAME_TO_ID.get(quality_name),
                 "intent": "buy",
                 "craftable": 1 if craftable else 0,
@@ -1198,6 +1199,7 @@ class BackpackTFPriceList:
             # "key" deliberately NOT set here - _get_with_retry injects
             # it per-request from whichever account the pool hands out.
             "item": name,
+            "appid": 440,
             "quality": quality_name,
             "craftable": 1 if craftable else 0,
             "tradable": 1,
