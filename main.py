@@ -568,10 +568,20 @@ class Watcher:
         links_block = ""
 
         priority_prefix = "⭐ ПРИОРИТЕТ (ликвидно/хайп) ⭐\n" if deal.get("is_priority") else ""
+        # display_name HTML-escaped defensively - not yet confirmed as
+        # the actual cause of any specific missed alert, but a real,
+        # concrete risk given this project has already seen backpack.tf's
+        # own "name" field contain unexpected raw internal tokens (the
+        # #Attrib_Particle artifact) - an unescaped "<"/"&" in some future
+        # such token would break Telegram's HTML parser and silently drop
+        # the WHOLE message, the same way an unescaped seller_note would
+        # (already fixed, see seller_note_line above).
+        import html
+        safe_display_name = html.escape(deal["display_name"])
         return (
             f"{priority_prefix}"
             f"🔥 <b>-{deal['discount_percent']:.0f}%</b> — {deal['source']}\n"
-            f"<b>{deal['display_name']}</b>{effect}{variant}"
+            f"<b>{safe_display_name}</b>{effect}{variant}"
             f"{special_block}\n"
             f"Цена в объявлении: <b>{deal['price_keys']:.2f} ключей</b>{usd}"
             f"{sell_reference_line}"
@@ -818,7 +828,6 @@ class Watcher:
             )
             self.stats["suppressed_item_cooldown"] += 1
             return
-        self.item_type_last_alerted[identity_key] = now
         # Surfaced in the alert itself (see format_alert's history_line) -
         # not just used internally for the cooldown above. Genuinely
         # "first time" only when this exact seller+item combo has never
@@ -836,7 +845,25 @@ class Watcher:
         )
         alert_text = self.format_alert(deal)
         keyboard = self._build_alert_keyboard(deal)
-        await self._run_telegram(self.telegram.send, alert_text, keyboard)
+        sent_message_id = await self._run_telegram(self.telegram.send, alert_text, keyboard)
+        if sent_message_id is not None:
+            # Cooldown recorded only on a CONFIRMED send - a real,
+            # serious bug fixed here: recording it unconditionally (as
+            # this used to do, right after the cooldown check above)
+            # meant a send that failed - e.g. Telegram rejecting
+            # malformed HTML in an unescaped seller note, see
+            # format_alert's own new escaping - still blocked every
+            # retry for this exact seller+item for the full cooldown
+            # window, even though the person never actually received
+            # anything. A failed send now leaves the door open for the
+            # very next matching event to try again immediately.
+            self.item_type_last_alerted[identity_key] = now
+        else:
+            log.warning(
+                "Telegram send failed for %s (%s, seller %s) - cooldown NOT recorded, "
+                "so the next matching event can retry.",
+                deal["display_name"], deal["source"], deal.get("seller_id"),
+            )
 
     # -- backpack.tf side ---------------------------------------------------
 
