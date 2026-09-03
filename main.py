@@ -190,23 +190,25 @@ class Watcher:
         # listing volume itself.
         self._name_to_identity_keys = collections.defaultdict(set)
 
-        # Base item name -> unix timestamp of the last proactive bulk
-        # Base item name -> {"ts": last-proactive-refresh unix
+        # (name, quality_name) -> {"ts": last-proactive-refresh unix
         # timestamp (0.0 = never, sorts first), "category": this item's
         # classify_category() result} - drives proactive_buy_order_
-        # refresh_loop below. category is stored so the loop can re-
-        # check, on every pick, whether this item's category is still
-        # currently watched (a category toggled off mid-run stops
-        # wasting requests immediately, not just at next discovery).
-        # Grown purely from observation (any Unusual-quality item seen
-        # via the websocket gets added here) rather than from Valve's
-        # schema - per explicit request: cover exactly what's actually
-        # being traded in practice, not a theoretical full item list.
-        # Not persisted across restarts deliberately - at the real event
-        # volume this project sees, the list rebuilds itself within
-        # minutes, and a fresh start (every item "never refreshed") is
-        # the same safe default as a genuinely first-ever run.
-        self._known_unusual_items = {}
+        # refresh_loop below. Covers every watched quality, not just
+        # Unusual.
+        #
+        # CAPPED at MAX_KNOWN_SCAN_ITEMS (LRU-evicted, see the population
+        # site in handle_bptf_event) - a real, serious bug this session:
+        # generalizing past Unusual-only meant this could grow to track
+        # every (name, quality) combination ever seen across every
+        # watched quality/category, unboundedly (nothing ever removed an
+        # entry) - on a small VPS, this grew large enough that the OOM
+        # killer terminated the whole process. Unusual alone stayed
+        # naturally small (TF2 only has so many Unusual-eligible items);
+        # generalizing without ALSO bounding the size was the mistake,
+        # not the generalization itself. Not persisted across restarts -
+        # rebuilds within minutes at the event volume this project sees.
+        self._known_scan_items = {}
+        self.MAX_KNOWN_SCAN_ITEMS = 2000
 
         if not cfg.get("backpacktf_token"):
             log.warning(
@@ -337,7 +339,7 @@ class Watcher:
     async def _proactive_unusual_refresh_worker(self, worker_id: int):
         """
         One worker of proactive_buy_order_refresh_loop below. Picks the
-        single stalest known Unusual item, claims it (bumps its
+        single stalest known (item, quality) pair, claims it (bumps its
         timestamp synchronously, before awaiting - no race between two
         workers picking the same item), then spends its own time on the
         network request. N workers means N requests in flight, each
@@ -352,32 +354,26 @@ class Watcher:
             # rather than uselessly re-hammering the same tiny set of
             # items, whenever known items are fewer than workers.
             now = time.time()
-            # No longer requires a known defindex - confirmed on
-            # backpack.tf's own forums that despite the earlier defindex;
-            # quality attempt, this endpoint's real "sku" param is just
-            # the item's plain name (see fetch_and_record_all_unusual_
-            # buy_orders' own docstring in bptf_client.py) - every known
-            # item is eligible again, not just ones a defindex happened
-            # to be captured for.
             eligible = {
-                n: v for n, v in self._known_unusual_items.items()
+                k: v for k, v in self._known_scan_items.items()
                 if v["category"] in self.runtime.watched_categories
                 and now - v["ts"] >= self.PROACTIVE_MIN_REFRESH_INTERVAL_SECONDS
             }
             if not eligible:
                 await asyncio.sleep(5)
                 continue
-            item_name = min(eligible, key=lambda n: eligible[n]["ts"])
-            self._known_unusual_items[item_name]["ts"] = time.time()  # claimed immediately, before awaiting
+            scan_key = min(eligible, key=lambda k: eligible[k]["ts"])
+            item_name, item_quality = scan_key
+            self._known_scan_items[scan_key]["ts"] = time.time()  # claimed immediately, before awaiting
             try:
                 recorded = await asyncio.to_thread(
-                    self.bptf.fetch_and_record_all_unusual_buy_orders, item_name
+                    self.bptf.fetch_and_record_all_buy_orders, item_name, item_quality
                 )
                 self.stats["proactive_unusual_scans"] += 1
                 self.stats["proactive_unusual_buy_orders_recorded"] += recorded
             except Exception:
-                log.exception("Proactive Unusual buy-order scan failed for %s (worker %d).",
-                               item_name, worker_id)
+                log.exception("Proactive buy-order scan failed for %s / %s (worker %d).",
+                               item_name, item_quality, worker_id)
 
     async def proactive_buy_order_refresh_loop(self):
         """
@@ -520,18 +516,6 @@ class Watcher:
         if deal.get("previous_low_keys") is not None:
             sell_reference_line = f"\nБыло: {deal['previous_low_keys']:.2f} ключей"
 
-        suggested_line = ""
-        if deal.get("suggested_keys") is not None:
-            date_part = ""
-            days_ago = deal.get("suggested_updated_days_ago")
-            if days_ago is not None:
-                import datetime
-                updated_date = (datetime.datetime.now() - datetime.timedelta(days=days_ago)).strftime("%d.%m.%Y")
-                date_part = f" — {updated_date}"
-            suggested_line = (
-                f"\n💬 Справочная цена (community): {deal['suggested_keys']:.2f} ключей{date_part}"
-            )
-
         buy_order_line = ""
         if deal.get("buy_order_keys") is not None:
             profit = deal.get("flip_profit_keys")
@@ -592,7 +576,6 @@ class Watcher:
             f"Цена в объявлении: <b>{deal['price_keys']:.2f} ключей</b>{usd}"
             f"{sell_reference_line}"
             f"{avg_line}"
-            f"{suggested_line}"
             f"{buy_order_line}"
             f"{stn_buy_line}"
             f"{liquidity_line}"
@@ -795,6 +778,20 @@ class Watcher:
         return header + "\n\n" + "\n\n".join(lines)
 
     async def send_deal(self, deal):
+        if "#attrib" in deal["display_name"].lower():
+            # Safety-net diagnostic: a real, repeated report that the
+            # #Attrib_Particle strip in handle_bptf_event still isn't
+            # catching every case, despite that fix testing correctly
+            # against every example string reported so far - meaning the
+            # REAL raw data must differ from what's been tested with in
+            # some way not yet seen. Logs the full deal dict (the
+            # closest thing to raw data available at this point) so the
+            # next occurrence is diagnosable from real production data
+            # instead of guessing at synthetic strings again.
+            log.warning(
+                "DIAGNOSTIC SAMPLE (display_name still contains an unstripped artifact "
+                "after clean_display_name) - full deal dict: %r", deal,
+            )
         # Per-SELLER cooldown: don't re-alert on the same item from the
         # SAME seller repeatedly (bumped/re-listed) within a short window
         # - but a DIFFERENT seller's listing of the same kind of item is a
@@ -1206,8 +1203,17 @@ class Watcher:
             excluded.lower() in name_lower_for_exclusion
             for excluded in self.cfg.get("excluded_types", [])
         )
-        if quality == "Unusual" and not is_excluded_type and name not in self._known_unusual_items:
-            self._known_unusual_items[name] = {"ts": 0.0, "category": category, "defindex": defindex}
+        is_currently_watched_quality = quality == "Unusual" or quality in self.runtime.watched_qualities
+        scan_key = (name, quality)
+        if is_currently_watched_quality and not is_excluded_type and scan_key not in self._known_scan_items:
+            # Hard cap, FIFO-evicted (oldest-inserted first - regular
+            # dicts keep insertion order) - see this dict's own comment
+            # in __init__ for why this cap exists at all: unbounded
+            # growth here already took down the whole process once.
+            if len(self._known_scan_items) >= self.MAX_KNOWN_SCAN_ITEMS:
+                oldest_key = next(iter(self._known_scan_items))
+                del self._known_scan_items[oldest_key]
+            self._known_scan_items[scan_key] = {"ts": 0.0, "category": category}
         self.bptf.local_listings.record(
             identity_key, str(listing_id), seller_steamid, price_keys, intent,
         )

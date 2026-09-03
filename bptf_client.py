@@ -884,7 +884,7 @@ class BackpackTFPriceList:
         self.local_listings = LocalListingStore()
         # Logs at most ONE raw sample of a bulk-scan entry that has no
         # resolvable particle_id, across this process's whole lifetime -
-        # see fetch_and_record_all_unusual_buy_orders' own diagnostic
+        # see fetch_and_record_all_buy_orders' own diagnostic
         # comment for why. One real sample is enough to check a field-
         # name assumption against; a warning on every one of potentially
         # thousands of scans would just spam the log for no extra value.
@@ -946,25 +946,6 @@ class BackpackTFPriceList:
             return value / self.key_price_metal
         # Unknown currency (rare, e.g. "usd" on special items) - skip.
         return None
-
-    def get_price_keys(self, name: str, quality_name: str, particle_id=None):
-        """
-        Returns the backpack.tf *community suggested* price for an item, in
-        keys, or None if we don't have pricing data for it. This is the
-        fallback reference used when a live snapshot isn't available (see
-        get_snapshot_min_other_keys below, which is preferred).
-        """
-        quality_id = QUALITY_NAME_TO_ID.get(quality_name)
-        if quality_id is None:
-            return None
-        entries = self.by_name_quality.get((name, quality_id, particle_id))
-        if not entries:
-            return None
-        keys_values = [v for v in (self._entry_to_keys(e) for e in entries) if v is not None]
-        if not keys_values:
-            return None
-        # Use the lowest reported value (conservative reference price).
-        return min(keys_values)
 
     # -- live listings (classifieds snapshot) ----------------------------
 
@@ -1039,15 +1020,21 @@ class BackpackTFPriceList:
                                     killstreaker=killstreaker, sheen=sheen)
         return self.local_listings.get_max_buy_price(key)
 
-    def fetch_and_record_all_unusual_buy_orders(self, name: str) -> int:
+    def fetch_and_record_all_buy_orders(self, name: str, quality_name: str) -> int:
         """
-        Bulk proactive scan: ONE snapshot API request for this base item
-        (Unusual, buy intent), covering EVERY particle effect at once -
-        not scoped to one effect, unlike fetch_live_buy_order_keys.
-        Records every listing directly into LocalListingStore, so a real
-        sell listing for any of these effects likely finds a fresh buy
-        order already waiting - no live-query wait needed. Returns how
-        many listings were recorded.
+        Bulk proactive scan: ONE snapshot API request for this item at
+        this quality (buy intent) - for Unusual, covers EVERY particle
+        effect at once; for any other quality, just that one quality's
+        buy orders (no particle dimension to split by). Not scoped to a
+        single effect the way fetch_live_buy_order_keys is. Records
+        every listing directly into LocalListingStore, so a real sell
+        listing later likely finds a fresh buy order already waiting -
+        no live-query wait needed. Returns how many listings recorded.
+
+        Covers every watched quality, not just Unusual - a real, direct
+        point: with fewer known items than worker accounts, idle workers
+        were sleeping instead of doing useful work, when they could
+        equally well keep other qualities' buy orders fresh too.
 
         Queries by "sku" - confirmed directly on backpack.tf's own
         forums (a trusted community member correcting another user's
@@ -1065,43 +1052,40 @@ class BackpackTFPriceList:
         hours before their own next real event.
         """
         try:
-            # "sku" here means backpack.tf's OWN term for it, confirmed
-            # directly on their forums by a trusted community member
-            # (Report Moderators role) after another user hit this exact
-            # same "'sku' param is required" error: it's the item's
-            # plain display NAME ("The Head Prize"), NOT the defindex;
-            # quality format the wider tf2-sku community standard uses -
-            # a real, confirmed correction to this project's own
-            # previous attempt, which sent defindex;quality and got back
-            # a bare acknowledgement with no listings at all, silently.
             params = {
                 "sku": strip_variant_prefixes(name), "appid": 440,
-                "quality": QUALITY_NAME_TO_ID.get("Unusual"), "intent": "buy",
+                "quality": QUALITY_NAME_TO_ID.get(quality_name), "intent": "buy",
             }
             resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=10)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
-            log.warning("Bulk Unusual buy-order scan failed for %s.", name)
+            log.warning("Bulk buy-order scan failed for %s (%s).", name, quality_name)
             return 0
 
         listings = data.get("listings")
         if not isinstance(listings, list):
             log.warning(
-                "Bulk scan response for %s had an unexpected shape - raw (truncated): %r",
-                name, str(data)[:500],
+                "Bulk scan response for %s (%s) had an unexpected shape - raw (truncated): %r",
+                name, quality_name, str(data)[:500],
             )
             return 0
 
         recorded = 0
         sample_logged = False
-        for entry in listings:
+        for i, entry in enumerate(listings):
             if not isinstance(entry, dict) or entry.get("intent") != "buy":
                 continue
             item = entry.get("item") or {}
             particle_obj = item.get("particle") or {}
             particle_id = particle_obj.get("id")
-            if particle_id is None:
+            # particle_id is only EXPECTED for Unusual - for every other
+            # quality, no particle is the normal case, not a reason to
+            # skip (a real, confirmed bug fixed while generalizing this
+            # past Unusual-only: the old unconditional "skip if no
+            # particle" check would have silently recorded nothing at
+            # all for every non-Unusual quality).
+            if quality_name == "Unusual" and particle_id is None:
                 if not sample_logged and not self._bulk_scan_sample_logged:
                     # Diagnostic sample - a real, confirmed case: the
                     # response CAN be a valid list (no "unexpected shape"
@@ -1117,11 +1101,16 @@ class BackpackTFPriceList:
                     )
                     sample_logged = True
                     self._bulk_scan_sample_logged = True
-                continue  # not actually the Unusual variant - skip rather than guess
+                continue
             price_keys = self.currencies_to_keys(entry.get("currencies") or {})
             if price_keys is None or price_keys <= 0:
                 continue
-            listing_id = entry.get("id") or entry.get("listing_id")
+            # Falls back to an index-based id (never just seller+particle,
+            # which - for any quality other than Unusual - would ALWAYS
+            # be seller+None, colliding between different real listings
+            # from the same seller within one response) only if the
+            # response entry itself has no id at all.
+            listing_id = entry.get("id") or entry.get("listing_id") or f"bulk-{i}"
             seller = ((entry.get("user") or {}).get("id")
                       or (entry.get("steamid")) or "unknown")
             # Derived from name text, NOT the raw item.craftable field -
@@ -1136,28 +1125,16 @@ class BackpackTFPriceList:
             craftable = not entry_name.startswith("Non-Craftable ")
             killstreaker_obj = item.get("killstreaker") or {}
             sheen_obj = item.get("sheen") or {}
-            # Actual quality from THIS entry, never hardcoded "Unusual" -
-            # a real, confirmed case: a "Strange Unusual" item (quality
-            # Strange, but still carrying a particle effect - a real TF2
-            # combination this project never accounted for before) was
-            # coming back from a quality=5-filtered query anyway, and
-            # blindly labeling every result "Unusual" pooled it with a
-            # genuinely different, quality=Unusual item sharing the same
-            # particle_id - wrong buy order matched to the wrong item.
-            entry_quality = ((item.get("quality") or {}).get("name")) or "Unusual"
-            # defindex was missing here entirely until now - a real,
-            # serious bug: main.py's real websocket path prefers
-            # defindex over name text for the identity key whenever it's
-            # available (see listing_identity_key's own docstring for
-            # why), but this bulk-scan path never extracted it, so a
-            # buy order recorded here for an item WITH a defindex ended
-            # up keyed by NAME instead - a completely different bucket
-            # from the one a real sell event for the exact same item
-            # would look up (keyed by defindex). The whole proactive
-            # scan's data was invisible to real evaluations for any item
-            # that has a defindex, which per this project's own research
-            # is most of them - the appid fix alone wasn't enough to
-            # make this feature actually work.
+            # Actual quality from THIS entry, defaulting to what was
+            # QUERIED (never hardcoded "Unusual") - a real, confirmed
+            # case: a "Strange Unusual" item (quality Strange, but still
+            # carrying a particle effect - a real TF2 combination this
+            # project never accounted for before) was coming back from a
+            # quality-filtered query anyway, and blindly labeling every
+            # result with the queried quality pooled it with a genuinely
+            # different item sharing the same particle_id - wrong buy
+            # order matched to the wrong item.
+            entry_quality = ((item.get("quality") or {}).get("name")) or quality_name
             defindex = item.get("defindex")
             key = listing_identity_key(
                 name, entry_quality, particle_id, None, craftable,
@@ -1165,8 +1142,7 @@ class BackpackTFPriceList:
                 killstreaker=killstreaker_obj.get("name"), sheen=sheen_obj.get("name"),
                 defindex=defindex,
             )
-            self.local_listings.record(key, str(listing_id or f"bulk-{seller}-{particle_id}"),
-                                        str(seller), price_keys, "buy")
+            self.local_listings.record(key, str(listing_id), str(seller), price_keys, "buy")
             recorded += 1
         return recorded
 

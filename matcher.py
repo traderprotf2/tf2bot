@@ -418,12 +418,6 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         # doesn't need a SECOND coincidental listing to compare against.
         ref_keys = None
 
-    # Community-suggested price - fetched here (before the buy order
-    # check below) so it can double as a sanity ceiling against buy-
-    # order manipulation, not just informational display later. Free -
-    # get_price_keys reads the already-loaded bulk price list.
-    suggested_keys = bptf.get_price_keys(lookup_name, listing.quality, listing.particle_id)
-
     buy_order_keys, buy_order_count = bptf.get_best_buy_order_keys(
         lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable,
         spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
@@ -460,28 +454,16 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         # "this item isn't discounted" - "nothing to compare against".
         return reject("no_live_buy_order")
 
-    # Sanity ceiling against buy-order manipulation: a real report showed
-    # scam/bulk-reseller sellers (seller notes literally advertising
-    # "Quicksell.store", "Over 10k items for sale") paired with an
-    # absurdly inflated buy order for the SAME cheap item (88 keys on a
-    # Non-Craftable Summer Hat normally worth well under 1) - enough
-    # buy-order listings (6, 22) to clear _filter_price_outliers' own
-    # 3-listing minimum, so a coordinated pattern across several fake
-    # listings isn't caught by outlier filtering alone (the "outliers"
-    # WERE the consensus). Rejecting a buy order that's wildly above what
-    # backpack.tf's own community suggests this item is worth catches
-    # this without reintroducing the community price as a PRIMARY
-    # reference (still never used to compute the discount itself, only
-    # to sanity-check the buy order) - permissive when no suggested price
-    # is available at all (nothing to check against), so this can't make
-    # genuinely rare/uncommon items harder to alert on than before.
-    if suggested_keys and suggested_keys > 0 and buy_order_keys > suggested_keys * 8:
-        log.warning(
-            "Buy order for %s (%.2f keys, %d listing(s)) is over 8x the community-suggested "
-            "price (%.2f keys) - treating as implausible/manipulated, not using it.",
-            lookup_name, buy_order_keys, buy_order_count, suggested_keys,
-        )
-        return reject("buy_order_implausible")
+    # Per explicit request: compare STRICTLY against the live buy order,
+    # nothing else - no sanity-check against backpack.tf's own community-
+    # suggested price. An earlier version of this function DID reject a
+    # buy order more than 8x the suggested price as "implausible" (a
+    # real, confirmed scam-listing pattern motivated that), but the
+    # suggested price itself can be stale/wrong for exactly the volatile,
+    # high-demand items this project cares most about catching - and per
+    # direct correction, a real, legitimate deal was rejected by this
+    # same check. Removed entirely rather than tuned, per explicit
+    # instruction: the buy order is the only reference that matters here.
 
     discount_percent = (buy_order_keys - listing.price_keys) / buy_order_keys * 100
     if discount_percent < cfg["discount_threshold_percent"]:
@@ -592,7 +574,6 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         "price_usd": listing.price_usd,
         "previous_low_keys": ref_keys,
         "average_keys": avg_keys,
-        "suggested_keys": suggested_keys,
         "suggested_updated_days_ago": days_since_update,
         "buy_order_keys": buy_order_keys,
         "buy_order_count": buy_order_count,
