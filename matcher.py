@@ -434,11 +434,19 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         # fetch_live_buy_order_keys' own docstring in bptf_client.py for
         # why. Same priority rule as the alert's own "⭐ ПРИОРИТЕТ" marker
         # further down (Unusual always, plus cfg["priority_item_names"]).
+        # Skipped when killstreaker/sheen are set - fetch_live_buy_order_keys
+        # can't reliably scope its query to one specific killstreaker/sheen
+        # combo (same unconfirmed-param-format reasoning that already
+        # removed these from build_classifieds_url), so querying live here
+        # risks pooling a rare, valuable combo's buy order into a totally
+        # different, cheaper combo's sell listing - a real, confirmed bug
+        # for the local-store path, fixed by adding them to the identity
+        # key there; the live path has no such key to add them to.
         name_lower = listing.name.lower()
         is_priority_for_live_query = listing.quality == "Unusual" or any(
             hype_name.lower() in name_lower for hype_name in cfg.get("priority_item_names", [])
         )
-        if is_priority_for_live_query:
+        if is_priority_for_live_query and not listing.killstreaker and not listing.sheen:
             buy_order_keys, buy_order_count = bptf.fetch_live_buy_order_keys(
                 lookup_name, listing.quality, listing.particle_id,
                 craftable=listing.craftable, australium=australium,

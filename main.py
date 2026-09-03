@@ -980,7 +980,7 @@ class Watcher:
         identity_key = bptf_client.listing_identity_key(
             name, quality, particle_id, paint_value_for_identity, bool(craftable),
             spells[0] if spells else None, killstreak_tier, name.startswith("Australium "),
-            texture=texture, defindex=defindex,
+            texture=texture, defindex=defindex, killstreaker=killstreaker, sheen=sheen,
         )
         self._name_to_identity_keys[name.lower()].add(identity_key)
         self.bptf.local_listings.record(

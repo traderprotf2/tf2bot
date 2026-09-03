@@ -830,7 +830,8 @@ class LocalListingStore:
 
 
 def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftable,
-                          spell, killstreak_tier, australium, texture=None, defindex=None):
+                          spell, killstreak_tier, australium, texture=None, defindex=None,
+                          killstreaker=None, sheen=None):
     """
     The exact tuple LocalListingStore keys entries by - every field is
     already extracted/validated from the raw websocket payload (see
@@ -852,12 +853,23 @@ def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftab
     two real, confirmed matching bugs this session. Falls back to the
     name-based key when defindex isn't available (e.g. a payload shape
     that doesn't include it) - never a hard requirement.
+
+    killstreaker/sheen (only meaningful on tier-3/tier-2+ Killstreak
+    weapons respectively) were missing from this tuple entirely until a
+    real, confirmed case: every distinct killstreaker/sheen combination
+    of the "same" weapon (same name/quality/killstreak_tier) was being
+    pooled into ONE bucket, since nothing here distinguished them - so a
+    buy order for a genuinely rare, high-value killstreaker (e.g.
+    Hypno-Beam) could get matched against a sell listing for a totally
+    different, much less valuable killstreaker on the same weapon,
+    producing a real, wrong, inflated "discount". Added as two more
+    required-to-match dimensions, same treatment as spell/paint/texture.
     """
     name_component = defindex if defindex is not None else strip_variant_prefixes(name)
     return (
         name_component, quality_name, particle_id, paint_decimal,
         bool(craftable), spell or None, killstreak_tier or 0, bool(australium),
-        texture or None,
+        texture or None, killstreaker or None, sheen or None,
     )
 
 
@@ -999,7 +1011,8 @@ class BackpackTFPriceList:
             paint_rgb_decimal(paint) if paint else None
         )
         key = listing_identity_key(name, quality_name, particle_id, paint_value, craftable,
-                                    spell, killstreak_tier, australium, texture=texture, defindex=defindex)
+                                    spell, killstreak_tier, australium, texture=texture, defindex=defindex,
+                                    killstreaker=killstreaker, sheen=sheen)
         return self.local_listings.get_min_sell_price(key, exclude_listing_id=exclude_listing_id)
 
     def get_best_buy_order_keys(self, name: str, quality_name: str, particle_id=None, craftable=True,
@@ -1018,7 +1031,8 @@ class BackpackTFPriceList:
             paint_rgb_decimal(paint) if paint else None
         )
         key = listing_identity_key(name, quality_name, particle_id, paint_value, craftable,
-                                    spell, killstreak_tier, australium, texture=texture, defindex=defindex)
+                                    spell, killstreak_tier, australium, texture=texture, defindex=defindex,
+                                    killstreaker=killstreaker, sheen=sheen)
         return self.local_listings.get_max_buy_price(key)
 
     def fetch_live_buy_order_keys(self, name: str, quality_name: str, particle_id=None,
@@ -1051,7 +1065,18 @@ class BackpackTFPriceList:
                 params["australium"] = 1
             if killstreak_tier:
                 params["killstreak_tier"] = killstreak_tier
-            resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=15)
+            # timeout kept short (5s, not the usual 15-20s elsewhere in
+            # this file) - a real, confirmed case: this call runs inside
+            # evaluate_listing, itself dispatched via asyncio.to_thread's
+            # small, SHARED default thread pool - a slow/hanging request
+            # here ties up one of that pool's few threads for the full
+            # duration, and enough of these piling up (Unusual items are
+            # unconditionally "priority", so this can fire often) was
+            # observed starving everything else sharing that same pool,
+            # including Telegram responsiveness. A live buy order that
+            # takes this long to answer isn't worth blocking a thread
+            # for anyway - the local-store value remains the fallback.
+            resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=5)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
