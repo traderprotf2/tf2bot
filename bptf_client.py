@@ -111,17 +111,12 @@ def configure_request_pacing(accounts, max_concurrent: int, min_interval_seconds
     _account_pool.reconfigure(accounts, min_interval_seconds)
 
 # On top of capping concurrency, backs off entirely once backpack.tf
-# actually returns 429 - concurrency limits alone don't prevent a burst
-# from tripping the limit again immediately. While active, every
-# snapshot/history request just returns "unavailable" (evaluate_listing
-# treats that as "can't evaluate this one right now", never falling back
-# to a less-reliable number).
-#
-# Adaptive, not a flat wait: getting rate-limited again shortly after a
-# previous cooldown ended means that wait wasn't long enough, so it
-# doubles (capped at 5 min) instead of repeating the same short wait
-# indefinitely - and resets to the base duration after a while without
-# hitting a 429 at all.
+# actually returns 429 - while active, snapshot/history requests just
+# return "unavailable" rather than falling back to a less-reliable
+# number. Adaptive, not a flat wait: getting rate-limited again shortly
+# after a cooldown ended means it wasn't long enough, so it doubles
+# (capped at 5 min) rather than repeating the same short wait forever -
+# and resets to the base duration after a while with no 429 at all.
 _RATE_LIMIT_BASE_COOLDOWN_SECONDS = 10
 _RATE_LIMIT_MAX_COOLDOWN_SECONDS = 300
 _RATE_LIMIT_RESET_AFTER_SECONDS = 300
@@ -251,20 +246,12 @@ PAINT_NAME_TO_RGB = {
     "Zepheniah's Greed": (66, 79, 59),
 }
 
-# The 7 team-coloured paints, as (RED, BLU) RGB pairs. Confirmed by a
-# Steam Community reference guide cross-checked against these same
-# names being independently attributed to a named contributor on
-# Valve's own wiki (Paint Can page: "colors and names for Operator's
-# Overalls, Waterlogged Lab Coat, Balaclavas Are Forever, An Air of
-# Debonair, The Value of Teamwork, and Cream Spirit were provided by
-# Mnemo"). A single PAINTED ITEM has ONE fixed colour, not a value that
-# changes with whichever team currently has it equipped (confirmed by a
-# real backpack.tf forum post: a user's own item "shows as only the red
-# team spirit and not both") - so trying both RED and BLU as separate
-# searches is safe, not a repeat of the earlier team-colour mistake:
-# querying with the WRONG one of the two just returns no matching
-# listings from backpack.tf's own filter (an empty, honest result), it
-# can't return the WRONG item's data the way an unfiltered search did.
+# The 7 team-coloured paints, as (RED, BLU) RGB pairs. A single PAINTED
+# ITEM has ONE fixed colour, not one that changes with whichever team
+# currently has it equipped (confirmed by a real forum post: a user's
+# own item "shows as only the red team spirit and not both") - so
+# trying both RED and BLU as separate searches is safe: querying with
+# the wrong one just returns an empty, honest result, never wrong data.
 TEAM_COLOR_PAINT_RGB = {
     "An Air of Debonair": {"RED": (101, 71, 64), "BLU": (40, 57, 77)},
     "Balaclavas Are Forever": {"RED": (59, 31, 35), "BLU": (24, 35, 61)},
@@ -452,26 +439,21 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
     """
     Link to backpack.tf's classifieds search, filtered to this exact
     item/quality/effect/spell - the closest thing to a permalink that
-    exists (backpack.tf has no single-listing permalink - confirmed both
-    by their API 404ing on that and by their own users being told a
-    tightly-filtered search is the closest alternative).
+    exists (backpack.tf has no single-listing permalink - confirmed by
+    their API 404ing on that).
 
     Domain is plain backpack.tf, not next.backpack.tf - the redesigned
-    site filters via an in-app modal, not URL query params, so a query
-    string there wouldn't filter anything.
+    site filters via an in-app modal, not URL params.
 
-    Params confirmed from a real, hand-verified working search:
-    "backpack.tf/classifieds?item=Ambassador&quality=11&spell=Exorcism
-    &australium=-1&killstreak_tier=0" - notably `australium`,
-    `killstreak_tier`, and `spell` are present even when NOT applicable
-    (-1, 0, "None" respectively) - omitting them doesn't tell the search
-    to exclude those variants, only including the explicit sentinel does.
-    `craftable` is added only when the item is uncraftable (mirrors the
-    SKU convention). `killstreaker`/`sheen` are deliberately NOT sent -
-    see the comment right before those params are skipped, below.
+    Confirmed from a real, working search: "...?item=Ambassador&quality=11
+    &spell=Exorcism&australium=-1&killstreak_tier=0" - `australium`,
+    `killstreak_tier`, `spell` are present even when NOT applicable (-1,
+    0, "None"), since omitting doesn't exclude those variants, only the
+    explicit sentinel does. `craftable` added only when uncraftable.
+    `killstreaker`/`sheen` deliberately NOT sent - see below.
 
-    `name` can be passed with or without Killstreak/Australium prefixes
-    still attached - strip_variant_prefixes() is applied internally.
+    `name` can include Killstreak/Australium prefixes - stripped
+    internally.
     """
     from urllib.parse import urlencode
 
@@ -834,36 +816,23 @@ def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftab
                           killstreaker=None, sheen=None):
     """
     The exact tuple LocalListingStore keys entries by - every field is
-    already extracted/validated from the raw websocket payload (see
-    main.py's handle_bptf_event), so two listings only share a bucket
-    when genuinely identical in every tracked dimension.
+    already extracted/validated from the raw websocket payload, so two
+    listings only share a bucket when genuinely identical in every
+    tracked dimension.
 
-    texture is a cosmetic/weapon "grade" (Civilian..Elite, introduced in
-    the Gun Mettle Update) - a separate, intrinsic sub-quality from the
-    normal 9-colour quality system, with real value differences on
-    otherwise-identical-looking items. Can NOT be read off the item's
-    display name (backpack.tf's own forums document items whose name
-    text contains a different grade's word than their real one) - must
-    come from the structured texture field.
+    texture is a cosmetic/weapon "grade" (Civilian..Elite) - a separate
+    sub-quality with real value differences. Can NOT be read from the
+    item's display name (some real items' names contain a different
+    grade's word than their true one) - must come from the field.
 
-    defindex (the base item type's own numeric schema id) is preferred
-    over the name-text-based strip_variant_prefixes() below, when the
-    caller has one - a stable, numeric id sidesteps name-text fragility
-    (prefix-stripping edge cases, casing/phrasing variation) that caused
-    two real, confirmed matching bugs this session. Falls back to the
-    name-based key when defindex isn't available (e.g. a payload shape
-    that doesn't include it) - never a hard requirement.
+    defindex (numeric schema id) is preferred over name-text matching
+    when available - sidesteps name-text fragility (prefix-stripping,
+    casing) that caused two confirmed matching bugs. Falls back to the
+    name-based key otherwise.
 
-    killstreaker/sheen (only meaningful on tier-3/tier-2+ Killstreak
-    weapons respectively) were missing from this tuple entirely until a
-    real, confirmed case: every distinct killstreaker/sheen combination
-    of the "same" weapon (same name/quality/killstreak_tier) was being
-    pooled into ONE bucket, since nothing here distinguished them - so a
-    buy order for a genuinely rare, high-value killstreaker (e.g.
-    Hypno-Beam) could get matched against a sell listing for a totally
-    different, much less valuable killstreaker on the same weapon,
-    producing a real, wrong, inflated "discount". Added as two more
-    required-to-match dimensions, same treatment as spell/paint/texture.
+    killstreaker/sheen: without these, every combo of the "same" weapon
+    pooled into one bucket, letting a rare, valuable killstreaker's buy
+    order match a cheap combo's sell listing - a real, confirmed bug.
     """
     name_component = defindex if defindex is not None else strip_variant_prefixes(name)
     return (
@@ -1038,21 +1007,18 @@ class BackpackTFPriceList:
     def fetch_and_record_all_unusual_buy_orders(self, name: str) -> int:
         """
         Bulk proactive scan: ONE snapshot API request for this base item
-        (Unusual quality, buy intent), covering EVERY particle effect at
-        once - not scoped to a single effect, unlike fetch_live_buy_
-        order_keys above. Records every listing found directly into
-        LocalListingStore, so by the time a real sell listing for any of
-        these effects arrives via the websocket, a fresh buy order is
-        very likely already sitting in the store - no live-query wait
-        needed at that moment. Returns how many listings were recorded.
+        (Unusual, buy intent), covering EVERY particle effect at once -
+        not scoped to one effect, unlike fetch_live_buy_order_keys.
+        Records every listing directly into LocalListingStore, so a real
+        sell listing for any of these effects likely finds a fresh buy
+        order already waiting - no live-query wait needed. Returns how
+        many listings were recorded.
 
-        Deliberately simpler extraction than handle_bptf_event's careful,
-        edge-case-covered version in main.py (particle name resolution,
-        the "#Attrib_Particle" strip, defindex, texture) - this is a
-        supplementary cache-warming pass, not the final decision path.
-        Anything this gets slightly wrong for some edge case is
-        overwritten the moment a real websocket event for that same
-        listing arrives, which already goes through the careful path.
+        Missing texture/defindex (unlike handle_bptf_event's fuller
+        extraction) - a supplementary cache-warming pass, not the final
+        decision path. craftable/killstreaker/sheen ARE derived the same
+        careful way as the main path, since buy orders here can sit
+        unrefreshed for hours before their own next real event.
         """
         try:
             params = {"item": name, "quality": QUALITY_NAME_TO_ID.get("Unusual"), "intent": "buy"}

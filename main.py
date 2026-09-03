@@ -336,18 +336,12 @@ class Watcher:
 
     async def _proactive_unusual_refresh_worker(self, worker_id: int):
         """
-        One worker of proactive_buy_order_refresh_loop below - see that
-        method's own docstring for the overall design. Each worker picks
-        the single stalest known Unusual item, claims it (bumps its
-        timestamp immediately, synchronously, before awaiting anything -
-        two workers can't race to pick the same item, since nothing else
-        runs on the event loop between the pick and the claim), then
-        spends its own time on the actual network request. With N
-        workers (matched to the number of configured accounts), N of
-        these requests are in flight at once, each naturally paced by
-        _AccountPool's own per-account throttle - no extra sleep needed
-        here, acquire() itself blocks the calling thread until an
-        account's turn comes up.
+        One worker of proactive_buy_order_refresh_loop below. Picks the
+        single stalest known Unusual item, claims it (bumps its
+        timestamp synchronously, before awaiting - no race between two
+        workers picking the same item), then spends its own time on the
+        network request. N workers means N requests in flight, each
+        paced by _AccountPool's own per-account throttle.
         """
         while True:
             # Only consider items whose category is CURRENTLY watched
@@ -380,24 +374,16 @@ class Watcher:
 
     async def proactive_buy_order_refresh_loop(self):
         """
-        Per explicit request: keep buy-order data for every Unusual item
-        this project has ever seen traded "perpetually fresh", rather
-        than only fetching one on demand when a matching sell listing
-        happens to arrive with nothing usable in the store yet (the
-        existing, narrower fetch_live_buy_order_keys path, still used as
-        a fallback for anything this hasn't gotten to yet).
+        Keeps buy-order data for every Unusual item this project has
+        seen traded "perpetually fresh", rather than only fetching one
+        on demand when a matching sell listing arrives (still the
+        fallback for anything this hasn't gotten to yet - see fetch_
+        live_buy_order_keys).
 
-        One worker task per configured backpack.tf account (see
-        cfg["backpacktf_accounts"] - more accounts means more workers
-        means the full cycle through every known item completes faster,
-        by explicit, confirmed choice: backpack.tf has confirmed running
-        several accounts' worth of requests in parallel is fine - see
-        _AccountPool's own docstring). Each worker continuously refreshes
-        whichever known item has gone longest without a refresh - so
-        with enough accounts/workers, no single item's data is ever far
-        from the front of the queue for long, keeping the whole known-
-        item set close to "just refreshed" on a rolling basis rather
-        than in separate, synchronized batches.
+        One worker per configured account (more accounts = more workers
+        = faster full-cycle time - backpack.tf confirmed running several
+        accounts in parallel is fine, see _AccountPool). Each worker
+        refreshes whichever known item has gone longest without one.
         """
         # +1 for the primary account (backpacktf_api_key/token) -
         # cfg["backpacktf_accounts"] holds only the EXTRA accounts (see
@@ -680,16 +666,12 @@ class Watcher:
 
     def _set_accounts(self, raw_text: str) -> str:
         """
-        /setaccounts, followed by one "api_key token" pair per line (a
-        space OR a comma between the two) - per explicit request, a way
-        to configure the multi-account pool (see _AccountPool in
-        bptf_client.py) entirely from Telegram, no config.json editing
-        or restart needed. Reconfigures the pool immediately - the very
-        next proactive-scan worker pick (see proactive_buy_order_
-        refresh_loop) already runs with the new account count, since
-        worker_count itself is read from cfg["backpacktf_accounts"] at
-        the top of each loop's own next cycle... actually taking effect
-        requires this loop to be restarted, noted in the reply below.
+        /setaccounts, followed by one "api_key token" pair per line
+        (space or comma between the two) - configures the multi-account
+        pool (see _AccountPool) from Telegram, no config.json editing.
+        The account pool itself updates immediately; the proactive
+        scanner's worker COUNT only grows after a restart (noted in the
+        reply below).
         """
         lines = [ln.strip() for ln in raw_text.strip().splitlines() if ln.strip()]
         if not lines:
