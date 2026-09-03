@@ -50,6 +50,17 @@ class TelegramErrorBuffer(logging.Handler):
         self._lock = threading.Lock()
         self._trim_lock = threading.Lock()
         self._writes_since_trim = 0
+        # Monotonic, never-trimmed count of every WARNING+ ever emitted -
+        # separate from self.buffer (bounded to MAX_ERRORS_KEPT for
+        # display). A real, confirmed bug: health_check_loop measured
+        # "how many new errors since last check" as len(recent()) minus
+        # a previous count, but recent() is capped at 100 - if MORE than
+        # 100 new errors land between two checks (exactly what a
+        # tight, repeating warning loop does), that delta can read as
+        # zero or even negative, silently hiding the exact kind of
+        # flood this check exists to catch. This counter has no cap, so
+        # the delta is always accurate regardless of volume.
+        self.total_emitted = 0
         self._load_from_disk()
 
     def _load_from_disk(self):
@@ -82,6 +93,7 @@ class TelegramErrorBuffer(logging.Handler):
             }
             with self._lock:
                 self.buffer.append(entry)
+                self.total_emitted += 1
             # Disk write happens OUTSIDE the lock - a real report showed
             # /errors (recent() below, which needs this same lock) never
             # responding across several attempts during a run generating

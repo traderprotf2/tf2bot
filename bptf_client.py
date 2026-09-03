@@ -35,6 +35,14 @@ log = logging.getLogger("bptf")
 MAX_CONCURRENT_REQUESTS = 4
 _request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
 
+# Per-account 429 cooldown, adaptive: doubles on a hit shortly after the
+# last one (capped at 5 min), resets to base after a quiet while - see
+# _AccountPool.note_rate_limited below, which uses these per account,
+# not globally.
+_RATE_LIMIT_BASE_COOLDOWN_SECONDS = 10
+_RATE_LIMIT_MAX_COOLDOWN_SECONDS = 300
+_RATE_LIMIT_RESET_AFTER_SECONDS = 300
+
 
 class _AccountPool:
     """
@@ -64,6 +72,19 @@ class _AccountPool:
         self._accounts = list(accounts)
         self._min_interval = min_interval_seconds
         self._last_used_at = [0.0] * len(self._accounts)
+        # Per-account cooldown-until timestamp and current cooldown
+        # duration - a real, confirmed architectural bug: rate-limit
+        # cooldown used to be ONE global flag shared by every account,
+        # so a single account getting 429'd paused ALL of them at once,
+        # completely defeating the purpose of having several - the
+        # aggregate throughput a multi-account pool exists to provide
+        # never actually materialized, since any one account tripping
+        # its own limit (likely, with several workers hammering
+        # concurrently) stalled the whole pool regardless of how much
+        # headroom the other accounts still had.
+        self._cooldown_until = [0.0] * len(self._accounts)
+        self._cooldown_seconds = [_RATE_LIMIT_BASE_COOLDOWN_SECONDS] * len(self._accounts)
+        self._last_hit_at = [0.0] * len(self._accounts)
         self._lock = threading.Lock()
 
     def reconfigure(self, accounts, min_interval_seconds):
@@ -71,20 +92,62 @@ class _AccountPool:
             self._accounts = list(accounts)
             self._min_interval = min_interval_seconds
             self._last_used_at = [0.0] * len(self._accounts)
+            self._cooldown_until = [0.0] * len(self._accounts)
+            self._cooldown_seconds = [_RATE_LIMIT_BASE_COOLDOWN_SECONDS] * len(self._accounts)
+            self._last_hit_at = [0.0] * len(self._accounts)
 
     def acquire(self):
-        """Blocks (in the calling thread) until some account's turn
-        comes up, then returns that account's (api_key, token)."""
+        """
+        Blocks (in the calling thread) until some account's turn comes
+        up, then returns (index, api_key, token) - the index is needed
+        so a later 429 for this specific request can be reported back
+        against the right account only (see note_rate_limited below),
+        not the whole pool.
+        """
         while True:
             with self._lock:
                 now = time.time()
-                best_idx = min(range(len(self._accounts)), key=lambda i: self._last_used_at[i])
-                wait = self._last_used_at[best_idx] + self._min_interval - now
+                eligible = [i for i in range(len(self._accounts)) if self._cooldown_until[i] <= now]
+                # If literally every account is on cooldown, fall back to
+                # picking among all of them anyway (rather than blocking
+                # forever) - whichever clears first will actually be
+                # usable the moment its own wait below elapses.
+                pool = eligible or list(range(len(self._accounts)))
+                best_idx = min(pool, key=lambda i: self._last_used_at[i])
+                wait = max(
+                    self._last_used_at[best_idx] + self._min_interval - now,
+                    self._cooldown_until[best_idx] - now,
+                )
                 if wait <= 0:
                     self._last_used_at[best_idx] = now
                     account = self._accounts[best_idx]
-                    return account["api_key"], account["token"]
-            time.sleep(wait)
+                    return best_idx, account["api_key"], account["token"]
+            time.sleep(max(wait, 0.05))
+
+    def note_rate_limited(self, index):
+        """Per-account version of the old global _note_rate_limited -
+        same adaptive backoff (doubles on a hit shortly after the last
+        one, resets to base after a quiet while), scoped to just this
+        one account's own cooldown clock."""
+        with self._lock:
+            now = time.time()
+            if now - self._last_hit_at[index] > _RATE_LIMIT_RESET_AFTER_SECONDS:
+                self._cooldown_seconds[index] = _RATE_LIMIT_BASE_COOLDOWN_SECONDS
+            else:
+                self._cooldown_seconds[index] = min(
+                    self._cooldown_seconds[index] * 2, _RATE_LIMIT_MAX_COOLDOWN_SECONDS
+                )
+            self._last_hit_at[index] = now
+            self._cooldown_until[index] = now + self._cooldown_seconds[index]
+
+    def any_account_available(self):
+        """Whether at least one account is NOT currently on cooldown -
+        used for /stats' "currently rate limited" display, which now
+        means "every account is cooling down" rather than the old
+        single global flag."""
+        with self._lock:
+            now = time.time()
+            return any(self._cooldown_until[i] <= now for i in range(len(self._accounts)))
 
 
 # Populated by configure_request_pacing at startup (see main.py) with
@@ -110,77 +173,42 @@ def configure_request_pacing(accounts, max_concurrent: int, min_interval_seconds
     _request_semaphore = threading.Semaphore(max_concurrent)
     _account_pool.reconfigure(accounts, min_interval_seconds)
 
-# On top of capping concurrency, backs off entirely once backpack.tf
-# actually returns 429 - while active, snapshot/history requests just
-# return "unavailable" rather than falling back to a less-reliable
-# number. Adaptive, not a flat wait: getting rate-limited again shortly
-# after a cooldown ended means it wasn't long enough, so it doubles
-# (capped at 5 min) rather than repeating the same short wait forever -
-# and resets to the base duration after a while with no 429 at all.
-_RATE_LIMIT_BASE_COOLDOWN_SECONDS = 10
-_RATE_LIMIT_MAX_COOLDOWN_SECONDS = 300
-_RATE_LIMIT_RESET_AFTER_SECONDS = 300
-_rate_limited_until_lock = threading.Lock()
-_rate_limited_until = 0.0
-_current_cooldown_seconds = _RATE_LIMIT_BASE_COOLDOWN_SECONDS
-_last_rate_limit_hit = 0.0
-
-
-def _note_rate_limited():
-    global _rate_limited_until, _current_cooldown_seconds, _last_rate_limit_hit
-    with _rate_limited_until_lock:
-        now = time.time()
-        if now - _last_rate_limit_hit > _RATE_LIMIT_RESET_AFTER_SECONDS:
-            _current_cooldown_seconds = _RATE_LIMIT_BASE_COOLDOWN_SECONDS
-        else:
-            _current_cooldown_seconds = min(
-                _current_cooldown_seconds * 2, _RATE_LIMIT_MAX_COOLDOWN_SECONDS
-            )
-        _last_rate_limit_hit = now
-        _rate_limited_until = now + _current_cooldown_seconds
-        log.warning(
-            "backpack.tf rate limit (429) hit - backing off for %ds this time (adaptive).",
-            _current_cooldown_seconds,
-        )
-
-
-def _currently_rate_limited():
-    with _rate_limited_until_lock:
-        return time.time() < _rate_limited_until
-
 
 def is_rate_limited() -> bool:
-    """Whether backpack.tf's snapshot/history endpoints are in the
-    post-429 cooldown (see _note_rate_limited above). Used for /stats'
-    "currently throttled" display."""
-    return _currently_rate_limited()
+    """Whether EVERY configured account is currently in its post-429
+    cooldown (see _AccountPool.note_rate_limited) - used for /stats'
+    "currently throttled" display. With multiple accounts, one account
+    cooling down no longer counts as "rate limited" here, since the
+    others can still serve requests."""
+    return not _account_pool.any_account_available()
 
 
 def _get_with_retry(session, url, params, timeout=20):
     """
     Shared GET for the two backpack.tf endpoints that scale with
-    evaluation volume (snapshot + price-history). Tracks 429s into the
-    shared cooldown above. Retries once, after a short pause, on a 5xx
-    (backpack.tf's own infra briefly overloaded - usually momentary).
+    evaluation volume (snapshot + price-history). Tracks a 429 against
+    the SPECIFIC account that got it (see _AccountPool.note_rate_limited)
+    - not every other account in the pool. Retries once, after a short
+    pause, on a 5xx (backpack.tf's own infra briefly overloaded).
 
     `params` should NOT include "key"/"token" - _AccountPool.acquire()
     picks which account's credentials to use for this specific request,
     so a retry after a 5xx goes through the pool fresh too.
     """
-    api_key, token = _account_pool.acquire()
+    idx, api_key, token = _account_pool.acquire()
     request_params = dict(params, key=api_key, token=token)
     with _request_semaphore:
         resp = session.get(url, params=request_params, timeout=timeout)
     if resp.status_code == 429:
-        _note_rate_limited()
+        _account_pool.note_rate_limited(idx)
     elif resp.status_code >= 500:
         time.sleep(1.5)
-        api_key, token = _account_pool.acquire()
+        idx, api_key, token = _account_pool.acquire()
         request_params = dict(params, key=api_key, token=token)
         with _request_semaphore:
             resp = session.get(url, params=request_params, timeout=timeout)
         if resp.status_code == 429:
-            _note_rate_limited()
+            _account_pool.note_rate_limited(idx)
     return resp
 
 QUALITY_NAME_TO_ID = {
@@ -1064,8 +1092,17 @@ class BackpackTFPriceList:
             craftable = not entry_name.startswith("Non-Craftable ")
             killstreaker_obj = item.get("killstreaker") or {}
             sheen_obj = item.get("sheen") or {}
+            # Actual quality from THIS entry, never hardcoded "Unusual" -
+            # a real, confirmed case: a "Strange Unusual" item (quality
+            # Strange, but still carrying a particle effect - a real TF2
+            # combination this project never accounted for before) was
+            # coming back from a quality=5-filtered query anyway, and
+            # blindly labeling every result "Unusual" pooled it with a
+            # genuinely different, quality=Unusual item sharing the same
+            # particle_id - wrong buy order matched to the wrong item.
+            entry_quality = ((item.get("quality") or {}).get("name")) or "Unusual"
             key = listing_identity_key(
-                name, "Unusual", particle_id, None, craftable,
+                name, entry_quality, particle_id, None, craftable,
                 None, item.get("killstreakTier") or 0, name.startswith("Australium "),
                 killstreaker=killstreaker_obj.get("name"), sheen=sheen_obj.get("name"),
             )
@@ -1142,6 +1179,14 @@ class BackpackTFPriceList:
         for entry in listings:
             if not isinstance(entry, dict) or entry.get("intent") != "buy":
                 continue
+            # Quality must match what was actually requested - a real,
+            # confirmed case: a "Strange Unusual" item (Strange quality,
+            # but still carrying a particle effect) came back from a
+            # quality-filtered query anyway, which would have silently
+            # let a different item's price into this max() otherwise.
+            entry_quality = ((entry.get("item") or {}).get("quality") or {}).get("name")
+            if entry_quality and entry_quality != quality_name:
+                continue
             price_keys = self.currencies_to_keys(entry.get("currencies") or {})
             if price_keys is not None and price_keys > 0:
                 prices.append(price_keys)
@@ -1192,7 +1237,7 @@ class BackpackTFPriceList:
         now = time.time()
         if cached and (now - cached[0]) < self.snapshot_cache_seconds:
             return cached[1]
-        if _currently_rate_limited():
+        if is_rate_limited():
             return None
 
         params = {

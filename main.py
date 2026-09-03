@@ -432,17 +432,17 @@ class Watcher:
         Pausing keeps monitoring alive in the background and is fully
         reversible with /resume once /errors has been checked.
         """
-        last_error_count = len(_error_buffer.recent(1000))
+        last_error_count = _error_buffer.total_emitted
         interval_seconds = self.cfg.get("health_check_interval_minutes", 180) * 60
         threshold = self.cfg.get("health_check_error_threshold", 5)
         auto_pause = self.cfg.get("health_check_auto_pause", True)
         while True:
             await asyncio.sleep(interval_seconds)
             try:
-                current_errors = _error_buffer.recent(1000)
-                new_error_count = len(current_errors) - last_error_count
+                new_error_count = _error_buffer.total_emitted - last_error_count
                 if new_error_count >= threshold:
-                    recent_messages = [e["message"][:150] for e in current_errors[-new_error_count:]]
+                    current_errors = _error_buffer.recent(1000)
+                    recent_messages = [e["message"][:150] for e in current_errors]
                     summary = "\n".join(f"• {m}" for m in recent_messages[-5:])
                     pause_note = ""
                     if auto_pause and not self.runtime.paused:
@@ -459,7 +459,7 @@ class Watcher:
                         f"{new_error_count} предупреждений/ошибок</b>.\n\nПоследние:\n{summary}"
                         f"{pause_note}",
                     )
-                last_error_count = len(current_errors)
+                last_error_count = _error_buffer.total_emitted
             except Exception:
                 log.exception("Health check loop itself failed - continuing anyway.")
     def _build_alert_keyboard(self, deal: dict):
@@ -891,8 +891,16 @@ class Watcher:
         # same effect, absent for others) risks the same kind of
         # identity-key mismatch already fixed twice this session for
         # similar name-text inconsistencies - not just an ugly display.
-        if " (#Attrib_Particle" in name and name.endswith(")"):
-            name = name[:name.index(" (#Attrib_Particle")]
+        #
+        # Matches "#Attrib_Particle" ANYWHERE in the string, not a fixed
+        # " (#Attrib_Particle" substring - a real, confirmed case: this
+        # project has already hit backpack.tf using non-ASCII whitespace
+        # in other text fields (seller notes), so requiring an exact
+        # regular space before the marker risked silently not matching
+        # at all if the same thing happens here. Trims any leftover
+        # whitespace/punctuation right before the marker too.
+        if "#Attrib_Particle" in name:
+            name = name.split("#Attrib_Particle")[0].rstrip("(").rstrip()
 
         # Base item type's own numeric schema ID - confirmed real in
         # backpack.tf's payload (multiple third-party API docs: "item...
