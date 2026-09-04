@@ -45,16 +45,15 @@ if [ ! -f config.json ]; then
     read -rp "mannco.store API key: " MANNCO_KEY
     read -rp "Telegram bot token: " TG_TOKEN
     read -rp "Telegram chat id: " TG_CHAT_ID
-    read -rp "Steam Web API key (необязательно, Enter чтобы пропустить): " STEAM_KEY
     read -rp "Минимальная цена предмета в ключах [5]: " MIN_KEYS
     MIN_KEYS="${MIN_KEYS:-5}"
     read -rp "Минимальная скидка от цены backpack.tf в % [5]: " DISCOUNT
     DISCOUNT="${DISCOUNT:-5}"
 
-    python3 - "$BACKPACKTF_KEY" "$BACKPACKTF_TOKEN" "$MANNCO_KEY" "$TG_TOKEN" "$TG_CHAT_ID" "$STEAM_KEY" "$MIN_KEYS" "$DISCOUNT" <<'PYEOF'
+    python3 - "$BACKPACKTF_KEY" "$BACKPACKTF_TOKEN" "$MANNCO_KEY" "$TG_TOKEN" "$TG_CHAT_ID" "$MIN_KEYS" "$DISCOUNT" <<'PYEOF'
 import json, sys
 
-backpacktf_key, backpacktf_token, mannco_key, tg_token, tg_chat_id, steam_key, min_keys, discount = sys.argv[1:9]
+backpacktf_key, backpacktf_token, mannco_key, tg_token, tg_chat_id, min_keys, discount = sys.argv[1:8]
 
 with open("config.example.json", "r", encoding="utf-8") as f:
     cfg = json.load(f)
@@ -64,7 +63,6 @@ cfg["backpacktf_token"] = backpacktf_token
 cfg["mannco_api_key"] = mannco_key
 cfg["telegram_bot_token"] = tg_token
 cfg["telegram_chat_id"] = tg_chat_id
-cfg["steam_api_key"] = steam_key
 cfg["min_price_keys"] = float(min_keys)
 cfg["discount_threshold_percent"] = float(discount)
 

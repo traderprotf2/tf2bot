@@ -24,6 +24,8 @@ import uuid
 
 import requests
 
+import unusual_effects
+
 log = logging.getLogger("bptf")
 
 # Caps how many backpack.tf requests (snapshot + price-history - the two
@@ -434,6 +436,38 @@ def strip_effect_prefix(name: str, particle_name: str) -> str:
     return name
 
 
+def find_effect_prefix(name: str):
+    """
+    Given a raw item name that MAY start with a known Unusual effect
+    name as a literal text prefix (e.g. "Orbiting Planets Merc's
+    Mohawk"), returns (effect_name, particle_id, stripped_name) for the
+    LONGEST matching known effect in unusual_effects.NAME_TO_ID, or
+    (None, None, name) if nothing matches. Longest match wins so a
+    short effect name never wins over a longer, more specific one that
+    also matches as a prefix of the same text.
+
+    A real, confirmed gap this covers: backpack.tf's real-time
+    websocket stream doesn't always include a usable particle.id (or
+    any of main.py's other structured-field fallbacks) for every
+    Unusual event, even for long-established, well-known effects - but
+    the item's own name text still reliably carries the effect as a
+    prefix regardless, since that's baked into backpack.tf's own
+    item.name convention. When every structured field comes up empty,
+    this text is the last, most reliable signal actually available -
+    and it's the SAME text the bug this fixes was already leaving
+    un-stripped, so it's guaranteed to be present exactly when needed.
+    """
+    name_lower = name.lower()
+    best_name, best_id, best_len = None, None, 0
+    for effect_name, effect_id in unusual_effects.NAME_TO_ID.items():
+        prefix_len = len(effect_name) + 1
+        if prefix_len > best_len and name_lower.startswith(effect_name.lower() + " "):
+            best_name, best_id, best_len = effect_name, effect_id, prefix_len
+    if best_name is None:
+        return None, None, name
+    return best_name, best_id, name[best_len:]
+
+
 def safe_dict(value):
     """
     Returns value if it's a dict, else {} - the safe replacement for the
@@ -474,6 +508,14 @@ def strip_variant_prefixes(name: str) -> str:
     name = strip_killstreak_prefix(name)
     if name.startswith("Australium "):
         name = name[len("Australium "):]
+    if name.startswith("The "):
+        # Confirmed via a direct, real working search URL: backpack.tf's
+        # classifieds search itself indexes items WITHOUT the "The"
+        # article ("Beast from Below", not "The Beast from Below") even
+        # though "The" is the item's own canonical, in-game display name -
+        # a name still carrying it matches nothing there, the same
+        # reasoning as the other prefixes above.
+        name = name[len("The "):]
     return name
 
 
@@ -491,15 +533,24 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
     Domain is plain backpack.tf, not next.backpack.tf - the redesigned
     site filters via an in-app modal, not URL params.
 
-    Confirmed from a real, working search: "...?item=Ambassador&quality=11
-    &spell=Exorcism&australium=-1&killstreak_tier=0" - `australium`,
-    `killstreak_tier`, `spell` are present even when NOT applicable (-1,
-    0, "None"), since omitting doesn't exclude those variants, only the
-    explicit sentinel does. `craftable` added only when uncraftable.
-    `killstreaker`/`sheen` deliberately NOT sent - see below.
+    Confirmed from two real, working search URLs (direct report,
+    verified against the item's OWN classifieds page rather than any
+    documentation): "...?item=Beast+from+Below&quality=6&tradable=1
+    &craftable=1&australium=-1&killstreak_tier=0" - note what's
+    genuinely absent here versus an EARLIER, wrong assumption this
+    project made: no `spell` param at all when there's no spell to
+    filter by (an explicit "spell=None" sentinel, sent unconditionally
+    before this fix, was never actually confirmed and turned out to
+    break real searches - omitted now unless there's an actual spell
+    value to filter by), and `craftable` sent explicitly (1, not just
+    omitted) even for a plain craftable item, not only when uncraftable
+    as this project assumed before. `australium`/`killstreak_tier` are
+    still present at their "not applicable" values (-1, 0) exactly as
+    already confirmed. `killstreaker`/`sheen` deliberately NOT sent -
+    see below.
 
-    `name` can include Killstreak/Australium prefixes - stripped
-    internally.
+    `name` can include Killstreak/Australium/"The" prefixes - stripped
+    internally (see strip_variant_prefixes).
     """
     from urllib.parse import urlencode
 
@@ -510,11 +561,8 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
         params["quality"] = quality_id
     if particle_id is not None:
         params["particle"] = particle_id
-    # "spell=None" (the literal string) is the real sentinel for "must
-    # have no spell" - the same convention as australium=-1/
-    # killstreak_tier=0 below. Omitting the param entirely doesn't
-    # exclude spelled listings.
-    params["spell"] = spell if spell else "None"
+    if spell:
+        params["spell"] = spell
     # killstreaker/sheen deliberately NOT included as search params - a
     # real, confirmed case showed the resulting search page displaying
     # "unknown" for both filters (the name-string format this project
@@ -525,8 +573,7 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
     # omitting these entirely is safer than sending a guessed, wrong
     # value - the search is still correctly filtered by every other
     # confirmed dimension (item/quality/spell/paint/killstreak_tier/etc).
-    if not craftable:
-        params["craftable"] = 0
+    params["craftable"] = 1 if craftable else 0
     paint_value = paint_rgb_decimal(paint) if paint else None
     if paint_value is not None:
         params["paint"] = paint_value

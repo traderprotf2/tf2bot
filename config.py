@@ -31,11 +31,6 @@ DEFAULTS = {
     "telegram_bot_token": "",       # from @BotFather
     "telegram_chat_id": "",         # your numeric chat id (see README)
 
-    # Optional: a free Steam Web API key (https://steamcommunity.com/dev/apikey).
-    # Resolves Unusual particle effect names to IDs. Without it, Unusual
-    # items are skipped (Strange/Australium weapons still work).
-    "steam_api_key": "",
-
     # --- Filtering rules ---
     # TF2 qualities to watch. "Strange" also covers Australium weapons
     # (always Strange quality). "Unique" is the default/most common

@@ -472,6 +472,36 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
     if discount_percent < cfg["discount_threshold_percent"]:
         return reject("discount_too_small")
 
+    # Final live re-check, right before actually committing to an alert -
+    # per direct report of stale/no-longer-real buy orders being alerted
+    # on: get_best_buy_order_keys() above (and its own live-query
+    # fallback further up) both only run when the SELF-COLLECTED store
+    # has nothing at all - neither ever re-verifies a value the store
+    # DID have, however long ago it was last reconfirmed. Buy orders are
+    # kept for up to 24h specifically as a safety net for a missed
+    # delete event (see LocalListingStore's own BUY_ORDER_SAFETY_NET_
+    # SECONDS) - meaning a genuinely withdrawn or fulfilled buy order
+    # could still back an alert for up to that long if its delete event
+    # never arrived. Alerts are rare compared to raw event volume, so a
+    # single extra live request right at this one, low-frequency moment -
+    # the last point before telling the user "this is real" - costs
+    # far less than every other place a live call was deliberately
+    # avoided for speed. Same killstreaker/sheen skip as the live-query
+    # fallback above, and same reasoning: this endpoint can't reliably
+    # scope to one specific combo.
+    if not listing.killstreaker and not listing.sheen:
+        live_buy_order_keys, live_buy_order_count = bptf.fetch_live_buy_order_keys(
+            lookup_name, listing.quality, listing.particle_id,
+            craftable=listing.craftable, australium=australium,
+            killstreak_tier=listing.killstreak_tier,
+        )
+        if live_buy_order_keys is None or live_buy_order_keys <= 0:
+            return reject("buy_order_gone_on_final_check")
+        buy_order_keys, buy_order_count = live_buy_order_keys, live_buy_order_count
+        discount_percent = (buy_order_keys - listing.price_keys) / buy_order_keys * 100
+        if discount_percent < cfg["discount_threshold_percent"]:
+            return reject("discount_too_small_on_final_check")
+
     flip_profit_keys = buy_order_keys - listing.price_keys
 
     # Price-boost sanity check across the whole killstreak tier ladder
@@ -549,7 +579,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
     )
 
     # Real item picture for the Telegram alert, straight from Valve's own
-    # schema (confirmed OK to hotlink directly - see steam_schema.py).
+    # schema (confirmed OK to hotlink directly).
     # Priority flag - Unusuals are the most liquid and highest-margin
     # category, worth calling out so they're not lost in a busy chat;
     # cfg["priority_item_names"] adds specific well-known "hype" items on

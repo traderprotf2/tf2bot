@@ -33,7 +33,6 @@ import mannco_client
 import matcher
 import runtime_settings
 import steam_inventory
-import steam_schema
 import unusual_effects
 import telegram_commands
 import telegram_notify
@@ -147,20 +146,19 @@ class Watcher:
         )
         self.mannco = mannco_client.ManncoClient(cfg["mannco_api_key"], cfg["jwt_refresh_seconds"])
         self.telegram = telegram_notify.TelegramNotifier(cfg["telegram_bot_token"], cfg["telegram_chat_id"])
-        # Bundled static data (unusual_effects.py) is the guaranteed
-        # baseline - never depends on steam_api_key or any network call
-        # succeeding, unlike the live schema fetch below. A real,
-        # confirmed incident: a common, long-established effect
-        # (Blizzardy Storm, added 2011) went unresolved end-to-end
-        # because the live fetch alone was the only source, and
-        # whatever made it fail (misconfigured/missing steam_api_key,
-        # most likely) meant EVERY effect was unresolved, not just rare
-        # or new ones. The live fetch result is layered ON TOP (still
-        # attempted, still preferred when it succeeds) so a working API
-        # key still adds effects newer than this bundle's own coverage -
-        # this bundle is the floor, not a replacement for the live data.
+        # Bundled static data (unusual_effects.py) is the SOLE source now -
+        # no Steam API call, no API key, nothing that can fail or go
+        # unconfigured. Per explicit request: the live schema fetch this
+        # used to layer on top of the bundle was removed entirely, not
+        # just made optional - a real, confirmed incident showed relying
+        # on it AT ALL (even as a "prefer live, bundle as fallback"
+        # layering) meant a live-fetch failure (steam_api_key missing or
+        # misconfigured, most likely) silently left EVERY effect
+        # unresolved, including common, long-established ones like
+        # Blizzardy Storm (added 2011) that this bundle alone covers
+        # correctly. See unusual_effects.py's own docstring for coverage
+        # and sourcing.
         self.particle_name_to_id = dict(unusual_effects.NAME_TO_ID)
-        self.particle_name_to_id.update(steam_schema.fetch_particle_name_to_id(cfg.get("steam_api_key", "")))
         self.particle_id_to_name = {v: k for k, v in self.particle_name_to_id.items()}
         self.inventory_checker = steam_inventory.SteamInventoryChecker(
             cache_ttl_seconds=cfg.get("inventory_cache_seconds", 900)
@@ -1104,6 +1102,23 @@ class Watcher:
                     except (TypeError, ValueError):
                         particle_id = None
                     break
+        if particle_id is None and quality == "Unusual":
+            # Last resort: backpack.tf's real-time websocket stream does
+            # NOT reliably include a usable particle.id or any of the
+            # three fallbacks above for every Unusual event - a real,
+            # confirmed report showed even a common, long-established
+            # effect (Orbiting Planets, added 2011) going completely
+            # unresolved this way. But the item's own `name` text still
+            # reliably carries the effect as a literal prefix regardless
+            # (backpack.tf bakes this into item.name unconditionally) -
+            # that's the exact text this whole bug was already leaving
+            # un-stripped, so it's guaranteed present exactly when every
+            # structured field above has failed. Matches against the
+            # bundled effect list itself (unusual_effects.py), picking
+            # the LONGEST matching known name so a short effect name
+            # never wins over a longer one sharing the same first word
+            # (e.g. "Stardust" vs "Stardust Pathway").
+            _, particle_id, _ = bptf_client.find_effect_prefix(name)
         if particle_id is not None:
             # Prefer the schema-based canonical name over whatever the
             # raw payload's own "name" field happens to say for THIS
@@ -1119,9 +1134,8 @@ class Watcher:
             # even though particle_id itself agrees. Using the one
             # canonical name tied to this particle_id, always, removes
             # that inconsistency at the source. Falls back to the raw
-            # payload's own name only when this id isn't in the schema at
-            # all (e.g. steam_api_key not configured, or a brand new
-            # effect Valve hasn't indexed yet).
+            # payload's own name only when this id isn't in the bundled
+            # data at all (a brand new effect not yet added there).
             particle_name = self.particle_id_to_name.get(particle_id) or particle_name
 
         if particle_name and particle_name.startswith("#"):
@@ -1546,13 +1560,6 @@ class Watcher:
                 f"key_price_metal выглядит неправдоподобно ({self.bptf.key_price_metal:.2f} "
                 f"металла за ключ, обычно 30-80) - возможно, парсинг цены сломан."
             )
-
-        if self.cfg.get("steam_api_key"):
-            if len(self.particle_name_to_id) < 400:
-                problems.append(
-                    f"Загружено только {len(self.particle_name_to_id)} unusual-эффектов из схемы "
-                    f"Steam (обычно 600+) - определение Unusual-предметов может работать не полностью."
-                )
 
         if not self.mannco_key_usd_cents:
             problems.append("Цена ключа с mannco.store не определилась - конвертация цен оттуда сломана.")

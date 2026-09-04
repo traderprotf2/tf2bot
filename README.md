@@ -9,7 +9,6 @@
 - **Telegram chat id** — напиши своему боту любое сообщение, затем открой
   `https://api.telegram.org/botTOKEN/getUpdates` (замени TOKEN на токен бота),
   найди `"chat":{"id":ЧИСЛО`
-- **(опционально) Steam Web API key** — https://steamcommunity.com/dev/apikey
 
 ## Шаг 2. Арендуй сервер
 
