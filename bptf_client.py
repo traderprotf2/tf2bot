@@ -1306,9 +1306,24 @@ class BackpackTFPriceList:
                     entry_quality_obj = {}
                 entry_quality = entry_quality_obj.get("name") or quality_name
                 defindex = item.get("defindex")
+                # Spell - a real, confirmed gap: this call hardcoded
+                # None here regardless of what the entry actually
+                # carried, unlike every other per-entry field this same
+                # function already extracts correctly (killstreaker,
+                # sheen, quality, defindex). That meant EVERY buy order
+                # this scanner records - spelled or not - filed into the
+                # SAME "no spell" bucket, silently pooling a spelled
+                # variant's (often far higher) buy order price into a
+                # plain item's comparison. Same extraction pattern as
+                # main.py's own handle_bptf_event: first spell only.
+                entry_spells = [
+                    s.get("name") for s in (item.get("spells") or [])
+                    if isinstance(s, dict) and s.get("name")
+                ]
+                entry_spell = entry_spells[0] if entry_spells else None
                 key = listing_identity_key(
                     name, entry_quality, particle_id, None, craftable,
-                    None, item.get("killstreakTier") or 0, name.startswith("Australium "),
+                    entry_spell, item.get("killstreakTier") or 0, name.startswith("Australium "),
                     killstreaker=killstreaker_obj.get("name"), sheen=sheen_obj.get("name"),
                     defindex=defindex,
                 )
