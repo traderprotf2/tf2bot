@@ -28,10 +28,15 @@ STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_s
 class RuntimeSettings:
     def __init__(self, min_price_keys, watched_qualities, watched_categories,
                  discount_threshold_percent, max_days_since_price_update,
-                 priority_item_names=None, paused=False, australium_only=False):
+                 priority_item_names=None, paused=False, australium_only=False,
+                 max_price_keys=None):
         self.paused = paused
         self.australium_only = australium_only
         self.min_price_keys = min_price_keys
+        # None = no upper limit (search at any price above the minimum) -
+        # per explicit request, the same "unset means unrestricted"
+        # convention as several other optional filters in this project.
+        self.max_price_keys = max_price_keys
         self.watched_qualities = list(watched_qualities)
         self.watched_categories = list(watched_categories)
         self.discount_threshold_percent = discount_threshold_percent
@@ -57,6 +62,7 @@ class RuntimeSettings:
         """
         settings = cls(
             min_price_keys=cfg["min_price_keys"],
+            max_price_keys=cfg.get("max_price_keys"),
             watched_qualities=cfg["watched_qualities"],
             watched_categories=cfg.get("watched_categories", ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"]),
             discount_threshold_percent=cfg["discount_threshold_percent"],
@@ -71,6 +77,8 @@ class RuntimeSettings:
                 settings.paused = bool(saved.get("paused", settings.paused))
                 settings.australium_only = bool(saved.get("australium_only", settings.australium_only))
                 settings.min_price_keys = float(saved.get("min_price_keys", settings.min_price_keys))
+                saved_max_price = saved.get("max_price_keys", settings.max_price_keys)
+                settings.max_price_keys = float(saved_max_price) if saved_max_price is not None else None
                 settings.watched_qualities = list(saved.get("watched_qualities", settings.watched_qualities))
                 watched_categories = list(saved.get("watched_categories", settings.watched_categories))
                 # Migration: "hat" was renamed "cosmetic" when the category
@@ -99,6 +107,7 @@ class RuntimeSettings:
                 "paused": self.paused,
                 "australium_only": self.australium_only,
                 "min_price_keys": self.min_price_keys,
+                "max_price_keys": self.max_price_keys,
                 "watched_qualities": self.watched_qualities,
                 "watched_categories": self.watched_categories,
                 "discount_threshold_percent": self.discount_threshold_percent,

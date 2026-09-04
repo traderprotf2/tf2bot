@@ -246,6 +246,7 @@ class Watcher:
         merged = {
             **self.cfg,
             "min_price_keys": self.runtime.min_price_keys,
+            "max_price_keys": self.runtime.max_price_keys,
             "watched_qualities": self.runtime.watched_qualities,
             "watched_categories": self.runtime.watched_categories,
             "discount_threshold_percent": self.runtime.discount_threshold_percent,
@@ -1011,6 +1012,51 @@ class Watcher:
             self.stats["bptf_rejected_category"] += 1
             return
 
+        # Price computed here, early - alongside category above, before
+        # any of the expensive particle/paint/spell/killstreak extraction
+        # below - moved up from where it used to be computed (right
+        # before intent, much later); nothing about this computation
+        # depends on any of that later extraction, so moving it earlier
+        # changes nothing about its own correctness. Reuses `currencies`,
+        # already extracted above for the dedup fingerprint.
+        price_keys = self.bptf.currencies_to_keys(currencies)
+        price_usd = None
+        if price_keys is None and currencies.get("usd") and self.mannco_key_usd_cents:
+            price_usd = float(currencies["usd"])
+            price_keys = price_usd / (self.mannco_key_usd_cents / 100)
+        elif price_keys is not None and self.mannco_key_usd_cents:
+            price_usd = price_keys * (self.mannco_key_usd_cents / 100)
+        if price_keys is None:
+            return
+
+        intent = payload.get("intent")
+        # min/max price is a filter on what's worth ALERTING on - it
+        # only makes sense against a SELL listing's own asking price,
+        # never a buy order's: a buy order outside this range is still
+        # exactly the reference data a LATER, in-range sell listing of
+        # the same item needs to be compared against, so gating this on
+        # intent == "sell" specifically (not applying it before intent is
+        # even known) matters for correctness, not just style - applying
+        # it to both intents alike would have silently discarded buy
+        # orders that were never the thing being filtered in the first
+        # place. A max-price ceiling (symmetric to the pre-existing
+        # min_price_keys floor) should "significantly ease parsing" per
+        # explicit request, which only actually happens if an out-of-
+        # range SELL listing is rejected before the expensive extraction
+        # below, not after - hence checked this early rather than staying
+        # in matcher.py's evaluate_listing, where min_price_keys used to
+        # live (still checked there too, for the same reason and with
+        # the same intent scoping evaluate_listing itself already has -
+        # it's only ever called for sell listings - as a defensive
+        # backstop for other sources sharing that function).
+        if intent == "sell":
+            if price_keys < self.runtime.min_price_keys:
+                self.stats["bptf_rejected_price"] += 1
+                return
+            if self.runtime.max_price_keys is not None and price_keys > self.runtime.max_price_keys:
+                self.stats["bptf_rejected_price"] += 1
+                return
+
         if quality == "Unusual" and "bptf_unusual" not in self._sampled_item_kinds:
             self._sampled_item_kinds.add("bptf_unusual")
             log.warning(
@@ -1238,21 +1284,6 @@ class Watcher:
         # relies on for search links) - deriving from the SAME string
         # that gets displayed means the two can never disagree again.
         craftable = not name.startswith("Non-Craftable ")
-
-        currencies = payload.get("currencies") or {}
-        price_keys = self.bptf.currencies_to_keys(currencies)
-        price_usd = None
-        if price_keys is None and currencies.get("usd") and self.mannco_key_usd_cents:
-            price_usd = float(currencies["usd"])
-            price_keys = price_usd / (self.mannco_key_usd_cents / 100)
-        elif price_keys is not None and self.mannco_key_usd_cents:
-            price_usd = price_keys * (self.mannco_key_usd_cents / 100)
-
-        if price_keys is None:
-            return
-
-        intent = payload.get("intent")
-
 
         # Record EVERY listing this project sees (both sell AND buy
         # intent, now that bptf_ws.py passes buy-intent events through

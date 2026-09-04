@@ -46,6 +46,8 @@ HELP_TEXT = (
     "/pause — приостановить уведомления\n"
     "/resume — возобновить\n"
     "/minprice [число] — минимальная цена в ключах (без числа — показать текущую)\n"
+    "/maxprice [число] — максимальная цена в ключах, 0 снимает ограничение "
+    "(без числа — показать текущую; не задана по умолчанию — любая цена)\n"
     "/discount [число] — порог скидки в % (без числа — показать текущий)\n"
     "/liquidity [число] — игнорировать предметы без переоценки цены дольше N дней\n"
     "/qualities, /addquality Название, /removequality Название\n"
@@ -216,10 +218,16 @@ def build_categories_menu(runtime):
 
 
 def build_price_menu(runtime):
+    max_line = (
+        f"Максимальная: {runtime.max_price_keys:g} ключей"
+        if runtime.max_price_keys is not None else "Максимальная: не задана (любая цена)"
+    )
     text = (
-        f"💰 <b>Минимальная цена</b>\n"
-        f"Сейчас: {runtime.min_price_keys:g} ключей\n\n"
-        f"Нужно другое число — просто напиши боту, например: /minprice 33"
+        f"💰 <b>Цена</b>\n"
+        f"Минимальная: {runtime.min_price_keys:g} ключей\n"
+        f"{max_line}\n\n"
+        f"Минимальную можно выбрать ниже, или числом: /minprice 33\n"
+        f"Максимальную — только числом: /maxprice 500 (0 — снять ограничение)"
     )
     keyboard = []
     row = []
@@ -596,9 +604,14 @@ def handle_command(text: str, runtime, stats=None, stats_since=None,
     if command == "status":
         state = "⏸ на паузе" if runtime.paused else "▶️ работает"
         australium_line = "\nТолько Australium: ✅ включено" if runtime.australium_only else ""
+        max_price_line = (
+            f"\nМаксимальная цена: {runtime.max_price_keys:g} ключей"
+            if runtime.max_price_keys is not None else ""
+        )
         return (
             f"{state}\n"
-            f"Минимальная цена: {runtime.min_price_keys:g} ключей\n"
+            f"Минимальная цена: {runtime.min_price_keys:g} ключей"
+            f"{max_price_line}\n"
             f"Порог скидки: {runtime.discount_threshold_percent:g}%\n"
             f"Порог ликвидности: {runtime.max_days_since_price_update:g} дн.\n"
             f"Качества: {', '.join(runtime.watched_qualities) or '(пусто)'}\n"
@@ -631,9 +644,37 @@ def handle_command(text: str, runtime, stats=None, stats_since=None,
             return f"Не понял число: {arg!r}. Пример: /minprice 10"
         if value < 0:
             return "Цена не может быть отрицательной."
+        if runtime.max_price_keys is not None and value > runtime.max_price_keys:
+            return (
+                f"Минимальная цена ({value:g}) не может быть больше максимальной "
+                f"({runtime.max_price_keys:g}). Сначала подними /maxprice."
+            )
         runtime.min_price_keys = value
         runtime.save()
         return f"Минимальная цена теперь {value:g} ключей."
+
+    if command == "maxprice":
+        if not arg:
+            current = f"{runtime.max_price_keys:g} ключей" if runtime.max_price_keys is not None else "не задана (ищем по любым ценам)"
+            return f"Сейчас: {current}. Чтобы поменять: /maxprice 500. Чтобы снять ограничение: /maxprice 0"
+        if arg.strip().lower() in ("0", "off", "none", "нет", "выкл"):
+            runtime.max_price_keys = None
+            runtime.save()
+            return "Максимальная цена снята - ищем по любым ценам (не ниже минимальной)."
+        try:
+            value = float(arg.replace(",", "."))
+        except ValueError:
+            return f"Не понял число: {arg!r}. Пример: /maxprice 500 (или /maxprice 0, чтобы снять ограничение)"
+        if value <= 0:
+            return "Максимальная цена должна быть больше нуля. Чтобы снять ограничение: /maxprice 0"
+        if value < runtime.min_price_keys:
+            return (
+                f"Максимальная цена ({value:g}) не может быть меньше минимальной "
+                f"({runtime.min_price_keys:g})."
+            )
+        runtime.max_price_keys = value
+        runtime.save()
+        return f"Максимальная цена теперь {value:g} ключей."
 
     if command == "discount":
         if not arg:

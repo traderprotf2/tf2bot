@@ -11,6 +11,7 @@
   "watched_categories": ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"],
   "excluded_types": ["War Paint", "Badge", "Tool", "Strangifier", "Craft Item", "Crate", "Party Favor"],
   "min_price_keys": 5,
+  "max_price_keys": null,
   "discount_threshold_percent": 5,
   "min_other_listings": 1,
   "item_type_cooldown_minutes": 60,

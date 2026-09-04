@@ -274,6 +274,9 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         return None
     if listing.price_keys is None or listing.price_keys < cfg["min_price_keys"]:
         return reject("min_price")
+    max_price = cfg.get("max_price_keys")
+    if max_price is not None and listing.price_keys > max_price:
+        return reject("max_price")
 
     # Killstreak Kits/Fabricators are skipped entirely, before any API
     # calls - the same limitation that already meant no search LINK could

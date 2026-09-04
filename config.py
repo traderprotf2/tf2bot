@@ -57,6 +57,10 @@ DEFAULTS = {
 
     # Minimum item value to bother alerting on, in TF2 keys.
     "min_price_keys": 5,
+    # None = no upper limit (search at any price above the minimum) -
+    # see runtime_settings.py's own docstring for why. Runtime-mutable
+    # via /maxprice in Telegram, same as min_price_keys/minprice.
+    "max_price_keys": None,
 
     # Discount vs. the live buy order needed to trigger an alert, in percent.
     "discount_threshold_percent": 5,
