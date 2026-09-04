@@ -1151,7 +1151,7 @@ class BackpackTFPriceList:
             log.warning("Bulk buy-order scan failed for %s (%s).", name, quality_name)
             return 0
 
-        listings = data.get("listings")
+        listings = data.get("listings") if isinstance(data, dict) else None
         if not isinstance(listings, list):
             log.warning(
                 "Bulk scan response for %s (%s) had an unexpected shape - raw (truncated): %r",
@@ -1304,7 +1304,7 @@ class BackpackTFPriceList:
             log.warning("Live snapshot buy-order query failed for %s - falling back to local store only.", name)
             return None, 0
 
-        listings = data.get("listings")
+        listings = data.get("listings") if isinstance(data, dict) else None
         if not isinstance(listings, list):
             # Diagnostic sample, not a guess acted on silently - this
             # endpoint's exact response shape for a LIVE, current call
@@ -1431,7 +1431,7 @@ class BackpackTFPriceList:
             )
             return None
 
-        response = data.get("response", {})
+        response = data.get("response", {}) if isinstance(data, dict) else {}
         if response.get("success") not in (1, "1"):
             self._history_cache[cache_key] = (now, None)
             return None
