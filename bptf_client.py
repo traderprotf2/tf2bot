@@ -1331,7 +1331,8 @@ class BackpackTFPriceList:
         return recorded
 
     def fetch_live_buy_order_keys(self, name: str, quality_name: str, particle_id=None,
-                                   craftable=True, australium: bool = False, killstreak_tier=None):
+                                   craftable=True, australium: bool = False, killstreak_tier=None,
+                                   spell=None):
         """
         LIVE query to the snapshot API for this item's current best buy
         order - a deliberate, narrow exception to this project's "local
@@ -1349,10 +1350,16 @@ class BackpackTFPriceList:
         wider tf2-sku community standard uses (see fetch_and_record_all_
         unusual_buy_orders' own docstring for the same correction, and
         the two wrong attempts at this endpoint it replaces). Only
-        item/quality are sent - particle/killstreak/craftable/australium
-        aren't independently confirmed as filterable on this endpoint at
-        all, so those are filtered CLIENT-SIDE from the response instead
-        of guessed at in the query string.
+        item/quality are sent - particle/killstreak/craftable/
+        australium/spell aren't independently confirmed as filterable
+        on this endpoint at all, so those are filtered CLIENT-SIDE from
+        the response instead of guessed at in the query string. `spell`
+        specifically was missing entirely until a real, confirmed
+        report: a spell-less sell listing got "verified" against a
+        rare, high-value spell variant's (Voices from Below) buy order
+        this way, since every spell variant (plus the un-spelled item)
+        was being pooled together with no spell dimension checked at
+        all.
 
         Returns (buy_keys, count) matching get_best_buy_order_keys' own
         shape, or (None, 0) on failure - never worse than not trying,
@@ -1426,6 +1433,25 @@ class BackpackTFPriceList:
                     continue
                 entry_ks_tier = item.get("killstreakTier") or 0
                 if (killstreak_tier or 0) != entry_ks_tier:
+                    continue
+                # Spell - a real, confirmed gap: this function's own
+                # signature never accepted a spell parameter at all,
+                # meaning it silently pooled EVERY spell variant of an
+                # item together (plus the un-spelled one), including
+                # rare, high-value spells like Voices from Below - a
+                # spell-less sell listing could get "verified" against a
+                # spelled item's buy order this way, a real, confirmed
+                # case of exactly that. Same convention as the local
+                # store's own identity key (see listing_identity_key):
+                # entries are compared by their FIRST spell only, since
+                # that's the one dimension TF2 items are actually priced
+                # by even when a second, cosmetic-only spell is present.
+                entry_spells = [
+                    s.get("name") for s in (item.get("spells") or [])
+                    if isinstance(s, dict) and s.get("name")
+                ]
+                entry_spell = entry_spells[0] if entry_spells else None
+                if (spell or None) != (entry_spell or None):
                     continue
                 price_keys = self.currencies_to_keys(entry.get("currencies") or {})
                 if price_keys is not None and price_keys > 0:

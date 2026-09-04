@@ -449,7 +449,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
             buy_order_keys, buy_order_count = bptf.fetch_live_buy_order_keys(
                 lookup_name, listing.quality, listing.particle_id,
                 craftable=listing.craftable, australium=australium,
-                killstreak_tier=listing.killstreak_tier,
+                killstreak_tier=listing.killstreak_tier, spell=primary_spell,
             )
     if buy_order_keys is None or buy_order_keys <= 0:
         # No live buy order in the local store, and (for priority items)
@@ -493,7 +493,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         live_buy_order_keys, live_buy_order_count = bptf.fetch_live_buy_order_keys(
             lookup_name, listing.quality, listing.particle_id,
             craftable=listing.craftable, australium=australium,
-            killstreak_tier=listing.killstreak_tier,
+            killstreak_tier=listing.killstreak_tier, spell=primary_spell,
         )
         if live_buy_order_keys is None or live_buy_order_keys <= 0:
             return reject("buy_order_gone_on_final_check")
