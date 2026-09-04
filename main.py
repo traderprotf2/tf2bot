@@ -146,18 +146,8 @@ class Watcher:
         )
         self.mannco = mannco_client.ManncoClient(cfg["mannco_api_key"], cfg["jwt_refresh_seconds"])
         self.telegram = telegram_notify.TelegramNotifier(cfg["telegram_bot_token"], cfg["telegram_chat_id"])
-        # Bundled static data (unusual_effects.py) is the SOLE source now -
-        # no Steam API call, no API key, nothing that can fail or go
-        # unconfigured. Per explicit request: the live schema fetch this
-        # used to layer on top of the bundle was removed entirely, not
-        # just made optional - a real, confirmed incident showed relying
-        # on it AT ALL (even as a "prefer live, bundle as fallback"
-        # layering) meant a live-fetch failure (steam_api_key missing or
-        # misconfigured, most likely) silently left EVERY effect
-        # unresolved, including common, long-established ones like
-        # Blizzardy Storm (added 2011) that this bundle alone covers
-        # correctly. See unusual_effects.py's own docstring for coverage
-        # and sourcing.
+        # Bundled static data (unusual_effects.py), not a live Steam API
+        # call - no API key dependency, works even if misconfigured.
         self.particle_name_to_id = dict(unusual_effects.NAME_TO_ID)
         self.particle_id_to_name = {v: k for k, v in self.particle_name_to_id.items()}
         self.inventory_checker = steam_inventory.SteamInventoryChecker(
@@ -168,13 +158,9 @@ class Watcher:
         self.seen = collections.deque(maxlen=cfg["seen_listings_max"])
         self.seen_set = set()
 
-        # Funnel counters, purely diagnostic - answers "is the bot even
-        # seeing the volume I'd expect, and if so, where is it narrowing
-        # down: the cheap quality/category filter, or the accuracy checks
-        # inside evaluate_listing (discount threshold, liquidity, tier
-        # consistency, community-price cross-check, etc)?" - see /stats
-        # in Telegram. Reset whenever /stats is read, so each read shows
-        # "since last time you checked", not a lifetime total.
+        # Funnel counters for /stats - shows where volume narrows down
+        # (quality/category filter vs evaluate_listing's own checks).
+        # Reset on each /stats read.
         self.stats = collections.Counter()
         self.stats_since = time.time()
 
@@ -183,42 +169,22 @@ class Watcher:
         # alert timestamp.
         self.item_type_last_alerted = {}
 
-        # Which "kinds" of item structure we've already logged a raw
-        # sample of since startup - see the sampling calls in
-        # handle_bptf_event. One sample per kind is plenty; the point is
-        # having real captured data on hand if extraction for that kind
-        # ever turns out wrong, not building an ongoing log of every item.
+        # One raw-sample log per item "kind" since startup - see the
+        # sampling calls in handle_bptf_event.
         self._sampled_item_kinds = set()
 
-        # Lightweight name -> identity_key(s) index, updated as events
-        # arrive, purely to support /checkitem (see that command's own
-        # handling) - lets a person look up "what does the bot's local
-        # store currently know about item X" by NAME (identity keys
-        # themselves may be defindex-anchored, not name-based - see
-        # listing_identity_key's own docstring in bptf_client.py - so
-        # this is the only way to search by name at all). Bounded size
-        # isn't enforced here deliberately: distinct item NAMES (not
-        # listings) are a small, slowly-growing set relative to the
-        # listing volume itself.
+        # name -> identity_key(s), for /checkitem's name-based lookup
+        # (identity keys themselves may be defindex-anchored, not
+        # name-based). Unbounded on purpose - distinct item NAMES are a
+        # small set relative to listing volume.
         self._name_to_identity_keys = collections.defaultdict(set)
 
-        # (name, quality_name) -> {"ts": last-proactive-refresh unix
-        # timestamp (0.0 = never, sorts first), "category": this item's
-        # classify_category() result} - drives proactive_buy_order_
-        # refresh_loop below. Covers every watched quality, not just
-        # Unusual.
-        #
-        # CAPPED at MAX_KNOWN_SCAN_ITEMS (LRU-evicted, see the population
-        # site in handle_bptf_event) - a real, serious bug this session:
-        # generalizing past Unusual-only meant this could grow to track
-        # every (name, quality) combination ever seen across every
-        # watched quality/category, unboundedly (nothing ever removed an
-        # entry) - on a small VPS, this grew large enough that the OOM
-        # killer terminated the whole process. Unusual alone stayed
-        # naturally small (TF2 only has so many Unusual-eligible items);
-        # generalizing without ALSO bounding the size was the mistake,
-        # not the generalization itself. Not persisted across restarts -
-        # rebuilds within minutes at the event volume this project sees.
+        # (name, quality_name) -> {"ts": last proactive-refresh time (0 =
+        # never), "category": classify_category() result} - drives
+        # proactive_buy_order_refresh_loop below, every watched quality.
+        # Capped at MAX_KNOWN_SCAN_ITEMS, LRU-evicted (see the population
+        # site in handle_bptf_event) - unbounded growth here once caused
+        # an OOM kill. Not persisted - rebuilds within minutes.
         self._known_scan_items = {}
         self.MAX_KNOWN_SCAN_ITEMS = 2000
 
@@ -503,14 +469,9 @@ class Watcher:
         usd = f", ${deal['price_usd']:.2f}" if deal["price_usd"] else ""
 
         # Every dynamic string below is backpack.tf-sourced text going
-        # into an HTML-parse-mode message - html.escape()d for the same
-        # reason seller_note_line/safe_display_name already are further
-        # down: this project has already confirmed backpack.tf's own
-        # "name" field can contain unexpected raw tokens (the
-        # #Attrib_Particle artifact), and an unescaped "<"/"&"/">" in
-        # ANY of these would break Telegram's HTML parser and silently
-        # drop the WHOLE message - a real, previously-unaudited gap this
-        # project only caught for two of these eight fields until now.
+        # into an HTML-parse-mode message - html.escape()d, since an
+        # unescaped "<"/"&"/">" in any of them would break Telegram's
+        # HTML parser and silently drop the whole message.
         special_lines = []
         if deal["paint"]:
             special_lines.append(f"🎨 Краска: {html.escape(deal['paint'], quote=False)}")
@@ -810,29 +771,19 @@ class Watcher:
 
     async def send_deal(self, deal):
         if "#attrib" in deal["display_name"].lower():
-            # Safety-net diagnostic: a real, repeated report that the
-            # #Attrib_Particle strip in handle_bptf_event still isn't
-            # catching every case, despite that fix testing correctly
-            # against every example string reported so far - meaning the
-            # REAL raw data must differ from what's been tested with in
-            # some way not yet seen. Logs the full deal dict (the
-            # closest thing to raw data available at this point) so the
-            # next occurrence is diagnosable from real production data
-            # instead of guessing at synthetic strings again.
+            # Safety-net diagnostic: if the #Attrib_Particle strip in
+            # handle_bptf_event ever misses a case, logs the full deal
+            # dict so the next occurrence is diagnosable from real data.
             log.warning(
                 "DIAGNOSTIC SAMPLE (display_name still contains an unstripped artifact "
                 "after clean_display_name) - full deal dict: %r", deal,
             )
         # Per-SELLER cooldown: don't re-alert on the same item from the
-        # SAME seller repeatedly (bumped/re-listed) within a short window
-        # - but a DIFFERENT seller's listing of the same kind of item is a
-        # genuinely different opportunity and must never be held back by
-        # this. An earlier version of this scoped the cooldown to the item
-        # type alone (no seller in the key), which was wrong per direct
-        # correction: it was silently swallowing every other seller's
-        # listing of the same item for a full hour after the first one
-        # alerted - exactly the effect of "new items stopped showing up",
-        # since they WERE being found, just suppressed by too broad a key.
+        # SAME seller within a short window, but a DIFFERENT seller's
+        # listing of the same item is a genuinely different opportunity.
+        # Scoping the cooldown to just the item type (no seller) was
+        # wrong - it silently suppressed every other seller's listing of
+        # the same item for a full hour after the first one alerted.
         identity_key = (
             deal["source"], deal.get("seller_id"), deal["display_name"],
             deal.get("particle_name"), deal.get("paint"), deal.get("killstreaker"), deal.get("sheen"),
@@ -868,16 +819,11 @@ class Watcher:
         keyboard = self._build_alert_keyboard(deal)
         sent_message_id = await self._run_telegram(self.telegram.send, alert_text, keyboard)
         if sent_message_id is not None:
-            # Cooldown recorded only on a CONFIRMED send - a real,
-            # serious bug fixed here: recording it unconditionally (as
-            # this used to do, right after the cooldown check above)
-            # meant a send that failed - e.g. Telegram rejecting
-            # malformed HTML in an unescaped seller note, see
-            # format_alert's own new escaping - still blocked every
-            # retry for this exact seller+item for the full cooldown
-            # window, even though the person never actually received
-            # anything. A failed send now leaves the door open for the
-            # very next matching event to try again immediately.
+            # Cooldown recorded only on a CONFIRMED send - recording it
+            # unconditionally meant a failed send (e.g. Telegram
+            # rejecting malformed HTML) still blocked every retry for
+            # this seller+item for the full cooldown window even though
+            # nothing was actually received.
             self.item_type_last_alerted[identity_key] = now
         else:
             log.warning(
@@ -895,15 +841,9 @@ class Watcher:
             # are currently being sent, and costs nothing to do anyway.
             listing_id = payload.get("id")
             if listing_id is not None:
-                # Dispatched to a thread - remove_listing() scans EVERY
-                # bucket in the store (no identity key to jump straight
-                # to one), now up to max_total_buckets (50,000) of them,
-                # under the same plain threading.Lock record() below
-                # also uses - same event-loop-blocking risk as that call,
-                # see its own comment, except this one iterates the
-                # WHOLE store on every single delete event rather than
-                # touching just one bucket, making it the more expensive
-                # of the two to ever hold directly on the event loop.
+                # Dispatched to a thread - remove_listing() takes the
+                # same lock record() does, so this must never run
+                # directly on the event loop.
                 await asyncio.to_thread(self.bptf.local_listings.remove_listing, str(listing_id))
             return
 
@@ -932,10 +872,8 @@ class Watcher:
         item = bptf_client.safe_dict(payload.get("item"))
         quality_obj = bptf_client.safe_dict(item.get("quality"))
         quality = quality_obj.get("name")
-        # Unusual is unconditionally watched, per explicit request -
-        # never toggleable via /addquality-/removequality, unlike every
-        # other quality. Everything else still goes through the normal
-        # watched_qualities check.
+        # Unusual is unconditionally watched - never toggleable via
+        # /addquality-/removequality, unlike every other quality.
         if quality != "Unusual" and quality not in self.runtime.watched_qualities:
             self.stats["bptf_rejected_quality"] += 1
             return
@@ -943,94 +881,55 @@ class Watcher:
         name = item.get("name") or item.get("marketName") or item.get("baseName")
         if not name:
             return
-        # Rejected here, at the source, before EVER being recorded into
-        # local_listings - a real, confirmed gap: this check used to only
-        # run later, inside evaluate_listing (matcher.py), which decides
-        # whether to ALERT - but every event, excluded type or not, was
-        # still being recorded into the database first regardless, so an
-        # explicitly banned item's buy/sell data sat there taking up
-        # space it could never actually be used for (evaluate_listing
-        # would reject it every time anyway). Same name-text check
-        # evaluate_listing's own excluded_types filter uses
-        # (matcher.py's item_type is never actually populated for
-        # backpack.tf, so that filter is name-text-only in practice too).
+        # Rejected here, before ever being recorded, not just later in
+        # evaluate_listing's own excluded_types filter - an explicitly
+        # banned item's data was otherwise still taking up store space
+        # it could never be used for anyway.
         name_lower_for_exclusion = name.lower()
         if any(excluded.lower() in name_lower_for_exclusion
                for excluded in self.cfg.get("excluded_types", [])):
             self.stats["bptf_rejected_excluded_type"] += 1
             return
-        # backpack.tf's own particle-name resolution occasionally fails
-        # for some effects, leaving a raw, unresolved internal token
-        # appended to the name instead of (or alongside) the real effect
-        # name - a real, confirmed case: "Sakura Smoke Bomb Blast Bowl
-        # (#Attrib_Particle288)". Stripped here, at the source, since an
-        # unreliable suffix like this (present for some events of the
-        # same effect, absent for others) risks the same kind of
-        # identity-key mismatch already fixed twice this session for
-        # similar name-text inconsistencies - not just an ugly display.
-        #
-        # Matches "#Attrib_Particle" ANYWHERE in the string, not a fixed
-        # " (#Attrib_Particle" substring - a real, confirmed case: this
-        # project has already hit backpack.tf using non-ASCII whitespace
-        # in other text fields (seller notes), so requiring an exact
-        # regular space before the marker risked silently not matching
-        # at all if the same thing happens here. Trims any leftover
-        # whitespace/punctuation right before the marker too.
+        # backpack.tf's own particle-name resolution occasionally fails,
+        # leaving a raw internal token in the name instead of (or
+        # alongside) the real effect name, e.g. "Sakura Smoke Bomb Blast
+        # Bowl (#Attrib_Particle288)". Stripped here since an unreliable
+        # suffix like this risks an identity-key mismatch, not just an
+        # ugly display. Matches "#Attrib_Particle" anywhere (not a fixed
+        # leading substring) since this project has hit non-ASCII
+        # whitespace in other text fields before.
         if "#Attrib_Particle" in name:
             name = name.split("#Attrib_Particle")[0].rstrip("(").rstrip()
 
-        # Base item type's own numeric schema ID - confirmed real in
-        # backpack.tf's payload (multiple third-party API docs: "item...
-        # Contains keys like defindex and quality"). Preferred identity
-        # anchor over name text - see listing_identity_key's own
-        # docstring in bptf_client.py for why.
+        # Base item's own numeric schema ID - preferred identity anchor
+        # over name text, see listing_identity_key's own docstring.
         defindex = item.get("defindex")
 
-        # Action items excluded unconditionally, not via watched_categories
-        # (so re-enabling by mistake via /addcategory can't undo it) - per
-        # a direct, explicit request to never even consider Tool, Craft
-        # Item, Strangifier, Crate, Party Favor, or Action items. Action
-        # items specifically have their own dedicated equip slot ("action",
-        # previously "MISC2") distinct from every other item type -
-        # confirmed via the official TF2 wiki's own Action items article -
-        # so this is a reliable, structural signal, not a name guess. The
-        # other five categories don't have an equally reliable single
-        # field confirmed for this project's exact data source, so they're
-        # excluded via config.py's excluded_types instead (name/type text
-        # match - the same, less-certain mechanism War Paint/Badge already
-        # used). A more reliable, schema-based check (Valve's own
-        # craft_class field confirms "tool" and "supply_crate" as real
-        # values for Tool and Crate specifically) was researched and is a
-        # good candidate for a future pass, but wasn't rushed into this
-        # one - implementing a new schema-fetch system without room to
-        # test it properly risked introducing exactly the kind of mistake
-        # a large, hurried edit already caused once this session.
+        # Action items excluded unconditionally (not via watched_
+        # categories, so re-enabling by mistake can't undo it) - they
+        # have their own dedicated equip slot ("action"), a reliable
+        # structural signal. Tool/Craft Item/Strangifier/Crate/Party
+        # Favor don't have an equally reliable single field for this
+        # data source, so those go through config.py's excluded_types
+        # (name-text match) instead.
         if item.get("slot") == "action":
             self.stats["bptf_rejected_category"] += 1
             return
 
-        # Category checked HERE, right alongside quality above and before
-        # any of the more expensive extraction below (particle/paint/
-        # spell/killstreak parsing) - per a direct request to stop that
-        # work being done at all for a category that isn't even watched
-        # (weapons specifically called out as the highest-volume category
-        # on backpack.tf). This mirrors is_watched()'s own category check
-        # in matcher.py - kept there too (not removed) since that
-        # function is shared by every source, not just this one; this is
-        # purely a fast-path duplicate for backpack.tf specifically,
-        # where the volume is highest.
+        # Checked here, alongside quality above, before the more
+        # expensive particle/paint/spell/killstreak extraction below -
+        # mirrors is_watched()'s own category check in matcher.py (kept
+        # there too, since that function is shared by every source) -
+        # this is just a fast-path duplicate for the highest-volume path.
         category = classify_category(name, item.get("slot"))
         if category not in self.runtime.watched_categories:
             self.stats["bptf_rejected_category"] += 1
             return
 
-        # Price computed here, early - alongside category above, before
-        # any of the expensive particle/paint/spell/killstreak extraction
-        # below - moved up from where it used to be computed (right
-        # before intent, much later); nothing about this computation
-        # depends on any of that later extraction, so moving it earlier
-        # changes nothing about its own correctness. Reuses `currencies`,
-        # already extracted above for the dedup fingerprint.
+        # Computed here, early, alongside category above, before the
+        # expensive extraction below - nothing about this depends on
+        # that extraction. Reuses `currencies`, already extracted above
+        # for the dedup fingerprint.
         price_keys = self.bptf.currencies_to_keys(currencies)
         price_usd = None
         if price_keys is None and currencies.get("usd") and self.mannco_key_usd_cents:
@@ -1042,25 +941,13 @@ class Watcher:
             return
 
         intent = payload.get("intent")
-        # min/max price is a filter on what's worth ALERTING on - it
-        # only makes sense against a SELL listing's own asking price,
-        # never a buy order's: a buy order outside this range is still
-        # exactly the reference data a LATER, in-range sell listing of
-        # the same item needs to be compared against, so gating this on
-        # intent == "sell" specifically (not applying it before intent is
-        # even known) matters for correctness, not just style - applying
-        # it to both intents alike would have silently discarded buy
-        # orders that were never the thing being filtered in the first
-        # place. A max-price ceiling (symmetric to the pre-existing
-        # min_price_keys floor) should "significantly ease parsing" per
-        # explicit request, which only actually happens if an out-of-
-        # range SELL listing is rejected before the expensive extraction
-        # below, not after - hence checked this early rather than staying
-        # in matcher.py's evaluate_listing, where min_price_keys used to
-        # live (still checked there too, for the same reason and with
-        # the same intent scoping evaluate_listing itself already has -
-        # it's only ever called for sell listings - as a defensive
-        # backstop for other sources sharing that function).
+        # min/max price only makes sense against a SELL listing's own
+        # asking price, never a buy order's - a buy order outside this
+        # range is still exactly the reference data a later in-range
+        # sell listing needs. Checked early (before the expensive
+        # extraction below), gated on intent == "sell" specifically for
+        # correctness, not just style. Still checked in matcher.py's
+        # evaluate_listing too, as a backstop for other sources.
         if intent == "sell":
             if price_keys < self.runtime.min_price_keys:
                 self.stats["bptf_rejected_price"] += 1
@@ -1082,18 +969,11 @@ class Watcher:
         particle_name = particle_obj.get("name")
 
         if particle_id is None:
-            # Defensive fallback paths - not independently confirmed
-            # against a real live backpack.tf Unusual payload (a repeated
-            # report that NO Unusual alerts were ever seen from ANY
-            # source raised real doubt about the primary path above).
-            # Try a flat field name first...
+            # Fallback: flat field names.
             particle_id = item.get("particleId") or item.get("particle_id")
         if particle_id is None:
-            # ...then raw Steam-schema-style attributes, where the
-            # "attach particle effect" attribute (defindex 134, a
-            # well-known constant in TF2 tooling) carries the particle id
-            # as its value - plausible if backpack.tf passes through
-            # relatively unprocessed inventory-style attribute data.
+            # Fallback: raw attributes, defindex 134 = "attach particle
+            # effect", value = the particle id.
             for attr in (item.get("attributes") or []):
                 if isinstance(attr, dict) and attr.get("defindex") == 134:
                     raw_value = attr.get("value", attr.get("float_value"))
@@ -1103,77 +983,48 @@ class Watcher:
                         particle_id = None
                     break
         if particle_id is None and quality == "Unusual":
-            # Last resort: backpack.tf's real-time websocket stream does
-            # NOT reliably include a usable particle.id or any of the
-            # three fallbacks above for every Unusual event - a real,
-            # confirmed report showed even a common, long-established
-            # effect (Orbiting Planets, added 2011) going completely
-            # unresolved this way. But the item's own `name` text still
-            # reliably carries the effect as a literal prefix regardless
-            # (backpack.tf bakes this into item.name unconditionally) -
-            # that's the exact text this whole bug was already leaving
-            # un-stripped, so it's guaranteed present exactly when every
-            # structured field above has failed. Matches against the
-            # bundled effect list itself (unusual_effects.py), picking
-            # the LONGEST matching known name so a short effect name
-            # never wins over a longer one sharing the same first word
-            # (e.g. "Stardust" vs "Stardust Pathway").
+            # Last resort: the websocket stream doesn't always include a
+            # usable particle id via any of the fields above, even for
+            # common, long-established effects. The item's own `name`
+            # text still carries the effect as a literal prefix though
+            # (backpack.tf bakes this in unconditionally) - matched
+            # against the bundled effect list, picking the LONGEST
+            # matching name so a short one never wins over a longer one
+            # sharing the same first word ("Stardust" vs "Stardust
+            # Pathway").
             _, particle_id, _ = bptf_client.find_effect_prefix(name)
         if particle_id is not None:
-            # Prefer the schema-based canonical name over whatever the
-            # raw payload's own "name" field happens to say for THIS
-            # specific event, whenever we have one - a real, hard-to-spot
-            # bug: strip_effect_prefix() below only strips the effect
-            # prefix when its EXACT string matches the start of `name`
-            # (case-sensitive), and if the raw payload's own particle
-            # name ever varies in phrasing/casing between two events for
-            # the SAME effect, the strip would succeed for one and
-            # silently fail for the other - leaving the SAME effect
-            # producing two DIFFERENT `name` values (one with the prefix
-            # still attached), which never match in the identity key,
-            # even though particle_id itself agrees. Using the one
-            # canonical name tied to this particle_id, always, removes
-            # that inconsistency at the source. Falls back to the raw
-            # payload's own name only when this id isn't in the bundled
-            # data at all (a brand new effect not yet added there).
+            # Prefer the schema's canonical name over the raw payload's
+            # own name for this event - the raw one can vary in
+            # phrasing/casing between two events for the SAME effect,
+            # which would make strip_effect_prefix() below succeed for
+            # one and silently fail for the other, splitting one effect
+            # into two different `name` values that never match in the
+            # identity key even though particle_id agrees. Falls back to
+            # the raw name only for an id not yet in the bundled data.
             particle_name = self.particle_id_to_name.get(particle_id) or particle_name
 
         if particle_name and particle_name.startswith("#"):
-            # THE actual root cause of a repeatedly-reported symptom
-            # ("Steaming Citizen Cane (#Attrib_Particle36)" - the effect
-            # prefix left un-stripped from the name AND the raw token
-            # shown as the effect itself): backpack.tf's real-time
-            # stream doesn't always resolve a human-readable particle
-            # name - for some events, item.particle.name is ITSELF this
-            # raw, unresolved internal token ("#Attrib_ParticleNN"), not
-            # a display name at all. An EARLIER fix stripped this same
-            # token as a SUFFIX off the item's own name field, which
-            # never was where it actually came from - it flows through
-            # via THIS field, particle_name, into two separate places
-            # (strip_effect_prefix below, which fails to match this
-            # raw token against the name's real prefix like "Steaming",
-            # leaving it un-stripped; and format_alert's "effect"
-            # parenthetical, which shows this field completely raw).
-            # Treated as if there were no resolved name at all - None
-            # is the correct value for "this effect has no known name
-            # right now", not a raw internal token no one should see.
+            # item.particle.name is sometimes itself an unresolved raw
+            # token ("#Attrib_ParticleNN"), not a display name - treated
+            # as no resolved name at all, not shown to anyone.
             particle_name = None
 
         if particle_name:
-            # Confirmed real via a direct report: backpack.tf's own
             # item.name already includes the effect as a display prefix
-            # ("Circling Heart Hot Dogger", not just "Hot Dogger") - left
-            # in place, the effect ends up shown twice in an alert's own
-            # text, AND (more importantly) the classifieds search link
-            # ends up searching for a literal item named "Circling Heart
-            # Hot Dogger" while ALSO passing particle=<id> separately,
-            # which doesn't match anything real - the exact reason a
-            # real alert's search link didn't work. Stripped here, once,
-            # so every downstream use (display name, identity key,
-            # search link) sees the same clean name consistently.
+            # ("Circling Heart Hot Dogger") - stripped here once so every
+            # downstream use (display name, identity key, search link)
+            # sees the same clean name. Left in, the effect would show
+            # twice AND the search link would search for a nonexistent
+            # item name while also passing particle= separately.
             name = bptf_client.strip_effect_prefix(name, particle_name)
 
         spells = [s.get("name") for s in (item.get("spells") or []) if isinstance(s, dict) and s.get("name")]
+        # Same filter matcher.py's own evaluate_listing applies
+        # (filter_spells_for_category) - keeps the recording side and
+        # the lookup side from ever disagreeing about which bucket a
+        # listing with a category-impossible spell belongs in.
+        spells = matcher.filter_spells_for_category(spells, category)
         strange_parts = [p.get("name") for p in (item.get("strangeParts") or [])
                           if isinstance(p, dict) and p.get("name")]
 
@@ -1185,12 +1036,9 @@ class Watcher:
         raw_paint = paint_obj.get("name") if isinstance(paint_obj, dict) else None
         paint = raw_paint if slot in COSMETIC_SLOTS else None
 
-        # Exact RGB decimal straight from the source (confirmed real via
-        # a diagnostic sample: {'id': 5046, 'name': 'Team Spirit',
-        # 'color': '#b8383b'} - '#b8383b' decodes, after stripping the
-        # '#', to (184, 56, 59), an exact match for this project's own
-        # "Team Spirit RED" value) - no RED/BLU guessing needed for
-        # team-coloured paints, this is the exact colour the listing is.
+        # Exact RGB decimal straight from the source (color: '#b8383b'
+        # decodes to Team Spirit RED exactly) - no RED/BLU guessing
+        # needed for team-coloured paints.
         paint_decimal_hint = None
         if paint and slot in COSMETIC_SLOTS:
             raw_color = paint_obj.get("color") if isinstance(paint_obj, dict) else None
@@ -1202,26 +1050,10 @@ class Watcher:
 
         if slot == "medal" and "bptf_medal_slot" not in self._sampled_item_kinds:
             self._sampled_item_kinds.add("bptf_medal_slot")
-            # Confirms the slot value classify_category() now checks for
-            # (see there) against a real payload, the same way every
-            # other slot/field assumption in this project has been
-            # verified - the official wiki describes badges as equipping
-            # "in the medal equip region", and this is the first real
-            # listing to actually confirm (or contradict) that the raw
-            # slot string backpack.tf sends is literally "medal".
             log.warning("DIAGNOSTIC SAMPLE (first slot='medal' item seen this run) - name: %r", item.get("name"))
 
         if paint and paint in bptf_client.TEAM_COLOR_PAINT_RGB and "bptf_team_paint" not in self._sampled_item_kinds:
             self._sampled_item_kinds.add("bptf_team_paint")
-            # Real production evidence (a Steam econ-item parsing library,
-            # danocmx/node-tf2-item-format) shows Steam's OWN raw item
-            # description carries a single "Paint Color: <hex>" string per
-            # item, not two RED/BLU alternatives - meaning there may be a
-            # direct colour/hex field on THIS payload's paint object too,
-            # which would be the correct single value to search with
-            # instead of guessing between the two RGB variants (see
-            # team_color_paint_decimals in matcher.py's evaluate_listing).
-            # Logging the FULL raw object here, once, to find out.
             log.warning(
                 "DIAGNOSTIC SAMPLE (first team-coloured paint seen this run, %r) - "
                 "raw paint object: %r",
@@ -1230,22 +1062,16 @@ class Watcher:
         raw_killstreak_tier = item.get("killstreakTier")
         killstreak_tier = raw_killstreak_tier if slot in WEAPON_SLOTS else None
 
-        # Per explicit request: only Professional Killstreak (tier 3) is
-        # watched now - plain (tier 0, no kit at all) still is too, only
-        # tier 1 ("Killstreak") and tier 2 ("Specialized Killstreak") are
-        # excluded. Checked here, early, same reasoning as the Action-
-        # item/category checks above - skip the more expensive parsing
-        # below entirely for a tier that's never going to be watched,
-        # not just suppress the alert for it later.
+        # Only Professional Killstreak (tier 3) is watched, plus plain
+        # (tier 0) - tier 1/2 excluded. Checked early to skip the more
+        # expensive parsing below for a tier that's never watched.
         if killstreak_tier in (1, 2):
             self.stats["bptf_rejected_category"] += 1
             return
         # Killstreak Kits/Fabricators have no weapon slot (killstreak_tier
-        # above is always None for them), so the same tier restriction is
-        # applied by name instead, mirroring classify_category's own
-        # Kit/Fabricator name-pattern detection. Only "Professional
-        # Killstreak ... Kit/Fabricator" passes; plain "Killstreak ..."
-        # and "Specialized Killstreak ..." are excluded the same way.
+        # is always None for them), so the same restriction applies by
+        # name instead: only "Professional Killstreak ... Kit/Fabricator"
+        # passes.
         if "Killstreak" in name and (name.endswith("Kit") or name.endswith("Fabricator")):
             if not name.startswith("Professional Killstreak "):
                 self.stats["bptf_rejected_category"] += 1
@@ -1253,13 +1079,8 @@ class Watcher:
 
         # Killstreaker/sheen only exist on weapons with a killstreak tier
         # (sheen from tier 2+, killstreaker from tier 3 only - see
-        # bptf_client.VALID_KILLSTREAKERS/VALID_SHEENS) - same game-logic
-        # guard as paint/killstreak_tier above. Field path is a best-effort
-        # guess following the same item.<attr>.name shape as particle/paint
-        # above (not independently confirmed for killstreaker/sheen
-        # specifically) - gracefully comes back None if wrong, same as any
-        # other uncertain field in this project, rather than guessing at a
-        # wrong value.
+        # VALID_KILLSTREAKERS/VALID_SHEENS). Comes back None if the field
+        # path guess is wrong, same as any other uncertain field here.
         killstreaker = None
         sheen = None
         if slot in WEAPON_SLOTS and killstreak_tier:
@@ -1281,47 +1102,30 @@ class Watcher:
 
         seller_steamid = payload.get("steamid")
 
-        # wearTier is the actual weapon-skin-specific signal (Factory
-        # New through Battle-Scarred wear only applies to War Paints/
-        # Decorated weapons - confirmed via the official TF2 wiki's own
-        # Grade article - cosmetics don't have a wear dimension at all).
-        # texture alone, WITHOUT wearTier, means a graded COSMETIC (a
-        # hat with an intrinsic Civilian-through-Elite rarity grade -
-        # same wiki source, "Grade is an intrinsic sub-quality of
-        # Decorated weapons AND certain cosmetic items") - a real,
-        # separate, often valuable category that was previously being
-        # unconditionally dropped here (is_skin used to fire on texture
-        # alone), conflating it with actual weapon skins. Grade/texture
-        # is captured below and threaded into the identity key instead -
-        # see listing_identity_key's own docstring for why this can
-        # never be read from the item's own display NAME text (backpack.
-        # tf's own forums document real items whose name contains a
-        # DIFFERENT grade's word than their true one).
+        # wearTier (Factory New..Battle-Scarred) only applies to War
+        # Paints/Decorated weapons. texture alone, WITHOUT wearTier,
+        # means a graded COSMETIC (Civilian..Elite rarity grade) - a
+        # separate, valuable category, previously conflated with actual
+        # weapon skins. Grade/texture is threaded into the identity key
+        # (see listing_identity_key) rather than read from the item's
+        # display name - some real items' names carry a different
+        # grade's word than their true one.
         is_skin = bool(item.get("wearTier"))
         texture_obj = item.get("texture")
         texture = texture_obj.get("name") if isinstance(texture_obj, dict) else texture_obj
         # Derived from the NAME TEXT, not the separate item.craftable
-        # field - a real, confirmed bug: the two disagreed for some
-        # listings, so the alert's own displayed name (built straight
-        # from this same name string - see clean_display_name) said
-        # "Non-Craftable X" while the buy order actually being compared
-        # against was looked up under craftable=True, because the
-        # separate boolean field said so. backpack.tf's name text
-        # reliably carries "Non-Craftable " as a literal prefix when
-        # applicable (the same convention strip_variant_prefixes already
-        # relies on for search links) - deriving from the SAME string
-        # that gets displayed means the two can never disagree again.
+        # field - the two disagreed for some listings, so the displayed
+        # name said "Non-Craftable X" while the buy order comparison
+        # used craftable=True. backpack.tf's name text reliably carries
+        # "Non-Craftable " as a literal prefix when applicable.
         craftable = not name.startswith("Non-Craftable ")
 
-        # Record EVERY listing this project sees (both sell AND buy
-        # intent, now that bptf_ws.py passes buy-intent events through
-        # too) into the self-collected local store - see LocalListingStore's
-        # own docstring in bptf_client.py for why this replaced querying
-        # backpack.tf's own (confirmed deprecated) snapshot endpoint.
-        # This has to happen for EVERY listing, not just ones that end up
-        # qualifying as a deal - a listing that isn't itself a bargain is
-        # still exactly the kind of "what's the going rate" comparison
-        # data a LATER listing of the same exact item needs.
+        # Records EVERY listing seen (both sell and buy intent) into the
+        # self-collected local store - see LocalListingStore's own
+        # docstring for why this replaced the deprecated snapshot
+        # endpoint. Happens for every listing, not just qualifying
+        # deals - a listing that isn't a bargain is still comparison
+        # data a later listing of the same item needs.
         paint_value_for_identity = paint_decimal_hint if paint_decimal_hint is not None else (
             bptf_client.paint_rgb_decimal(paint) if paint else None
         )
@@ -1331,53 +1135,38 @@ class Watcher:
             texture=texture, defindex=defindex, killstreaker=killstreaker, sheen=sheen,
         )
         self._name_to_identity_keys[name.lower()].add(identity_key)
-        # excluded_types already rejected and returned early above, at
-        # the very top of this function - anything reaching this point
+        # excluded_types already rejected above - anything reaching here
         # is guaranteed not excluded.
         is_currently_watched_quality = quality == "Unusual" or quality in self.runtime.watched_qualities
         scan_key = (name, quality)
         if is_currently_watched_quality and scan_key not in self._known_scan_items:
-            # Hard cap, FIFO-evicted (oldest-inserted first - regular
-            # dicts keep insertion order) - see this dict's own comment
-            # in __init__ for why this cap exists at all: unbounded
-            # growth here already took down the whole process once.
+            # Hard cap, FIFO-evicted - see this dict's own comment in
+            # __init__.
             if len(self._known_scan_items) >= self.MAX_KNOWN_SCAN_ITEMS:
                 oldest_key = next(iter(self._known_scan_items))
                 del self._known_scan_items[oldest_key]
             self._known_scan_items[scan_key] = {"ts": 0.0, "category": category}
         # Dispatched to a thread, not called directly on the event loop -
-        # a real, confirmed lag/freeze risk: record() takes a plain
-        # threading.Lock (LocalListingStore's own, shared with every
-        # evaluate_listing() read too), and this function itself runs
-        # directly on the asyncio event loop (handle_bptf_event is async
-        # def, called from a task, not from asyncio.to_thread) - so any
-        # time this specific lock happened to already be held by a
-        # WORKER thread (running evaluate_listing via its own
-        # asyncio.to_thread), THIS call would block waiting for it
-        # directly on the event loop itself. A blocked event loop can't
-        # schedule anything else meanwhile - including Telegram's own
-        # command dispatch, even though the actual Telegram HTTP call
-        # runs on its own dedicated thread pool, since even starting
-        # that await needs the event loop to be free to run it.
+        # record() takes a plain threading.Lock shared with every
+        # evaluate_listing() read too, and this function runs directly
+        # on the asyncio event loop - if that lock were ever held by a
+        # worker thread, this call would block the WHOLE event loop
+        # (including Telegram's own command dispatch) waiting for it.
         await asyncio.to_thread(
             self.bptf.local_listings.record,
             identity_key, str(listing_id), seller_steamid, price_keys, intent,
         )
 
         if intent != "sell":
-            # Buy-intent listings only ever feed the local store above -
-            # there's no "deal" to evaluate or alert on for an offer to
-            # BUY something, only a data point for pricing SELL listings
-            # of the same item later.
+            # Buy-intent listings only feed the local store above -
+            # nothing to alert on for an offer to BUY something, only
+            # comparison data for pricing SELL listings later.
             self.stats["bptf_buy_recorded"] += 1
             return
 
-        # Direct, pre-filled Steam trade-offer link straight to the seller
-        # - the fastest way to actually buy - when backpack.tf exposes one
-        # publicly for them. The "view the offer on backpack.tf itself"
-        # link is built uniformly for every deal in matcher.py, so this is
-        # only the direct-purchase link; left empty if the seller doesn't
-        # have one public (the search link still gets them there).
+        # Direct, pre-filled Steam trade-offer link to the seller, when
+        # backpack.tf exposes one publicly - the "view on backpack.tf"
+        # link is built separately in matcher.py for every deal.
         link = bptf_client.safe_dict(payload.get("user")).get("tradeOfferUrl")
 
         listing = matcher.NormalizedListing(
@@ -1402,14 +1191,7 @@ class Watcher:
             killstreak_tier=killstreak_tier,
             killstreaker=killstreaker,
             sheen=sheen,
-            # "details" is at the LISTING level (sibling of id/steamid/
-            # price), not nested under "item" - confirmed independently
-            # by two real sources reading/writing this exact field:
-            # a GitHub library that parses live backpack.tf listings
-            # ("details: string // Comment below the listing") and the
-            # unofficial BackpackTF PyPI wrapper's create_listing
-            # ("details - the listing comment, max 200 characters") -
-            # both agree on the name, from opposite ends (read vs write).
+            # "details" is at the LISTING level, not nested under "item".
             seller_note=(payload.get("details") or "").strip() or None,
             paint_decimal_hint=paint_decimal_hint,
         )
@@ -1451,21 +1233,13 @@ class Watcher:
         while True:
             try:
                 # Uses the SAME dedicated small thread pool as
-                # _run_telegram's own sends (see run() for the full
-                # reasoning) - NOT the shared default pool this used to
-                # go through. A real report of the Telegram bot going
-                # completely unresponsive traced to exactly this gap:
-                # this fix's earlier version only moved outgoing sends
-                # (_run_telegram) to a dedicated pool, but get_updates()
-                # itself - a LONG-POLLING call that occupies a worker
-                # thread for the whole poll cycle, called in a tight
-                # while True loop - was still going through the shared
-                # default pool the same way evaluate_listing does. Under
-                # the real event volume this project handles, that
-                # shared pool being busy meant polling itself couldn't
-                # get a thread promptly, so the bot could go a long time
-                # without even checking for new messages - not a crash,
-                # just total unresponsiveness that looked exactly like one.
+                # _run_telegram's own sends, not the shared default
+                # pool - get_updates() is a long-polling call occupying
+                # a worker thread for the whole poll cycle, in a tight
+                # while True loop, so if it shared the same pool as
+                # evaluate_listing under real event volume, polling
+                # couldn't get a thread promptly and the bot looked
+                # totally unresponsive without actually crashing.
                 loop = asyncio.get_running_loop()
                 executor = getattr(self, "_telegram_executor", None)
                 if executor is not None:
@@ -1576,39 +1350,17 @@ class Watcher:
 
     async def run(self):
         # Telegram gets its OWN small, dedicated thread pool, separate
-        # from the one asyncio.to_thread() uses by default for
-        # everything else (evaluate_listing, Steam inventory checks,
-        # etc.) - NOT just a bigger shared pool. A real report showed
-        # Telegram commands lagging once listing events started being
-        # dispatched concurrently (bptf_ws.py's
-        # _dispatch_semaphore, up to 60+60 potentially "in flight" at
-        # once, each holding a worker thread for its entire throttled
-        # request chain - tens of seconds of time.sleep() inside the
-        # account pool's throttle) - Telegram's own to_thread calls were
-        # queuing up behind all of that on the SAME small default pool.
-        # The first fix here simply made the shared pool much bigger
-        # (200 workers) - but a second, separate report then showed
-        # something worse: 100% of evaluations failing right after that
-        # change, on a small VPS (real hostname seen elsewhere: "vm-
-        # nano") - 200 real OS threads is a real, sometimes-too-heavy
-        # resource ask on a box that small, however roomy it looks on
-        # paper. A dedicated small pool for Telegram specifically (it
-        # only ever needs a handful of threads - calls are quick and
-        # infrequent) solves the ORIGINAL lag without needing the shared
-        # pool to be huge at all - see _run_telegram below, used
-        # everywhere self.telegram.* used to go through plain
-        # asyncio.to_thread.
+        # from the default one asyncio.to_thread() uses for everything
+        # else (evaluate_listing, Steam inventory checks, etc.) - a
+        # shared pool let Telegram commands queue up behind listing
+        # evaluations under load. A big shared pool alone isn't the fix
+        # either: 200 real OS threads was too heavy on a small VPS. A
+        # small dedicated pool for Telegram (it only needs a handful of
+        # threads) solves the lag without the shared pool needing to be
+        # huge - see _run_telegram below.
         self._telegram_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
-        # Restores whatever the local listing store had saved right
-        # before this run started (or a previous one, if this is the
-        # first run since a save) - see LocalListingStore.load_from_disk
-        # and local_store_snapshot_loop below for why this exists: a
-        # real, direct point that restarting for every update (routine
-        # during active development) was otherwise wiping out everything
-        # the store had learned each time. Done before anything else
-        # touches self.bptf.local_listings, so the very first real
-        # listing evaluated after a restart already has recent
+        # Restores whatever the local listing store had saved before -
         # comparison data available, not an empty store.
         await asyncio.to_thread(self.bptf.local_listings.load_from_disk, bptf_client.LOCAL_LISTINGS_STATE_PATH)
         self._load_alert_cooldowns()
@@ -1634,21 +1386,12 @@ class Watcher:
 
         await self._startup_sanity_check()
 
-        # Graceful-shutdown handling: saves the local listing store
-        # (see LocalListingStore.save_to_disk / local_store_snapshot_loop
-        # above) the MOMENT the process is asked to stop, not just on
-        # local_store_snapshot_loop's own 90-second timer. Direct
-        # feedback made clear why the timer alone isn't enough: this bot
-        # gets restarted often during active development (an update is
-        # exactly a restart), and if that restart happens to land before
-        # the periodic loop's first save (up to 90 seconds after
-        # startup, worst case), everything collected in that window was
-        # simply lost when the process exited - not "written but stale",
-        # never written at all. `systemctl restart`/`stop` send SIGTERM;
-        # Ctrl+C / KeyboardInterrupt is SIGINT - both are handled the
-        # same way here so either kind of stop triggers one last save
-        # before the process actually exits, regardless of how much (or
-        # how little) time has passed since the last periodic save.
+        # Graceful-shutdown handling: saves the local listing store the
+        # MOMENT the process is asked to stop, not just on
+        # local_store_snapshot_loop's own 90-second timer - a restart
+        # landing before that loop's first save would otherwise lose
+        # everything collected since startup. SIGTERM (systemctl
+        # restart/stop) and SIGINT (Ctrl+C) both trigger one last save.
         shutdown_event = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -1691,18 +1434,11 @@ class Watcher:
             except (asyncio.CancelledError, Exception):
                 pass
         else:
-            # main_tasks finished FIRST, and not because of a shutdown
-            # signal - meaning one of the loops inside it actually
-            # raised (every real loop in this project is `while True`,
-            # so ordinary completion never happens on its own). Do the
-            # same emergency save a real shutdown would (whatever data
-            # has been collected is still worth keeping), then
-            # deliberately let the original exception propagate out of
-            # run() instead of swallowing it - systemd's restart policy
-            # is what's supposed to bring the process back up after a
-            # real crash, and it can only do that if the process
-            # actually exits with the failure visible, the same as
-            # before this shutdown-handling code existed at all.
+            # main_tasks finished first, not from a shutdown signal -
+            # one of the (normally `while True`) loops actually raised.
+            # Same emergency save a real shutdown would do, then let the
+            # exception propagate - systemd's restart policy needs the
+            # process to actually exit with the failure visible.
             shutdown_waiter.cancel()
             log.warning("A core loop exited unexpectedly - saving local listing store before the crash propagates...")
             try:

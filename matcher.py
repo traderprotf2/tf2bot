@@ -279,29 +279,17 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         return reject("max_price")
 
     # Killstreak Kits/Fabricators are skipped entirely, before any API
-    # calls - the same limitation that already meant no search LINK could
-    # be generated for them (backpack.tf's own community confirms these
-    # need the special "Find recipes where the output item is used on
-    # this item" flow, not a normal item= search) very plausibly applies
-    # to the price-lookup snapshot API too, not just the webpage - and a
-    # real production log showed repeated failed snapshot requests
-    # specifically for Kit items. Rather than keep spending request
-    # budget (and contributing to rate-limit pressure for everything
-    # else) on a category whose pricing can't be trusted to begin with,
-    # this is skipped outright until there's real evidence of a working
-    # way to price Kits specifically.
+    # calls - backpack.tf needs a special "find recipes" flow for these,
+    # not a normal item= search, and snapshot requests for them
+    # repeatedly failed. Skipped outright until there's a working way to
+    # price Kits specifically.
     if listing.category == "killstreak_kit":
         return reject("kit_category")
 
-    # Unusuals need a resolved particle id to compare like-for-like - EXCEPT
-    # "Unusualifier" tools, which are a genuinely different case: they GRANT
-    # an effect when used, rather than wearing one themselves, so the raw
-    # payload legitimately has no particle data for them (confirmed via a
-    # real production log: these consistently had no particle field at all,
-    # while a real worn Unusual in the same log DID - not a parsing miss,
-    # a real structural difference for this item type). Comparing them by
-    # name+quality alone (no particle requirement) is correct here, same
-    # as any other non-Unusual item.
+    # Unusuals need a resolved particle id to compare like-for-like -
+    # EXCEPT "Unusualifier" tools, which GRANT an effect when used
+    # rather than wearing one, so they legitimately have no particle
+    # data. Compared by name+quality alone, like any non-Unusual item.
     is_unusualifier = "Unusualifier" in listing.name
     if listing.quality == "Unusual" and listing.particle_id is None and not is_unusualifier:
         log.warning(
@@ -313,31 +301,16 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
 
     lookup_name = strip_quality_prefix(listing.name, listing.quality)
 
-    # A painted item whose exact colour we can't resolve to RGB must NOT
-    # proceed with an unfiltered comparison - the paint param would
-    # silently get omitted from every downstream query, comparing this
-    # specific painted item's price against an undifferentiated pool
-    # (every OTHER colour, plus unpainted) instead of the same colour
-    # specifically. A real production incident showed exactly this
-    # cascade: several differently-painted copies of the same cosmetic
-    # (one of them "Team Spirit", a team-coloured paint with no single
-    # universal RGB value - team-coloured paints are excluded from the
-    # table on purpose, see PAINT_NAME_TO_RGB) all landed on nearly
-    # identical, wrong reference/buy-order numbers because none of them
-    # were actually being paint-filtered - flooding alerts with false
-    # "discounts" and, because every one of those still burned a full
-    # round of API calls, contributing to backpack.tf's rate limit
-    # escalating all the way to its 300s ceiling, which then starved
-    # everything ELSE of a fair chance to be evaluated too. Skipping here
-    # - the same "can't safely compare, so don't guess" principle as the
-    # Unusual-particle-id check above - costs missing this one item, but
-    # protects both this item's own accuracy and the whole system's
-    # request budget from a cascade like that repeating.
-    # Team-coloured paints (Team Spirit and 6 others) get a SEPARATE path
-    # below - a real production log showed these being common enough on
-    # real Unusual listings that skipping every one outright was costing
-    # a meaningful share of genuine opportunities, not just a rare edge
-    # case. Anything else unmapped still gets skipped exactly as before.
+    # A painted item whose exact colour can't be resolved to RGB must
+    # NOT proceed with an unfiltered comparison - the paint param would
+    # silently be omitted, comparing against an undifferentiated pool
+    # (every colour, plus unpainted) instead of the same colour
+    # specifically, which once flooded alerts with false "discounts"
+    # while also burning enough extra API calls to push backpack.tf's
+    # rate limit to its ceiling. Team-coloured paints (Team Spirit and 6
+    # others, see PAINT_NAME_TO_RGB) get a separate path below since
+    # they're common enough to be worth handling; anything else unmapped
+    # is still skipped.
     team_color_decimals = team_color_paint_decimals(listing.paint) if listing.paint else None
     if listing.paint and team_color_decimals is None and paint_rgb_decimal(listing.paint) is None:
         log.warning(
@@ -359,17 +332,13 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
 
     exclude_id = listing.listing_id if listing.source == "backpack.tf" else ""
 
-    # A single painted item has ONE fixed colour (confirmed: a real user's
-    # own item "shows as only the red team spirit and not both" on a
-    # backpack.tf forum post), but which of RED/BLU isn't knowable from
-    # the paint name alone - try RED first, then BLU only if RED found
-    # nothing. Trying the wrong one first just costs one extra request
-    # (backpack.tf's own paint= filter returns no matches for the wrong
-    # colour, never wrong data - see TEAM_COLOR_PAINT_RGB's own comment),
-    # it can't produce a bad comparison the way skipping the filter
-    # entirely did. Whichever decimal succeeds here is reused for the
-    # buy-order lookup below too, so both numbers describe the same
-    # colour, not two different guesses.
+    # A single painted item has ONE fixed colour, but which of RED/BLU
+    # isn't knowable from the paint name alone - try RED first, then BLU
+    # only if RED found nothing. Trying the wrong one first just costs
+    # one extra request (backpack.tf's paint= filter returns no matches
+    # for the wrong colour, never wrong data), never a bad comparison.
+    # Whichever decimal succeeds is reused for the buy-order lookup
+    # below too, so both describe the same colour.
     winning_paint_decimal = None
     if listing.paint_decimal_hint is not None:
         # The source told us exactly which colour this listing is
@@ -430,17 +399,11 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
     )
     if buy_order_keys is None or buy_order_keys <= 0:
         # Live-query supplement, ONLY for priority items - see
-        # fetch_live_buy_order_keys' own docstring in bptf_client.py for
-        # why. Same priority rule as the alert's own "⭐ ПРИОРИТЕТ" marker
-        # further down (Unusual always, plus cfg["priority_item_names"]).
-        # Skipped when killstreaker/sheen are set - fetch_live_buy_order_keys
-        # can't reliably scope its query to one specific killstreaker/sheen
-        # combo (same unconfirmed-param-format reasoning that already
-        # removed these from build_classifieds_url), so querying live here
-        # risks pooling a rare, valuable combo's buy order into a totally
-        # different, cheaper combo's sell listing - a real, confirmed bug
-        # for the local-store path, fixed by adding them to the identity
-        # key there; the live path has no such key to add them to.
+        # fetch_live_buy_order_keys' own docstring. Same priority rule
+        # as the alert's own "⭐ ПРИОРИТЕТ" marker further down. Skipped
+        # when killstreaker/sheen are set - this endpoint can't reliably
+        # scope its query to one specific combo, which risks pooling a
+        # rare, valuable combo's buy order into a cheaper one's listing.
         name_lower = listing.name.lower()
         is_priority_for_live_query = listing.quality == "Unusual" or any(
             hype_name.lower() in name_lower for hype_name in cfg.get("priority_item_names", [])
@@ -471,36 +434,6 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
     discount_percent = (buy_order_keys - listing.price_keys) / buy_order_keys * 100
     if discount_percent < cfg["discount_threshold_percent"]:
         return reject("discount_too_small")
-
-    # Final live re-check, right before actually committing to an alert -
-    # per direct report of stale/no-longer-real buy orders being alerted
-    # on: get_best_buy_order_keys() above (and its own live-query
-    # fallback further up) both only run when the SELF-COLLECTED store
-    # has nothing at all - neither ever re-verifies a value the store
-    # DID have, however long ago it was last reconfirmed. Buy orders are
-    # kept for up to 24h specifically as a safety net for a missed
-    # delete event (see LocalListingStore's own BUY_ORDER_SAFETY_NET_
-    # SECONDS) - meaning a genuinely withdrawn or fulfilled buy order
-    # could still back an alert for up to that long if its delete event
-    # never arrived. Alerts are rare compared to raw event volume, so a
-    # single extra live request right at this one, low-frequency moment -
-    # the last point before telling the user "this is real" - costs
-    # far less than every other place a live call was deliberately
-    # avoided for speed. Same killstreaker/sheen skip as the live-query
-    # fallback above, and same reasoning: this endpoint can't reliably
-    # scope to one specific combo.
-    if not listing.killstreaker and not listing.sheen:
-        live_buy_order_keys, live_buy_order_count = bptf.fetch_live_buy_order_keys(
-            lookup_name, listing.quality, listing.particle_id,
-            craftable=listing.craftable, australium=australium,
-            killstreak_tier=listing.killstreak_tier, spell=primary_spell,
-        )
-        if live_buy_order_keys is None or live_buy_order_keys <= 0:
-            return reject("buy_order_gone_on_final_check")
-        buy_order_keys, buy_order_count = live_buy_order_keys, live_buy_order_count
-        discount_percent = (buy_order_keys - listing.price_keys) / buy_order_keys * 100
-        if discount_percent < cfg["discount_threshold_percent"]:
-            return reject("discount_too_small_on_final_check")
 
     flip_profit_keys = buy_order_keys - listing.price_keys
 
@@ -554,22 +487,16 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         avg_keys = bptf.get_average_price_keys(lookup_name, listing.quality, listing.particle_id,
                                                 craftable=listing.craftable)
 
-    # Best current buy order - "could I flip this for an instant, guaranteed
-    # profit". Also only fetched now, same reasoning as the average price.
+    # Best current buy order - "could I flip this for an instant,
+    # guaranteed profit". Also only fetched now, same reasoning as the
+    # average price above.
     #
-    # This same link doubles as: (a) a way to manually double-check the
-    # alert against the live market, and (b) after buying, a ready-made
-    # search to jump straight into listing/selling it - no re-searching
-    # by hand. Every attribute that does or doesn't apply to this exact
-    # item is included, the same way the user's own hand-built reference
-    # search does it. Not filtered to the seller's steamid - backpack.tf
-    # sorts classifieds by price ascending, so a correctly-filtered search
-    # already puts the exact listing that triggered the alert first, and
-    # dropping the steamid filter shows the surrounding market too.
-    #
-    # (Killstreak Kits/Fabricators never reach this point at all now - see
-    # the early return near the top of this function - so no special-case
-    # is needed here anymore.)
+    # This same link doubles as a manual double-check against the live
+    # market, and (after buying) a ready-made search to list/sell it
+    # again. Not filtered to the seller's steamid - backpack.tf sorts by
+    # price ascending, so the exact listing that triggered the alert
+    # already sorts first, and dropping the filter shows the wider
+    # market too.
     backpacktf_search_link = build_classifieds_url(
         lookup_name, listing.quality, listing.particle_id,
         killstreak_tier=listing.killstreak_tier,

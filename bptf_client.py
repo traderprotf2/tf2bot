@@ -76,15 +76,9 @@ class _AccountPool:
         self._min_interval = min_interval_seconds
         self._last_used_at = [0.0] * len(self._accounts)
         # Per-account cooldown-until timestamp and current cooldown
-        # duration - a real, confirmed architectural bug: rate-limit
-        # cooldown used to be ONE global flag shared by every account,
-        # so a single account getting 429'd paused ALL of them at once,
-        # completely defeating the purpose of having several - the
-        # aggregate throughput a multi-account pool exists to provide
-        # never actually materialized, since any one account tripping
-        # its own limit (likely, with several workers hammering
-        # concurrently) stalled the whole pool regardless of how much
-        # headroom the other accounts still had.
+        # duration - previously a single global flag shared by every
+        # account, so one account getting 429'd paused ALL of them,
+        # defeating the whole point of having several.
         self._cooldown_until = [0.0] * len(self._accounts)
         self._cooldown_seconds = [_RATE_LIMIT_BASE_COOLDOWN_SECONDS] * len(self._accounts)
         self._last_hit_at = [0.0] * len(self._accounts)
@@ -563,16 +557,13 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
         params["particle"] = particle_id
     if spell:
         params["spell"] = spell
-    # killstreaker/sheen deliberately NOT included as search params - a
-    # real, confirmed case showed the resulting search page displaying
-    # "unknown" for both filters (the name-string format this project
-    # was sending clearly isn't what backpack.tf's search expects, and
-    # the correct format - likely a numeric id, similar to particle -
-    # isn't confirmed anywhere reliable). "unknown" risks actively
-    # filtering to the WRONG subset rather than just being ignored, so
-    # omitting these entirely is safer than sending a guessed, wrong
-    # value - the search is still correctly filtered by every other
-    # confirmed dimension (item/quality/spell/paint/killstreak_tier/etc).
+    # killstreaker/sheen deliberately NOT included as search params - the
+    # name-string format this project would send isn't what backpack.tf's
+    # search expects (showed "unknown" for both filters), and the
+    # correct format isn't confirmed. Omitting is safer than sending a
+    # guessed, wrong value that would actively filter to the wrong
+    # subset - the search is still correctly filtered by every other
+    # confirmed dimension.
     params["craftable"] = 1 if craftable else 0
     paint_value = paint_rgb_decimal(paint) if paint else None
     if paint_value is not None:
@@ -653,29 +644,18 @@ def _iter_price_entries(craft_block):
 class LocalListingStore:
     """
     Self-collected market data, built from the SAME websocket stream
-    already being consumed for new-listing detection - NOT a call to
-    backpack.tf's own API. This exists because the entire prior
-    reference-price/buy-order mechanism (get_snapshot_min_other_keys,
-    get_best_buy_order_keys below) was built on /classifieds/listings/
-    snapshot, which backpack.tf's OWN Developer Centre changelog states
-    plainly: "v1 listing APIs have been deprecated and rate limited, as
-    they are slated for removal. Please use v2." - and as of the most
-    recent community discussion found (June 2026), there is still no v2
-    endpoint for general market search at all: "still no v2 endpoint for
-    classifieds or listings, just relying on websocket events and
-    collected data." This class IS that "collected data" approach - the
-    only currently-viable one.
+    already used for new-listing detection - NOT a call to backpack.tf's
+    own API. This exists because the prior reference-price/buy-order
+    mechanism was built on /classifieds/listings/snapshot, which
+    backpack.tf's own changelog confirms is deprecated and rate-limited
+    with no v2 replacement as of the most recent community discussion
+    found. This class is the "collected data" approach that replaces it.
 
-    Every incoming listing this project sees (regardless of whether it
-    itself qualifies as a discount) is recorded here, keyed by an EXACT
-    identity tuple built from this project's own already-validated
-    parsing (see listing_identity_key below) - not from trusting an
-    external endpoint's filtering. This means the exact contamination
-    bugs found and fixed earlier this session (spell/paint/craftable/
-    killstreak-tier listings bleeding into each other via an unreliable
-    external filter) cannot happen here by construction: a listing only
-    ever lands in the bucket matching precisely what was parsed for it,
-    and a query only ever reads from that same exact bucket.
+    Every incoming listing (regardless of whether it qualifies as a
+    discount) is recorded here, keyed by an exact identity tuple built
+    from this project's own parsing (see listing_identity_key below),
+    not an external endpoint's filtering - a listing only ever lands in
+    the bucket matching precisely what was parsed for it.
 
     Thread-safe (a plain lock) since listings are recorded from the
     asyncio event loop thread but read from worker threads via
@@ -686,27 +666,26 @@ class LocalListingStore:
                  max_total_buckets=50000):
         # OrderedDict, not a plain dict - move_to_end() in record() below
         # keeps buckets ordered LEAST-recently-updated first, so eviction
-        # (when max_total_buckets is hit) always drops the coldest bucket
-        # first, cheaply (O(1) both to reorder and to pop the front).
+        # always drops the coldest bucket first, cheaply (O(1)).
         #
-        # max_total_buckets is a real, confirmed fix for a real incident:
-        # max_entries_per_key only ever bounded entries WITHIN one bucket
-        # - nothing bounded the number of DISTINCT buckets (identity
-        # keys) this store could hold at once, and buy orders are kept
-        # for up to buy_max_age_seconds (24h by default) specifically so
-        # a missed delete event doesn't lose real data - meaning NOTHING
-        # aged out at all for the first 24h of any fresh process start.
-        # At real, confirmed volume (181,113 buy orders recorded in just
-        # 80 minutes, per a live /stats reading), an unbounded number of
-        # distinct buckets accumulating for hours with nothing pruning
-        # them yet is exactly what took the whole process down via the
-        # OOM killer. 50,000 buckets is generous for what this project
-        # actually needs (every distinct item/quality/effect/attribute
-        # combination genuinely worth tracking) while still bounding
-        # worst-case memory to a fixed, known ceiling regardless of how
-        # long the process has been running or how much of TF2's
-        # marketplace it happens to see.
+        # max_total_buckets fixes a real incident: max_entries_per_key
+        # only bounded entries WITHIN one bucket, nothing bounded the
+        # number of DISTINCT buckets - and since buy orders are kept up
+        # to 24h so a missed delete event doesn't lose data, nothing aged
+        # out at all for the first 24h of a fresh start. At real volume
+        # (181,113 buy orders in 80 minutes) that unbounded growth is
+        # what took the whole process down via the OOM killer. 50,000
+        # buckets bounds worst-case memory to a fixed ceiling regardless
+        # of uptime or how much of the marketplace is seen.
         self._entries = collections.OrderedDict()  # identity_key -> {listing_id: {listing_id, seller_id, price_keys, ts, intent}}
+        # listing_id -> identity_key currently holding it - see record()'s
+        # own comment for why this exists: without it, a listing whose
+        # identity changes between two record() calls left an orphaned,
+        # stale entry sitting in its old bucket forever (or until that
+        # bucket's own freshness window expired). Purely a derived,
+        # in-memory index - never persisted directly, always rebuilt
+        # from self._entries after load_from_disk (see there).
+        self._listing_locations = {}
         self._max_age_seconds = max_age_seconds
         # Matches get_max_buy_price's own BUY_ORDER_SAFETY_NET_SECONDS -
         # retaining a buy order no longer than the window that could ever
@@ -731,6 +710,22 @@ class LocalListingStore:
             return
         ts = timestamp if timestamp is not None else time.time()
         with self._lock:
+            # If this SAME listing_id was last recorded under a
+            # DIFFERENT identity_key, remove it from that old bucket
+            # first - without this, a listing whose identity changes
+            # between two record() calls (an update event parsed
+            # differently than the original) left a stale, orphaned
+            # entry in its old bucket, since remove_listing() only fires
+            # on an explicit delete, not an identity change. That
+            # orphaned entry could then surface as a buy order for a
+            # different item variant than the one being compared.
+            old_key = self._listing_locations.get(listing_id)
+            if old_key is not None and old_key != identity_key:
+                old_bucket = self._entries.get(old_key)
+                if old_bucket is not None:
+                    old_bucket.pop(listing_id, None)
+            self._listing_locations[listing_id] = identity_key
+
             is_new_bucket = identity_key not in self._entries
             if is_new_bucket:
                 self._entries[identity_key] = {}
@@ -749,20 +744,39 @@ class LocalListingStore:
                 oldest_first = sorted(bucket.values(), key=lambda e: e["ts"])
                 for stale in oldest_first[:len(bucket) - self._max_entries_per_key]:
                     del bucket[stale["listing_id"]]
+                    self._listing_locations.pop(stale["listing_id"], None)
             if is_new_bucket and len(self._entries) > self._max_total_buckets:
                 # LRU eviction of a whole bucket, not just entries within
                 # one - see __init__'s own comment for the real incident
                 # this bounds against. next(iter(...)) is the coldest
                 # bucket, since move_to_end() above keeps this dict
                 # ordered least-recently-touched first.
-                self._entries.popitem(last=False)
+                evicted_key, evicted_bucket = self._entries.popitem(last=False)
+                for evicted_listing_id in evicted_bucket:
+                    # Only clear the mapping if it still points at THIS
+                    # (now-evicted) bucket - a listing_id could have
+                    # already been re-pointed to a newer bucket by a
+                    # later record() call for the same listing_id, and
+                    # that newer mapping must survive this eviction.
+                    if self._listing_locations.get(evicted_listing_id) == evicted_key:
+                        del self._listing_locations[evicted_listing_id]
 
     def remove_listing(self, listing_id):
         """Removes a listing from every bucket it might be in, called on
-        backpack.tf's "listing-delete" event. Scans every bucket (no
-        identity key to jump straight to one), but the removal itself is
-        O(1) per bucket (dict pop)."""
+        backpack.tf's "listing-delete" event. The location map (see
+        record()'s own comment) means this can usually jump straight to
+        the ONE bucket a listing is actually in - but still falls back
+        to a full scan if the map doesn't have it (e.g. a listing
+        recorded before this map existed, from a state file saved by an
+        older version), so a delete never silently no-ops just because
+        the map happens to be incomplete."""
         with self._lock:
+            known_key = self._listing_locations.pop(listing_id, None)
+            if known_key is not None:
+                bucket = self._entries.get(known_key)
+                if bucket is not None:
+                    bucket.pop(listing_id, None)
+                return
             for bucket in self._entries.values():
                 bucket.pop(listing_id, None)
 
@@ -808,48 +822,25 @@ class LocalListingStore:
             return None, 0
         return min(trustworthy), len(trustworthy)
 
-    # How recent a buy order needs to be to count as usable for the
-    # discount DECISION - deliberately short, and with NO fallback to
-    # older data (see get_max_buy_price below): per direct correction,
-    # a buy order can genuinely go stale within minutes (fulfilled,
-    # cancelled, or repriced without this project necessarily seeing a
-    # matching event in time), so using anything older risks acting on
-    # a number that's no longer real. There's no live query available
-    # to verify a specific buy order at decision time (the only endpoint
-    # that could - backpack.tf's own classifieds snapshot - is the
-    # THE actual bug behind a real, severe complaint: backpack.tf's own
-    # websocket only fires "listing-update" on an actual create or CHANGE
-    # (confirmed via their docs earlier this session) - there is no
-    # periodic per-listing heartbeat. A buy order a bot posts once and
-    # never touches again generates exactly ONE event, then nothing, for
-    # as long as it stays posted (often days). Requiring one to have been
-    # RE-SEEN within the last few minutes - with no fallback - meant
-    # almost every real, still-active buy order aged out and became
-    # unusable within minutes of being recorded, long before any genuinely
-    # discounted sell listing had a chance to appear against it. That's
-    # not a tuning problem to fix with a bigger number - it's the wrong
-    # model: this project doesn't need "was this RE-CONFIRMED recently",
-    # it needs "is this the CURRENT value, as far as the websocket stream
-    # has told me" - which is a fundamentally different, event-driven
-    # question already answered correctly elsewhere: record() replaces a
-    # listing's price the moment an update event changes it, and
-    # remove_listing() deletes it the moment a delete event arrives (see
-    # both in this same class). A recorded buy order IS the live, current
-    # value - continuously kept correct by that same event stream, not by
-    # how recently it happened to be reconfirmed - right up until one of
-    # those two events says otherwise.
+    # A recorded buy order IS the live, current value, kept correct by
+    # the event stream itself: record() replaces it the moment an update
+    # changes it, remove_listing() deletes it the moment a delete event
+    # arrives. It does NOT go stale just from time passing - backpack.tf
+    # only fires "listing-update" on an actual create/change, no
+    # periodic heartbeat, so a buy order posted once and never touched
+    # again generates exactly one event then nothing for as long as it
+    # stays posted (often days). An earlier version required a buy order
+    # to have been RE-SEEN within the last few minutes with no fallback,
+    # which aged out almost every real, still-active buy order within
+    # minutes of being recorded - the wrong model entirely.
     #
     # This window is therefore a SAFETY NET, not the correctness
-    # mechanism: only relevant if a delete event was somehow missed
-    # entirely (e.g. during a brief reconnect gap - bptf_ws.py reconnects
-    # within seconds, so this gap is normally tiny). Set generously long
-    # so it essentially never fires in normal operation, while still
-    # eventually clearing a truly abandoned entry.
+    # mechanism - only relevant if a delete event was somehow missed
+    # (e.g. a brief reconnect gap). Set generously long so it essentially
+    # never fires in normal operation.
     BUY_ORDER_SAFETY_NET_SECONDS = 24 * 3600
     # A shorter window used ONLY to prefer more-recently-reconfirmed data
-    # when it happens to exist, for a slightly higher-confidence read -
-    # never a requirement, since falling back past it is exactly what
-    # fixes the bug above.
+    # when it happens to exist - never a requirement.
     BUY_ORDER_HIGH_CONFIDENCE_SECONDS = 6 * 3600
 
     def get_max_buy_price(self, identity_key):
@@ -949,18 +940,13 @@ class LocalListingStore:
                     if isinstance(bucket, list):
                         bucket = {e["listing_id"]: e for e in bucket if "listing_id" in e}
                     self._entries[key] = bucket
-                # Trims down to max_total_buckets right after loading too,
-                # not just in record() going forward - a real, confirmed
-                # gap: a file saved BEFORE this cap existed could hold far
-                # more buckets than the cap allows (from the exact
-                # unbounded-growth period that caused a real OOM kill),
-                # and loading it back in would restore that same memory
-                # footprint immediately, bypassing the cap entirely until
-                # enough NEW buckets happened to trigger record()'s own
-                # eviction. Keeps the most recently-updated buckets (by
-                # each bucket's own newest entry) - a perfect LRU replay
-                # of pre-restart order isn't needed for a one-time
-                # startup trim, just bounding the size is.
+                # Trims down to max_total_buckets right after loading
+                # too, not just going forward in record() - a file saved
+                # before this cap existed could hold far more buckets
+                # than allowed, restoring that same memory footprint
+                # immediately on load. Keeps the most recently-updated
+                # buckets - a perfect LRU replay isn't needed for a
+                # one-time startup trim, just bounding the size is.
                 if len(self._entries) > self._max_total_buckets:
                     overflow = len(self._entries) - self._max_total_buckets
                     by_recency = sorted(
@@ -974,6 +960,15 @@ class LocalListingStore:
                         "trimmed the %d oldest.",
                         len(self._entries) + overflow, self._max_total_buckets, overflow,
                     )
+                # Rebuilt from self._entries, not persisted directly (see
+                # __init__'s own comment on why) - has to happen after
+                # the trim above, not before, so it only ever reflects
+                # listings that actually survived into the loaded store.
+                self._listing_locations = {
+                    listing_id: key
+                    for key, bucket in self._entries.items()
+                    for listing_id in bucket
+                }
             log.info("Loaded %d local listing store entries from disk (%s).",
                       self.entry_count(), path)
         except Exception:
