@@ -34,6 +34,7 @@ import matcher
 import runtime_settings
 import steam_inventory
 import steam_schema
+import unusual_effects
 import telegram_commands
 import telegram_notify
 from config import load_config
@@ -146,7 +147,20 @@ class Watcher:
         )
         self.mannco = mannco_client.ManncoClient(cfg["mannco_api_key"], cfg["jwt_refresh_seconds"])
         self.telegram = telegram_notify.TelegramNotifier(cfg["telegram_bot_token"], cfg["telegram_chat_id"])
-        self.particle_name_to_id = steam_schema.fetch_particle_name_to_id(cfg.get("steam_api_key", ""))
+        # Bundled static data (unusual_effects.py) is the guaranteed
+        # baseline - never depends on steam_api_key or any network call
+        # succeeding, unlike the live schema fetch below. A real,
+        # confirmed incident: a common, long-established effect
+        # (Blizzardy Storm, added 2011) went unresolved end-to-end
+        # because the live fetch alone was the only source, and
+        # whatever made it fail (misconfigured/missing steam_api_key,
+        # most likely) meant EVERY effect was unresolved, not just rare
+        # or new ones. The live fetch result is layered ON TOP (still
+        # attempted, still preferred when it succeeds) so a working API
+        # key still adds effects newer than this bundle's own coverage -
+        # this bundle is the floor, not a replacement for the live data.
+        self.particle_name_to_id = dict(unusual_effects.NAME_TO_ID)
+        self.particle_name_to_id.update(steam_schema.fetch_particle_name_to_id(cfg.get("steam_api_key", "")))
         self.particle_id_to_name = {v: k for k, v in self.particle_name_to_id.items()}
         self.inventory_checker = steam_inventory.SteamInventoryChecker(
             cache_ttl_seconds=cfg.get("inventory_cache_seconds", 900)
@@ -917,8 +931,8 @@ class Watcher:
             self.stats["bptf_deduped"] += 1
             return
 
-        item = payload.get("item") or {}
-        quality_obj = item.get("quality") or {}
+        item = bptf_client.safe_dict(payload.get("item"))
+        quality_obj = bptf_client.safe_dict(item.get("quality"))
         quality = quality_obj.get("name")
         # Unusual is unconditionally watched, per explicit request -
         # never toggleable via /addquality-/removequality, unlike every
@@ -1065,7 +1079,7 @@ class Watcher:
                 item.get("particle"), item.get("particleId"), item.get("attributes"),
             )
 
-        particle_obj = item.get("particle") or {}
+        particle_obj = bptf_client.safe_dict(item.get("particle"))
         particle_id = particle_obj.get("id")
         particle_name = particle_obj.get("name")
 
@@ -1242,11 +1256,11 @@ class Watcher:
                     "fields relevant to killstreaker/sheen extraction: killstreaker=%r, sheen=%r",
                     item.get("killstreaker"), item.get("sheen"),
                 )
-            killstreaker_obj = item.get("killstreaker") or {}
+            killstreaker_obj = bptf_client.safe_dict(item.get("killstreaker"))
             raw_killstreaker = killstreaker_obj.get("name") if isinstance(killstreaker_obj, dict) else None
             if killstreak_tier >= 3 and raw_killstreaker in bptf_client.VALID_KILLSTREAKERS:
                 killstreaker = raw_killstreaker
-            sheen_obj = item.get("sheen") or {}
+            sheen_obj = bptf_client.safe_dict(item.get("sheen"))
             raw_sheen = sheen_obj.get("name") if isinstance(sheen_obj, dict) else None
             if killstreak_tier >= 2 and raw_sheen in bptf_client.VALID_SHEENS:
                 sheen = raw_sheen
@@ -1350,7 +1364,7 @@ class Watcher:
         # link is built uniformly for every deal in matcher.py, so this is
         # only the direct-purchase link; left empty if the seller doesn't
         # have one public (the search link still gets them there).
-        link = (payload.get("user") or {}).get("tradeOfferUrl")
+        link = bptf_client.safe_dict(payload.get("user")).get("tradeOfferUrl")
 
         listing = matcher.NormalizedListing(
             source="backpack.tf",

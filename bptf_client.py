@@ -434,6 +434,23 @@ def strip_effect_prefix(name: str, particle_name: str) -> str:
     return name
 
 
+def safe_dict(value):
+    """
+    Returns value if it's a dict, else {} - the safe replacement for the
+    "value or {}" pattern used all over this project (and main.py) to
+    defensively unpack a nested field that's normally an object.
+    "or {}" only substitutes when value is FALSY - a truthy NON-dict
+    (a string, a list, a number) sails straight through unchanged, and
+    the very next .get() on it throws. A real, confirmed case: a
+    scam/fake listing bot's data for one specific item had some nested
+    field in this shape, and the SAME "X or {}" pattern was repeated
+    across this file AND main.py's own real-time event handler (the
+    highest-volume, most exposed path in the whole project) - all
+    fixed here at once, the same safe way.
+    """
+    return value if isinstance(value, dict) else {}
+
+
 def strip_variant_prefixes(name: str) -> str:
     """
     Strips "Non-Craftable", Killstreak-tier, and Australium prefixes on
@@ -1165,8 +1182,12 @@ class BackpackTFPriceList:
             if not isinstance(entry, dict) or entry.get("intent") != "buy":
                 continue
             try:
-                item = entry.get("item") or {}
-                particle_obj = item.get("particle") or {}
+                item = entry.get("item")
+                if not isinstance(item, dict):
+                    item = {}
+                particle_obj = item.get("particle")
+                if not isinstance(particle_obj, dict):
+                    particle_obj = {}
                 particle_id = particle_obj.get("id")
                 # particle_id is only EXPECTED for Unusual - for every
                 # other quality, no particle is the normal case, not a
@@ -1203,8 +1224,10 @@ class BackpackTFPriceList:
                 # within one response) only if the response entry itself
                 # has no id at all.
                 listing_id = entry.get("id") or entry.get("listing_id") or f"bulk-{i}"
-                seller = ((entry.get("user") or {}).get("id")
-                          or (entry.get("steamid")) or "unknown")
+                user_obj = entry.get("user")
+                if not isinstance(user_obj, dict):
+                    user_obj = {}
+                seller = user_obj.get("id") or (entry.get("steamid")) or "unknown"
                 # Derived from name text, NOT the raw item.craftable
                 # field - same confirmed-unreliable field, same fix, as
                 # main.py's own handle_bptf_event. Matters MORE here than
@@ -1215,8 +1238,12 @@ class BackpackTFPriceList:
                 # long time if that later event may not come for hours.
                 entry_name = item.get("name") or name
                 craftable = not entry_name.startswith("Non-Craftable ")
-                killstreaker_obj = item.get("killstreaker") or {}
-                sheen_obj = item.get("sheen") or {}
+                killstreaker_obj = item.get("killstreaker")
+                if not isinstance(killstreaker_obj, dict):
+                    killstreaker_obj = {}
+                sheen_obj = item.get("sheen")
+                if not isinstance(sheen_obj, dict):
+                    sheen_obj = {}
                 # Actual quality from THIS entry, defaulting to what was
                 # QUERIED (never hardcoded "Unusual") - a real, confirmed
                 # case: a "Strange Unusual" item (quality Strange, but
@@ -1227,7 +1254,10 @@ class BackpackTFPriceList:
                 # quality pooled it with a genuinely different item
                 # sharing the same particle_id - wrong buy order matched
                 # to the wrong item.
-                entry_quality = ((item.get("quality") or {}).get("name")) or quality_name
+                entry_quality_obj = item.get("quality")
+                if not isinstance(entry_quality_obj, dict):
+                    entry_quality_obj = {}
+                entry_quality = entry_quality_obj.get("name") or quality_name
                 defindex = item.get("defindex")
                 key = listing_identity_key(
                     name, entry_quality, particle_id, None, craftable,
@@ -1323,35 +1353,46 @@ class BackpackTFPriceList:
         for entry in listings:
             if not isinstance(entry, dict) or entry.get("intent") != "buy":
                 continue
-            item = entry.get("item") or {}
-            # Quality must match what was actually requested - a real,
-            # confirmed case: a "Strange Unusual" item (Strange quality,
-            # but still carrying a particle effect) came back from a
-            # quality-filtered query anyway, which would have silently
-            # let a different item's price into this max() otherwise.
-            entry_quality = (item.get("quality") or {}).get("name")
-            if entry_quality and entry_quality != quality_name:
-                continue
-            # particle/craftable/killstreak_tier/australium are now
-            # filtered HERE, client-side, instead of as query params -
-            # the query only sends the confirmed sku=defindex;quality
-            # part (see this function's own docstring for why).
-            if particle_id is not None:
-                entry_particle = (item.get("particle") or {}).get("id")
-                if entry_particle != particle_id:
+            try:
+                item = safe_dict(entry.get("item"))
+                # Quality must match what was actually requested - a real,
+                # confirmed case: a "Strange Unusual" item (Strange quality,
+                # but still carrying a particle effect) came back from a
+                # quality-filtered query anyway, which would have silently
+                # let a different item's price into this max() otherwise.
+                entry_quality = safe_dict(item.get("quality")).get("name")
+                if entry_quality and entry_quality != quality_name:
                     continue
-            entry_name = item.get("name") or ""
-            entry_craftable = not entry_name.startswith("Non-Craftable ")
-            if bool(craftable) != entry_craftable:
+                # particle/craftable/killstreak_tier/australium are now
+                # filtered HERE, client-side, instead of as query params -
+                # the query only sends the confirmed sku=defindex;quality
+                # part (see this function's own docstring for why).
+                if particle_id is not None:
+                    entry_particle = safe_dict(item.get("particle")).get("id")
+                    if entry_particle != particle_id:
+                        continue
+                entry_name = item.get("name") or ""
+                entry_craftable = not entry_name.startswith("Non-Craftable ")
+                if bool(craftable) != entry_craftable:
+                    continue
+                if bool(australium) != entry_name.startswith("Australium "):
+                    continue
+                entry_ks_tier = item.get("killstreakTier") or 0
+                if (killstreak_tier or 0) != entry_ks_tier:
+                    continue
+                price_keys = self.currencies_to_keys(entry.get("currencies") or {})
+                if price_keys is not None and price_keys > 0:
+                    prices.append(price_keys)
+            except Exception:
+                # Per-entry, not per-query - same reasoning as the bulk
+                # scanner's own identical protection: one malformed entry
+                # shouldn't cost every other entry in an otherwise-good
+                # response, and this function previously had NO such
+                # protection at all despite running for every priority
+                # item evaluation - a crash here was just as exposed as
+                # the bulk scanner's was before that one got this fix.
+                log.exception("Live snapshot entry failed for %s - skipping just this one.", name)
                 continue
-            if bool(australium) != entry_name.startswith("Australium "):
-                continue
-            entry_ks_tier = item.get("killstreakTier") or 0
-            if (killstreak_tier or 0) != entry_ks_tier:
-                continue
-            price_keys = self.currencies_to_keys(entry.get("currencies") or {})
-            if price_keys is not None and price_keys > 0:
-                prices.append(price_keys)
         if not prices:
             return None, 0
         trustworthy = _filter_price_outliers(prices, floor_fraction=0.3, ceiling_fraction=3.0)
