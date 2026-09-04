@@ -484,21 +484,31 @@ class Watcher:
         return [buttons] if buttons else None
 
     def format_alert(self, deal: dict) -> str:
-        effect = f" ({deal['particle_name']})" if deal["particle_name"] else ""
-        variant = f" [{deal['variant_label']}]" if deal.get("variant_label") else ""
+        import html
+        effect = f" ({html.escape(deal['particle_name'], quote=False)})" if deal["particle_name"] else ""
+        variant = f" [{html.escape(deal['variant_label'], quote=False)}]" if deal.get("variant_label") else ""
         usd = f", ${deal['price_usd']:.2f}" if deal["price_usd"] else ""
 
+        # Every dynamic string below is backpack.tf-sourced text going
+        # into an HTML-parse-mode message - html.escape()d for the same
+        # reason seller_note_line/safe_display_name already are further
+        # down: this project has already confirmed backpack.tf's own
+        # "name" field can contain unexpected raw tokens (the
+        # #Attrib_Particle artifact), and an unescaped "<"/"&"/">" in
+        # ANY of these would break Telegram's HTML parser and silently
+        # drop the WHOLE message - a real, previously-unaudited gap this
+        # project only caught for two of these eight fields until now.
         special_lines = []
         if deal["paint"]:
-            special_lines.append(f"🎨 Краска: {deal['paint']}")
+            special_lines.append(f"🎨 Краска: {html.escape(deal['paint'], quote=False)}")
         if deal["spells"]:
-            special_lines.append(f"👻 Спелл(ы): {', '.join(deal['spells'])}")
+            special_lines.append(f"👻 Спелл(ы): {html.escape(', '.join(deal['spells']), quote=False)}")
         if deal.get("strange_parts"):
-            special_lines.append(f"🔧 Strange Part(ы): {', '.join(deal['strange_parts'])}")
+            special_lines.append(f"🔧 Strange Part(ы): {html.escape(', '.join(deal['strange_parts']), quote=False)}")
         if deal.get("killstreaker"):
-            special_lines.append(f"🔥 Killstreaker (эффект в глазах): {deal['killstreaker']}")
+            special_lines.append(f"🔥 Killstreaker (эффект в глазах): {html.escape(deal['killstreaker'], quote=False)}")
         if deal.get("sheen"):
-            special_lines.append(f"✨ Sheen (цвет вспышки при убийствах): {deal['sheen']}")
+            special_lines.append(f"✨ Sheen (цвет вспышки при убийствах): {html.escape(deal['sheen'], quote=False)}")
         if deal.get("trade_closed"):
             special_lines.append("🔒 Инвентарь продавца закрыт — трейд напрямую недоступен")
         special_block = ("\n" + "\n".join(special_lines)) if special_lines else ""
@@ -538,7 +548,6 @@ class Watcher:
 
         seller_note_line = ""
         if deal.get("seller_note"):
-            import html
             # Real, confirmed field (see the listing construction in
             # handle_bptf_event) - the seller's own comment on their
             # listing, shown verbatim like the "Description" field in the
@@ -546,7 +555,7 @@ class Watcher:
             # it's arbitrary user text being dropped into an HTML-parsed
             # message - an unescaped "<" or "&" in someone's note would
             # otherwise break the whole message's formatting.
-            seller_note_line = f"\n📝 Продавец пишет: [<i>{html.escape(deal['seller_note'])}</i>]"
+            seller_note_line = f"\n📝 Продавец пишет: [<i>{html.escape(deal['seller_note'], quote=False)}</i>]"
 
         # Only called out when true - "this seller's had this item up
         # before" is the unremarkable default and doesn't need a line of
@@ -576,8 +585,7 @@ class Watcher:
         # such token would break Telegram's HTML parser and silently drop
         # the WHOLE message, the same way an unescaped seller_note would
         # (already fixed, see seller_note_line above).
-        import html
-        safe_display_name = html.escape(deal["display_name"])
+        safe_display_name = html.escape(deal["display_name"], quote=False)
         return (
             f"{priority_prefix}"
             f"🔥 <b>-{deal['discount_percent']:.0f}%</b> — {deal['source']}\n"
@@ -765,9 +773,9 @@ class Watcher:
                 buy_price, buy_count = store.get_max_buy_price(key)
                 sell_price, sell_count = store.get_min_sell_price(key)
                 now = time.time()
-                bucket = store._entries.get(key, {})
-                buy_ages = [now - e["ts"] for e in bucket.values() if e["intent"] == "buy"]
-                sell_ages = [now - e["ts"] for e in bucket.values() if e["intent"] == "sell"]
+                entries = store.get_all_entries(key)
+                buy_ages = [now - e["ts"] for e in entries if e["intent"] == "buy"]
+                sell_ages = [now - e["ts"] for e in entries if e["intent"] == "sell"]
 
                 buy_line = (
                     f"💰 Buy order: {buy_price:.2f} ключей ({buy_count} шт., самый свежий "
@@ -874,7 +882,16 @@ class Watcher:
             # are currently being sent, and costs nothing to do anyway.
             listing_id = payload.get("id")
             if listing_id is not None:
-                self.bptf.local_listings.remove_listing(str(listing_id))
+                # Dispatched to a thread - remove_listing() scans EVERY
+                # bucket in the store (no identity key to jump straight
+                # to one), now up to max_total_buckets (50,000) of them,
+                # under the same plain threading.Lock record() below
+                # also uses - same event-loop-blocking risk as that call,
+                # see its own comment, except this one iterates the
+                # WHOLE store on every single delete event rather than
+                # touching just one bucket, making it the more expensive
+                # of the two to ever hold directly on the event loop.
+                await asyncio.to_thread(self.bptf.local_listings.remove_listing, str(listing_id))
             return
 
         if self.runtime.paused:
@@ -912,6 +929,22 @@ class Watcher:
 
         name = item.get("name") or item.get("marketName") or item.get("baseName")
         if not name:
+            return
+        # Rejected here, at the source, before EVER being recorded into
+        # local_listings - a real, confirmed gap: this check used to only
+        # run later, inside evaluate_listing (matcher.py), which decides
+        # whether to ALERT - but every event, excluded type or not, was
+        # still being recorded into the database first regardless, so an
+        # explicitly banned item's buy/sell data sat there taking up
+        # space it could never actually be used for (evaluate_listing
+        # would reject it every time anyway). Same name-text check
+        # evaluate_listing's own excluded_types filter uses
+        # (matcher.py's item_type is never actually populated for
+        # backpack.tf, so that filter is name-text-only in practice too).
+        name_lower_for_exclusion = name.lower()
+        if any(excluded.lower() in name_lower_for_exclusion
+               for excluded in self.cfg.get("excluded_types", [])):
+            self.stats["bptf_rejected_excluded_type"] += 1
             return
         # backpack.tf's own particle-name resolution occasionally fails
         # for some effects, leaving a raw, unresolved internal token
@@ -1030,6 +1063,27 @@ class Watcher:
             # all (e.g. steam_api_key not configured, or a brand new
             # effect Valve hasn't indexed yet).
             particle_name = self.particle_id_to_name.get(particle_id) or particle_name
+
+        if particle_name and particle_name.startswith("#"):
+            # THE actual root cause of a repeatedly-reported symptom
+            # ("Steaming Citizen Cane (#Attrib_Particle36)" - the effect
+            # prefix left un-stripped from the name AND the raw token
+            # shown as the effect itself): backpack.tf's real-time
+            # stream doesn't always resolve a human-readable particle
+            # name - for some events, item.particle.name is ITSELF this
+            # raw, unresolved internal token ("#Attrib_ParticleNN"), not
+            # a display name at all. An EARLIER fix stripped this same
+            # token as a SUFFIX off the item's own name field, which
+            # never was where it actually came from - it flows through
+            # via THIS field, particle_name, into two separate places
+            # (strip_effect_prefix below, which fails to match this
+            # raw token against the name's real prefix like "Steaming",
+            # leaving it un-stripped; and format_alert's "effect"
+            # parenthetical, which shows this field completely raw).
+            # Treated as if there were no resolved name at all - None
+            # is the correct value for "this effect has no known name
+            # right now", not a raw internal token no one should see.
+            particle_name = None
 
         if particle_name:
             # Confirmed real via a direct report: backpack.tf's own
@@ -1218,21 +1272,12 @@ class Watcher:
             texture=texture, defindex=defindex, killstreaker=killstreaker, sheen=sheen,
         )
         self._name_to_identity_keys[name.lower()].add(identity_key)
-        # Same name-text check evaluate_listing's own excluded_types
-        # filter uses (matcher.py's item_type is never actually
-        # populated for backpack.tf, so that filter is name-text-only in
-        # practice too - see its own comment) - an Unusual item whose
-        # name matches an excluded type would never pass evaluate_listing
-        # anyway, so there's no point spending proactive-scan requests
-        # keeping its buy-order data fresh.
-        name_lower_for_exclusion = name.lower()
-        is_excluded_type = any(
-            excluded.lower() in name_lower_for_exclusion
-            for excluded in self.cfg.get("excluded_types", [])
-        )
+        # excluded_types already rejected and returned early above, at
+        # the very top of this function - anything reaching this point
+        # is guaranteed not excluded.
         is_currently_watched_quality = quality == "Unusual" or quality in self.runtime.watched_qualities
         scan_key = (name, quality)
-        if is_currently_watched_quality and not is_excluded_type and scan_key not in self._known_scan_items:
+        if is_currently_watched_quality and scan_key not in self._known_scan_items:
             # Hard cap, FIFO-evicted (oldest-inserted first - regular
             # dicts keep insertion order) - see this dict's own comment
             # in __init__ for why this cap exists at all: unbounded
@@ -1241,7 +1286,22 @@ class Watcher:
                 oldest_key = next(iter(self._known_scan_items))
                 del self._known_scan_items[oldest_key]
             self._known_scan_items[scan_key] = {"ts": 0.0, "category": category}
-        self.bptf.local_listings.record(
+        # Dispatched to a thread, not called directly on the event loop -
+        # a real, confirmed lag/freeze risk: record() takes a plain
+        # threading.Lock (LocalListingStore's own, shared with every
+        # evaluate_listing() read too), and this function itself runs
+        # directly on the asyncio event loop (handle_bptf_event is async
+        # def, called from a task, not from asyncio.to_thread) - so any
+        # time this specific lock happened to already be held by a
+        # WORKER thread (running evaluate_listing via its own
+        # asyncio.to_thread), THIS call would block waiting for it
+        # directly on the event loop itself. A blocked event loop can't
+        # schedule anything else meanwhile - including Telegram's own
+        # command dispatch, even though the actual Telegram HTTP call
+        # runs on its own dedicated thread pool, since even starting
+        # that await needs the event loop to be free to run it.
+        await asyncio.to_thread(
+            self.bptf.local_listings.record,
             identity_key, str(listing_id), seller_steamid, price_keys, intent,
         )
 
@@ -1379,7 +1439,18 @@ class Watcher:
                 errors_text, keyboard = telegram_commands.build_errors_view(_error_buffer.recent(100))
                 await self._run_telegram(self.telegram.send, errors_text, keyboard)
             elif command == "checkitem":
-                reply = self._check_item(text.split(maxsplit=1)[1] if " " in text else "")
+                # Dispatched to a thread - a real, confirmed risk found
+                # during a systematic Telegram-load sweep: this scans
+                # self._name_to_identity_keys (unbounded, slowly growing
+                # for the whole process lifetime) AND reads store._entries
+                # directly (bypassing LocalListingStore's own lock
+                # entirely, unlike every other read path in this
+                # project) - both were running synchronously on the
+                # event loop itself, the same event-loop-blocking risk
+                # already fixed for record()/remove_listing() above.
+                reply = await asyncio.to_thread(
+                    self._check_item, text.split(maxsplit=1)[1] if " " in text else ""
+                )
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "setaccounts":
                 raw = text.split(maxsplit=1)[1] if " " in text or "\n" in text else ""

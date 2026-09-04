@@ -48,10 +48,27 @@ def _throttle():
 
 
 class SteamInventoryChecker:
-    def __init__(self, cache_ttl_seconds: int = 900):
+    def __init__(self, cache_ttl_seconds: int = 900, max_cache_entries: int = 20000):
         self.cache_ttl_seconds = cache_ttl_seconds
         self.session = requests.Session()
-        self._cache = {}  # steamid -> (timestamp, is_public: bool)
+        # steamid -> (timestamp, is_public: bool). CAPPED, FIFO-evicted
+        # (oldest-inserted first - regular dicts keep insertion order) -
+        # a real, confirmed bug found during a systematic sweep of files
+        # this project hadn't audited yet: nothing ever removed an entry
+        # once cached, only overwrote it if the SAME steamid was checked
+        # again - at real volume (hundreds of thousands of events,
+        # potentially thousands of distinct sellers), this is the exact
+        # same unbounded-growth pattern that already took the whole
+        # process down once via the OOM killer (see main.py's
+        # _known_scan_items cap and its own comment for that incident).
+        self.max_cache_entries = max_cache_entries
+        self._cache = {}
+
+    def _cache_set(self, steamid, value):
+        if steamid not in self._cache and len(self._cache) >= self.max_cache_entries:
+            oldest_key = next(iter(self._cache))
+            del self._cache[oldest_key]
+        self._cache[steamid] = value
 
     def is_public(self, steamid: str):
         """
@@ -79,7 +96,7 @@ class SteamInventoryChecker:
         if resp.status_code == 403:
             # This is Steam's standard response for a private profile /
             # private inventory on this endpoint.
-            self._cache[steamid] = (now, False)
+            self._cache_set(steamid, (now, False))
             return False
 
         if resp.status_code == 429:
@@ -100,5 +117,5 @@ class SteamInventoryChecker:
         success = data.get("success")
         is_public = bool(success) and success not in (False, 0)
 
-        self._cache[steamid] = (now, is_public)
+        self._cache_set(steamid, (now, is_public))
         return is_public

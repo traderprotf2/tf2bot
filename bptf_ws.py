@@ -140,7 +140,7 @@ async def stream_listing_events(on_event):
                             # shape alone.
                             delete_payload = e.get("payload") or {}
                             delete_payload["_bptf_event_type"] = "delete"
-                            asyncio.create_task(_dispatch_event(on_event, delete_payload))
+                            _spawn_dispatch(on_event, delete_payload)
                             continue
                         if event_type != "listing-update":
                             continue
@@ -163,7 +163,7 @@ async def stream_listing_events(on_event):
                             continue
                         if payload.get("status") not in (None, "active"):
                             continue
-                        asyncio.create_task(_dispatch_event(on_event, payload))
+                        _spawn_dispatch(on_event, payload)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -178,6 +178,24 @@ async def stream_listing_events(on_event):
 # is one), just a sane ceiling against a burst of thousands of events
 # arriving in one batch spinning up thousands of simultaneous tasks.
 _dispatch_semaphore = asyncio.Semaphore(60)
+
+# Holds a strong reference to every task created via _spawn_dispatch
+# below, for as long as it's running - a real, confirmed Python pitfall
+# found during a systematic sweep of files this project hadn't audited
+# yet: asyncio.create_task()'s own docs warn that a task with no
+# reference kept anywhere else "can be garbage collected" mid-execution
+# without warning, since the event loop itself only holds a weak
+# reference. Every dispatch here was calling create_task() and
+# immediately discarding the only reference to it - the standard,
+# documented fix is exactly this: keep it in a set, drop it via a
+# done-callback once it actually finishes on its own.
+_background_tasks = set()
+
+
+def _spawn_dispatch(on_event, payload):
+    task = asyncio.create_task(_dispatch_event(on_event, payload))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 async def _dispatch_event(on_event, payload):

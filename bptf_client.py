@@ -14,6 +14,7 @@ backpack.tf's own listed key price (in refined metal) converts its
 metal-denominated prices into keys.
 """
 
+import collections
 import json
 import logging
 import os
@@ -617,8 +618,31 @@ class LocalListingStore:
     asyncio.to_thread(evaluate_listing, ...).
     """
 
-    def __init__(self, max_age_seconds=3600, buy_max_age_seconds=None, max_entries_per_key=300):
-        self._entries = {}  # identity_key -> {listing_id: {listing_id, seller_id, price_keys, ts, intent}}
+    def __init__(self, max_age_seconds=3600, buy_max_age_seconds=None, max_entries_per_key=300,
+                 max_total_buckets=50000):
+        # OrderedDict, not a plain dict - move_to_end() in record() below
+        # keeps buckets ordered LEAST-recently-updated first, so eviction
+        # (when max_total_buckets is hit) always drops the coldest bucket
+        # first, cheaply (O(1) both to reorder and to pop the front).
+        #
+        # max_total_buckets is a real, confirmed fix for a real incident:
+        # max_entries_per_key only ever bounded entries WITHIN one bucket
+        # - nothing bounded the number of DISTINCT buckets (identity
+        # keys) this store could hold at once, and buy orders are kept
+        # for up to buy_max_age_seconds (24h by default) specifically so
+        # a missed delete event doesn't lose real data - meaning NOTHING
+        # aged out at all for the first 24h of any fresh process start.
+        # At real, confirmed volume (181,113 buy orders recorded in just
+        # 80 minutes, per a live /stats reading), an unbounded number of
+        # distinct buckets accumulating for hours with nothing pruning
+        # them yet is exactly what took the whole process down via the
+        # OOM killer. 50,000 buckets is generous for what this project
+        # actually needs (every distinct item/quality/effect/attribute
+        # combination genuinely worth tracking) while still bounding
+        # worst-case memory to a fixed, known ceiling regardless of how
+        # long the process has been running or how much of TF2's
+        # marketplace it happens to see.
+        self._entries = collections.OrderedDict()  # identity_key -> {listing_id: {listing_id, seller_id, price_keys, ts, intent}}
         self._max_age_seconds = max_age_seconds
         # Matches get_max_buy_price's own BUY_ORDER_SAFETY_NET_SECONDS -
         # retaining a buy order no longer than the window that could ever
@@ -630,6 +654,7 @@ class LocalListingStore:
         # net for a missed delete event, not the correctness mechanism.
         self._buy_max_age_seconds = buy_max_age_seconds if buy_max_age_seconds is not None else 24 * 3600
         self._max_entries_per_key = max_entries_per_key
+        self._max_total_buckets = max_total_buckets
         self._lock = threading.Lock()
 
     def record(self, identity_key, listing_id, seller_id, price_keys, intent, timestamp=None):
@@ -642,7 +667,14 @@ class LocalListingStore:
             return
         ts = timestamp if timestamp is not None else time.time()
         with self._lock:
-            bucket = self._entries.setdefault(identity_key, {})
+            is_new_bucket = identity_key not in self._entries
+            if is_new_bucket:
+                self._entries[identity_key] = {}
+            else:
+                # Touch: moves this bucket to the "most recently used"
+                # end, so eviction below always drops the coldest one.
+                self._entries.move_to_end(identity_key)
+            bucket = self._entries[identity_key]
             bucket[listing_id] = {
                 "listing_id": listing_id, "seller_id": seller_id,
                 "price_keys": price_keys, "ts": ts, "intent": intent,
@@ -653,6 +685,13 @@ class LocalListingStore:
                 oldest_first = sorted(bucket.values(), key=lambda e: e["ts"])
                 for stale in oldest_first[:len(bucket) - self._max_entries_per_key]:
                     del bucket[stale["listing_id"]]
+            if is_new_bucket and len(self._entries) > self._max_total_buckets:
+                # LRU eviction of a whole bucket, not just entries within
+                # one - see __init__'s own comment for the real incident
+                # this bounds against. next(iter(...)) is the coldest
+                # bucket, since move_to_end() above keeps this dict
+                # ordered least-recently-touched first.
+                self._entries.popitem(last=False)
 
     def remove_listing(self, listing_id):
         """Removes a listing from every bucket it might be in, called on
@@ -681,6 +720,19 @@ class LocalListingStore:
 
     def _fresh_values(self, identity_key, intent, exclude_listing_id=None, max_age=None):
         return [e["price_keys"] for e in self._fresh_entries(identity_key, intent, exclude_listing_id, max_age)]
+
+    def get_all_entries(self, identity_key):
+        """
+        Every entry (buy and sell, fresh or stale) currently in one
+        bucket - the proper, locked way to inspect a bucket's raw
+        contents (used by /checkitem's diagnostic display, which wants
+        to show age info even for stale entries, not just fresh ones).
+        A real, confirmed gap this replaces: main.py used to read
+        store._entries directly for this, bypassing the lock every
+        other read path in this class goes through.
+        """
+        with self._lock:
+            return list(self._entries.get(identity_key, {}).values())
 
     def get_min_sell_price(self, identity_key, exclude_listing_id=None):
         """Mirrors get_snapshot_min_other_keys's old return shape:
@@ -833,6 +885,31 @@ class LocalListingStore:
                     if isinstance(bucket, list):
                         bucket = {e["listing_id"]: e for e in bucket if "listing_id" in e}
                     self._entries[key] = bucket
+                # Trims down to max_total_buckets right after loading too,
+                # not just in record() going forward - a real, confirmed
+                # gap: a file saved BEFORE this cap existed could hold far
+                # more buckets than the cap allows (from the exact
+                # unbounded-growth period that caused a real OOM kill),
+                # and loading it back in would restore that same memory
+                # footprint immediately, bypassing the cap entirely until
+                # enough NEW buckets happened to trigger record()'s own
+                # eviction. Keeps the most recently-updated buckets (by
+                # each bucket's own newest entry) - a perfect LRU replay
+                # of pre-restart order isn't needed for a one-time
+                # startup trim, just bounding the size is.
+                if len(self._entries) > self._max_total_buckets:
+                    overflow = len(self._entries) - self._max_total_buckets
+                    by_recency = sorted(
+                        self._entries.items(),
+                        key=lambda kv: max((e.get("ts", 0) for e in kv[1].values()), default=0),
+                    )
+                    for stale_key, _ in by_recency[:overflow]:
+                        del self._entries[stale_key]
+                    log.warning(
+                        "Loaded local listing store had %d buckets, over the %d cap - "
+                        "trimmed the %d oldest.",
+                        len(self._entries) + overflow, self._max_total_buckets, overflow,
+                    )
             log.info("Loaded %d local listing store entries from disk (%s).",
                       self.entry_count(), path)
         except Exception:
@@ -958,19 +1035,30 @@ class BackpackTFPriceList:
         possible (usd isn't metal), so for usd we fall back to whatever
         USD-per-key rate the caller supplies (mannco.store's live key
         price is used for this elsewhere in the project).
+
+        Defensive against a malformed value (a real, confirmed case: this
+        function crashed uncaught somewhere in real, high-volume traffic,
+        taking down whatever loop called it - main.py's own primary
+        event handler is ONE of this function's callers, not just the
+        proactive scanner) - float()ing something backpack.tf sent that
+        isn't actually string/number-shaped returns None (this listing's
+        price genuinely can't be read) rather than raising.
         """
-        if not currencies:
+        if not currencies or not isinstance(currencies, dict):
             return None
         total = 0.0
         got_any = False
-        if currencies.get("keys"):
-            total += float(currencies["keys"])
-            got_any = True
-        if currencies.get("metal"):
-            if not self.key_price_metal:
-                return None
-            total += float(currencies["metal"]) / self.key_price_metal
-            got_any = True
+        try:
+            if currencies.get("keys"):
+                total += float(currencies["keys"])
+                got_any = True
+            if currencies.get("metal"):
+                if not self.key_price_metal:
+                    return None
+                total += float(currencies["metal"]) / self.key_price_metal
+                got_any = True
+        except (TypeError, ValueError):
+            return None
         if not got_any and currencies.get("usd"):
             return None  # caller must handle pure-usd listings separately
         return total if got_any else None
@@ -1076,74 +1164,93 @@ class BackpackTFPriceList:
         for i, entry in enumerate(listings):
             if not isinstance(entry, dict) or entry.get("intent") != "buy":
                 continue
-            item = entry.get("item") or {}
-            particle_obj = item.get("particle") or {}
-            particle_id = particle_obj.get("id")
-            # particle_id is only EXPECTED for Unusual - for every other
-            # quality, no particle is the normal case, not a reason to
-            # skip (a real, confirmed bug fixed while generalizing this
-            # past Unusual-only: the old unconditional "skip if no
-            # particle" check would have silently recorded nothing at
-            # all for every non-Unusual quality).
-            if quality_name == "Unusual" and particle_id is None:
-                if not sample_logged and not self._bulk_scan_sample_logged:
-                    # Diagnostic sample - a real, confirmed case: the
-                    # response CAN be a valid list (no "unexpected shape"
-                    # warning fires) while every entry still fails to
-                    # record anything, if this project's field-name
-                    # assumptions about EACH entry's own structure (not
-                    # the outer response) are wrong. One real, raw sample
-                    # makes that visible instead of silently recording
-                    # zero forever with no error anywhere.
-                    log.warning(
-                        "DIAGNOSTIC SAMPLE (bulk scan entry with no resolvable particle_id) "
-                        "for %s - raw entry: %r", name, entry,
-                    )
-                    sample_logged = True
-                    self._bulk_scan_sample_logged = True
+            try:
+                item = entry.get("item") or {}
+                particle_obj = item.get("particle") or {}
+                particle_id = particle_obj.get("id")
+                # particle_id is only EXPECTED for Unusual - for every
+                # other quality, no particle is the normal case, not a
+                # reason to skip (a real, confirmed bug fixed while
+                # generalizing this past Unusual-only: the old
+                # unconditional "skip if no particle" check would have
+                # silently recorded nothing at all for every non-Unusual
+                # quality).
+                if quality_name == "Unusual" and particle_id is None:
+                    if not sample_logged and not self._bulk_scan_sample_logged:
+                        # Diagnostic sample - a real, confirmed case: the
+                        # response CAN be a valid list (no "unexpected
+                        # shape" warning fires) while every entry still
+                        # fails to record anything, if this project's
+                        # field-name assumptions about EACH entry's own
+                        # structure (not the outer response) are wrong.
+                        # One real, raw sample makes that visible instead
+                        # of silently recording zero forever with no
+                        # error anywhere.
+                        log.warning(
+                            "DIAGNOSTIC SAMPLE (bulk scan entry with no resolvable particle_id) "
+                            "for %s - raw entry: %r", name, entry,
+                        )
+                        sample_logged = True
+                        self._bulk_scan_sample_logged = True
+                    continue
+                price_keys = self.currencies_to_keys(entry.get("currencies") or {})
+                if price_keys is None or price_keys <= 0:
+                    continue
+                # Falls back to an index-based id (never just
+                # seller+particle, which - for any quality other than
+                # Unusual - would ALWAYS be seller+None, colliding
+                # between different real listings from the same seller
+                # within one response) only if the response entry itself
+                # has no id at all.
+                listing_id = entry.get("id") or entry.get("listing_id") or f"bulk-{i}"
+                seller = ((entry.get("user") or {}).get("id")
+                          or (entry.get("steamid")) or "unknown")
+                # Derived from name text, NOT the raw item.craftable
+                # field - same confirmed-unreliable field, same fix, as
+                # main.py's own handle_bptf_event. Matters MORE here than
+                # it first looks: this populates the buy-order side of
+                # the store, which can sit unrefreshed for hours until
+                # that specific buy order's own next websocket event -
+                # "a later real event corrects it" doesn't hold for a
+                # long time if that later event may not come for hours.
+                entry_name = item.get("name") or name
+                craftable = not entry_name.startswith("Non-Craftable ")
+                killstreaker_obj = item.get("killstreaker") or {}
+                sheen_obj = item.get("sheen") or {}
+                # Actual quality from THIS entry, defaulting to what was
+                # QUERIED (never hardcoded "Unusual") - a real, confirmed
+                # case: a "Strange Unusual" item (quality Strange, but
+                # still carrying a particle effect - a real TF2
+                # combination this project never accounted for before)
+                # was coming back from a quality-filtered query anyway,
+                # and blindly labeling every result with the queried
+                # quality pooled it with a genuinely different item
+                # sharing the same particle_id - wrong buy order matched
+                # to the wrong item.
+                entry_quality = ((item.get("quality") or {}).get("name")) or quality_name
+                defindex = item.get("defindex")
+                key = listing_identity_key(
+                    name, entry_quality, particle_id, None, craftable,
+                    None, item.get("killstreakTier") or 0, name.startswith("Australium "),
+                    killstreaker=killstreaker_obj.get("name"), sheen=sheen_obj.get("name"),
+                    defindex=defindex,
+                )
+                self.local_listings.record(key, str(listing_id), str(seller), price_keys, "buy")
+                recorded += 1
+            except Exception:
+                # Per-entry, not per-scan: a real, confirmed case - this
+                # loop crashed uncaught (past this point, outside the
+                # request-level try/except above) for reasons never
+                # pinned down against real backpack.tf data, taking the
+                # WHOLE scan down with it on every single occurrence,
+                # for many different items, at real volume (1554 errors
+                # in 3 hours). One malformed entry (an unexpected type in
+                # currencies, a missing nested field some other code path
+                # doesn't guard) should cost that ONE entry, never the
+                # rest of a real, mostly-good response.
+                log.exception("Bulk scan entry failed for %s (%s), entry %d - skipping just this one.",
+                               name, quality_name, i)
                 continue
-            price_keys = self.currencies_to_keys(entry.get("currencies") or {})
-            if price_keys is None or price_keys <= 0:
-                continue
-            # Falls back to an index-based id (never just seller+particle,
-            # which - for any quality other than Unusual - would ALWAYS
-            # be seller+None, colliding between different real listings
-            # from the same seller within one response) only if the
-            # response entry itself has no id at all.
-            listing_id = entry.get("id") or entry.get("listing_id") or f"bulk-{i}"
-            seller = ((entry.get("user") or {}).get("id")
-                      or (entry.get("steamid")) or "unknown")
-            # Derived from name text, NOT the raw item.craftable field -
-            # same confirmed-unreliable field, same fix, as main.py's own
-            # handle_bptf_event. Matters MORE here than it first looks:
-            # this populates the buy-order side of the store, which can
-            # sit unrefreshed for hours until that specific buy order's
-            # own next websocket event - "a later real event corrects
-            # it" doesn't hold for a long time if that later event may
-            # not come for hours.
-            entry_name = item.get("name") or name
-            craftable = not entry_name.startswith("Non-Craftable ")
-            killstreaker_obj = item.get("killstreaker") or {}
-            sheen_obj = item.get("sheen") or {}
-            # Actual quality from THIS entry, defaulting to what was
-            # QUERIED (never hardcoded "Unusual") - a real, confirmed
-            # case: a "Strange Unusual" item (quality Strange, but still
-            # carrying a particle effect - a real TF2 combination this
-            # project never accounted for before) was coming back from a
-            # quality-filtered query anyway, and blindly labeling every
-            # result with the queried quality pooled it with a genuinely
-            # different item sharing the same particle_id - wrong buy
-            # order matched to the wrong item.
-            entry_quality = ((item.get("quality") or {}).get("name")) or quality_name
-            defindex = item.get("defindex")
-            key = listing_identity_key(
-                name, entry_quality, particle_id, None, craftable,
-                None, item.get("killstreakTier") or 0, name.startswith("Australium "),
-                killstreaker=killstreaker_obj.get("name"), sheen=sheen_obj.get("name"),
-                defindex=defindex,
-            )
-            self.local_listings.record(key, str(listing_id), str(seller), price_keys, "buy")
-            recorded += 1
         return recorded
 
     def fetch_live_buy_order_keys(self, name: str, quality_name: str, particle_id=None,
