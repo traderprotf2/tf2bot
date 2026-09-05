@@ -1336,31 +1336,24 @@ class BackpackTFPriceList:
                 sheen_obj = item.get("sheen")
                 if not isinstance(sheen_obj, dict):
                     sheen_obj = {}
-                # Actual quality from THIS entry - NEVER assumed to be
-                # the queried one when missing. A real, confirmed
-                # incident this closes: falling back to quality_name
-                # (the queried value) whenever the entry's own field came
-                # back empty had the exact same effect as hardcoding
-                # "Unusual" - a "Strange Unusual" item (quality Strange,
-                # still carrying a particle effect - a real TF2
-                # combination) coming back from a quality-filtered query
-                # with its own quality field empty/differently-shaped
-                # got silently RELABELED as the queried quality instead
-                # of skipped, pooling it with a genuinely different item
-                # sharing the same particle_id - the wrong buy order
-                # matched to the wrong item, confirmed still happening
-                # in production after the same leniency was already
-                # fixed for fetch_live_buy_order_keys's own quality
-                # check, since this recording-side copy of the same
-                # pattern was missed at the time. Skipped entirely now
-                # when the entry's own quality can't be read - a missing
-                # value is never grounds to assume a match.
+                # Actual quality from THIS entry - defaults to "Unique"
+                # when missing, TF2's own implicit default for a
+                # tradable item, rather than assuming a match with
+                # whatever was queried (that leniency was the original
+                # bug here - a "Strange Unusual" item's buy order
+                # silently relabeled as whatever quality was queried) OR
+                # skipping entirely (a real, confirmed regression from
+                # that first fix: a plain "Unique" entry omitting the
+                # quality field, since Unique is the unmarked default,
+                # was then skipped outright - the single most common
+                # quality of all never getting recorded by this scanner
+                # at all whenever the API left the field out). Missing
+                # still never means "assume a match with the query" for
+                # anything other than Unique specifically.
                 entry_quality_obj = item.get("quality")
                 if not isinstance(entry_quality_obj, dict):
                     entry_quality_obj = {}
-                entry_quality = entry_quality_obj.get("name")
-                if not entry_quality:
-                    continue
+                entry_quality = entry_quality_obj.get("name") or "Unique"
                 defindex = item.get("defindex")
                 # Spell - a real, confirmed gap: this call hardcoded
                 # None here regardless of what the entry actually
@@ -1512,17 +1505,20 @@ class BackpackTFPriceList:
                 # Quality must match what was actually requested - a real,
                 # confirmed case: a "Strange Unusual" item (Strange quality,
                 # but still carrying a particle effect) came back from a
-                # quality-filtered query anyway. Strict now, not just
-                # "reject only if present AND different" - that leniency
-                # was itself the bug: an entry with quality missing or
-                # empty for any reason (a "Strange Unusual" item's own
-                # quality field parsing differently, or any other cause)
-                # sailed through unfiltered, since `if entry_quality and
-                # ...` short-circuits to False (no rejection) whenever
-                # entry_quality itself is falsy - a real, confirmed case
-                # of exactly this happening. Missing quality info is
-                # never grounds to assume a match.
-                entry_quality = safe_dict(item.get("quality")).get("name")
+                # quality-filtered query anyway. Strict comparison, but
+                # missing quality defaults to "Unique" first - TF2's own
+                # implicit default for a tradable item, and a real,
+                # confirmed regression from making this check strict
+                # without that default: a plain "Unique" item's snapshot
+                # entry omitting the quality field entirely (since Unique
+                # is the unmarked default) then FAILED every query for
+                # "Unique" specifically - the single most common quality
+                # of all - since None was never allowed to mean Unique.
+                # Missing quality still never means "assume a match" for
+                # anything OTHER than Unique, so the original fix's own
+                # goal (catching a genuinely different, explicitly-tagged
+                # quality like Strange) is unaffected.
+                entry_quality = safe_dict(item.get("quality")).get("name") or "Unique"
                 if entry_quality != quality_name:
                     continue
                 # particle/craftable/killstreak_tier/australium are now

@@ -29,7 +29,7 @@ class RuntimeSettings:
     def __init__(self, min_price_keys, watched_qualities, watched_categories,
                  discount_threshold_percent, max_days_since_price_update,
                  priority_item_names=None, paused=False, australium_only=False,
-                 max_price_keys=None):
+                 max_price_keys=None, min_profit_keys=1.0):
         self.paused = paused
         self.australium_only = australium_only
         self.min_price_keys = min_price_keys
@@ -37,6 +37,11 @@ class RuntimeSettings:
         # per explicit request, the same "unset means unrestricted"
         # convention as several other optional filters in this project.
         self.max_price_keys = max_price_keys
+        # /minprofit in Telegram changes this - a floor on the actual
+        # profit in keys, separate from and in addition to
+        # discount_threshold_percent (a percentage discount can still
+        # profit only a razor-thin absolute amount on a cheap item).
+        self.min_profit_keys = min_profit_keys
         self.watched_qualities = list(watched_qualities)
         self.watched_categories = list(watched_categories)
         self.discount_threshold_percent = discount_threshold_percent
@@ -63,6 +68,7 @@ class RuntimeSettings:
         settings = cls(
             min_price_keys=cfg["min_price_keys"],
             max_price_keys=cfg.get("max_price_keys"),
+            min_profit_keys=cfg.get("min_profit_keys", 1.0),
             watched_qualities=cfg["watched_qualities"],
             watched_categories=cfg.get("watched_categories", ["weapon", "cosmetic", "taunt", "killstreak_kit", "other"]),
             discount_threshold_percent=cfg["discount_threshold_percent"],
@@ -79,6 +85,7 @@ class RuntimeSettings:
                 settings.min_price_keys = float(saved.get("min_price_keys", settings.min_price_keys))
                 saved_max_price = saved.get("max_price_keys", settings.max_price_keys)
                 settings.max_price_keys = float(saved_max_price) if saved_max_price is not None else None
+                settings.min_profit_keys = float(saved.get("min_profit_keys", settings.min_profit_keys))
                 settings.watched_qualities = list(saved.get("watched_qualities", settings.watched_qualities))
                 watched_categories = list(saved.get("watched_categories", settings.watched_categories))
                 # Migration: "hat" was renamed "cosmetic" when the category
@@ -108,6 +115,7 @@ class RuntimeSettings:
                 "australium_only": self.australium_only,
                 "min_price_keys": self.min_price_keys,
                 "max_price_keys": self.max_price_keys,
+                "min_profit_keys": self.min_profit_keys,
                 "watched_qualities": self.watched_qualities,
                 "watched_categories": self.watched_categories,
                 "discount_threshold_percent": self.discount_threshold_percent,

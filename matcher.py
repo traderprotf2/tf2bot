@@ -425,6 +425,34 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
                 killstreak_tier=listing.killstreak_tier, spell=spell_combo,
                 texture=listing.texture, paint=listing.paint,
             )
+    # Unpainted-buy-order fallback, painted items only, per explicit
+    # request: an unpopular paint can have NO buy order at all in
+    # principle - nobody's ever going to place one for that specific
+    # colour - which meant a genuinely, deeply underpriced listing in
+    # that paint could never alert at all, no matter how big the actual
+    # discount, purely because the exact-paint match found nothing.
+    # Falls back to the item's own UNPAINTED buy order as a
+    # conservative reference - still a real, live, observed price (not
+    # a guess or a community-suggested number, the exact category of
+    # unreliable source this project already deliberately excludes
+    # elsewhere), and paint essentially always adds value on top of the
+    # unpainted base rather than subtracting from it, so this is a
+    # floor, not an inflated number. Marked on the deal (see
+    # unpainted_reference below) so the alert itself says plainly that
+    # this ISN'T a guaranteed exact-match flip - the buyer is trusting
+    # that painted-usually-worth-more-than-unpainted holds for this
+    # specific paint, not backpack.tf's own live market for it
+    # specifically, since no live market for it was found at all.
+    unpainted_reference = False
+    if (buy_order_keys is None or buy_order_keys <= 0) and listing.paint:
+        buy_order_keys, buy_order_count = bptf.get_best_buy_order_keys(
+            lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable,
+            spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
+            killstreaker=listing.killstreaker, sheen=listing.sheen,
+            texture=listing.texture, defindex=listing.defindex,
+        )
+        if buy_order_keys is not None and buy_order_keys > 0:
+            unpainted_reference = True
     if buy_order_keys is None or buy_order_keys <= 0:
         # No live buy order in the local store, and (for priority items)
         # the live-query supplement above also came back empty. Not
@@ -447,6 +475,17 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         return reject("discount_too_small")
 
     flip_profit_keys = buy_order_keys - listing.price_keys
+    if flip_profit_keys < cfg.get("min_profit_keys", 0):
+        # /minprofit in Telegram - a floor on the ACTUAL profit in keys,
+        # separate from and in addition to discount_threshold_percent
+        # above. A real, confirmed case: a discount that clears the
+        # percentage threshold can still profit only a razor-thin
+        # absolute amount on a cheap item (+0.50 keys) - margins that
+        # thin get wiped out by almost anything not captured in
+        # structured data (a buy order's own free-text note restricting
+        # it to a specific paint/pattern the buyer never used
+        # backpack.tf's own filter for, trading fees, etc).
+        return reject("profit_too_small")
 
     # Price-boost sanity check across the whole killstreak tier ladder
     # (0=plain through 3=Professional) - applies even to a plain item
@@ -542,6 +581,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         # the deal dict at all, so a graded item's alert never showed
         # WHICH grade it was, only that the item matched.
         "grade": listing.texture,
+        "unpainted_reference": unpainted_reference,
         "killstreaker": listing.killstreaker,
         "sheen": listing.sheen,
         "spells": spells,

@@ -82,6 +82,17 @@ DEFAULTS = {
     # already being watched (see is_watched in matcher.py).
     "australium_only": False,
 
+    # /minprofit in Telegram changes this. A discount can clear
+    # discount_threshold_percent yet still profit only a razor-thin
+    # absolute amount (a real, confirmed case: +0.50 keys) - margins
+    # that thin get wiped out by almost anything not captured in
+    # structured data (a buy order's own free-text note restricting it
+    # to a specific paint/pattern the seller never used backpack.tf's
+    # own filter for, trading fees, etc). This is a floor on the actual
+    # profit in keys, separate from and in addition to the percentage
+    # threshold - both must pass.
+    "min_profit_keys": 1.0,
+
     # Proactive health check: if this many new warnings/errors pile up
     # within one interval, sends a Telegram message unprompted.
     "health_check_interval_minutes": 180,

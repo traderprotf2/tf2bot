@@ -48,6 +48,9 @@ HELP_TEXT = (
     "/minprice [число] — минимальная цена в ключах (без числа — показать текущую)\n"
     "/maxprice [число] — максимальная цена в ключах, 0 снимает ограничение "
     "(без числа — показать текущую; не задана по умолчанию — любая цена)\n"
+    "/minprofit [число] — минимальная прибыль в ключах (не в %, отдельно от "
+    "/discount), 0 снимает ограничение (по умолчанию 1 ключ - отсекает "
+    "сделки с крошечной, рискованной маржой)\n"
     "/discount [число] — порог скидки в % (без числа — показать текущий)\n"
     "/liquidity [число] — игнорировать предметы без переоценки цены дольше N дней\n"
     "/qualities, /addquality Название, /removequality Название\n"
@@ -612,10 +615,15 @@ def handle_command(text: str, runtime, stats=None, stats_since=None,
             f"\nМаксимальная цена: {runtime.max_price_keys:g} ключей"
             if runtime.max_price_keys is not None else ""
         )
+        min_profit_line = (
+            f"\nМинимальная прибыль: {runtime.min_profit_keys:g} ключей"
+            if runtime.min_profit_keys > 0 else ""
+        )
         return (
             f"{state}\n"
             f"Минимальная цена: {runtime.min_price_keys:g} ключей"
-            f"{max_price_line}\n"
+            f"{max_price_line}"
+            f"{min_profit_line}\n"
             f"Порог скидки: {runtime.discount_threshold_percent:g}%\n"
             f"Порог ликвидности: {runtime.max_days_since_price_update:g} дн.\n"
             f"Качества: {', '.join(runtime.watched_qualities) or '(пусто)'}\n"
@@ -679,6 +687,24 @@ def handle_command(text: str, runtime, stats=None, stats_since=None,
         runtime.max_price_keys = value
         runtime.save()
         return f"Максимальная цена теперь {value:g} ключей."
+
+    if command == "minprofit":
+        if not arg:
+            return (
+                f"Сейчас: {runtime.min_profit_keys:g} ключей. Чтобы поменять: /minprofit 1.5. "
+                f"Чтобы снять ограничение: /minprofit 0"
+            )
+        try:
+            value = float(arg.replace(",", "."))
+        except ValueError:
+            return f"Не понял число: {arg!r}. Пример: /minprofit 1.5"
+        if value < 0:
+            return "Минимальная прибыль не может быть отрицательной."
+        runtime.min_profit_keys = value
+        runtime.save()
+        if value == 0:
+            return "Минимальная прибыль снята - алертит по любой прибыли, если проходит % скидки."
+        return f"Минимальная прибыль теперь {value:g} ключей."
 
     if command == "discount":
         if not arg:

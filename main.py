@@ -238,6 +238,7 @@ class Watcher:
             **self.cfg,
             "min_price_keys": self.runtime.min_price_keys,
             "max_price_keys": self.runtime.max_price_keys,
+            "min_profit_keys": self.runtime.min_profit_keys,
             "watched_qualities": self.runtime.watched_qualities,
             "watched_categories": self.runtime.watched_categories,
             "discount_threshold_percent": self.runtime.discount_threshold_percent,
@@ -567,6 +568,18 @@ class Watcher:
                 f"\n💰 Buy order на backpack.tf: {deal['buy_order_keys']:.2f} ключей "
                 f"({deal.get('buy_order_count', 0)} шт.){profit_note}"
             )
+            if deal.get("unpainted_reference"):
+                # No buy order exists at all for this specific paint (an
+                # unpopular colour can genuinely have none, ever) - this
+                # is the item's own UNPAINTED buy order instead, as a
+                # conservative floor reference, NOT a live buy order for
+                # this exact painted item. Said plainly so this doesn't
+                # read as a guaranteed instant flip the way every other
+                # buy order line here does.
+                buy_order_line += (
+                    "\n⚠️ Buy order на непокрашенный вариант - на именно эту краску "
+                    "buy order'ов нет вообще, гарантированной перепродажи по этой цене нет"
+                )
 
         stn_buy_line = ""
         if deal.get("stn_buy_keys") is not None:
