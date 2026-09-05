@@ -76,6 +76,12 @@ DEFAULTS = {
     # list, not definitive - edit freely.
     "priority_item_names": ["Max's Severed Head"],
 
+    # /australium in Telegram toggles this - ADDITIVE, not exclusive:
+    # surfaces Australium weapons even if Strange quality/weapon category
+    # aren't separately watched, without suppressing anything else
+    # already being watched (see is_watched in matcher.py).
+    "australium_only": False,
+
     # Proactive health check: if this many new warnings/errors pile up
     # within one interval, sends a Telegram message unprompted.
     "health_check_interval_minutes": 180,

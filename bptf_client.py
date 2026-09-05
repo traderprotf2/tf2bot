@@ -870,7 +870,16 @@ class LocalListingStore:
         on its own, this just actually removes them so the store doesn't
         grow without bound over a long-running process. Each entry is
         checked against ITS OWN intent's freshness window (buy orders
-        live much longer than sell listings - see __init__)."""
+        live much longer than sell listings - see __init__).
+
+        Also cleans up _listing_locations for every listing_id removed
+        here - a real, confirmed gap: this was the ONE removal path that
+        didn't, since it predates that map's own addition. Left
+        unfixed, _listing_locations would grow by one entry for every
+        listing ever recorded, for the whole life of a long-running
+        process, with nothing ever shrinking it back down - the same
+        class of unbounded growth that caused a real OOM kill
+        elsewhere in this project."""
         now = time.time()
         with self._lock:
             for key in list(self._entries.keys()):
@@ -881,6 +890,8 @@ class LocalListingStore:
                 ]
                 for lid in expired_ids:
                     del bucket[lid]
+                    if self._listing_locations.get(lid) == key:
+                        del self._listing_locations[lid]
                 if not bucket:
                     del self._entries[key]
 
@@ -1015,8 +1026,15 @@ class BackpackTFPriceList:
         self.key_price_metal = None
         self.last_refreshed = 0
         self.session = requests.Session()
-        self._snapshot_cache = {}  # (name, quality_id, particle_id, intent) -> (timestamp, [(listing_id, price_keys)])
         self._history_cache = {}  # (name, quality_id, particle_id) -> (timestamp, history_list)
+        # Cap for _history_cache below - only relevant when
+        # fetch_price_history_data is enabled (off by default), but
+        # unbounded otherwise: nothing previously capped or evicted this
+        # dict, so a long-running process with that feature on would
+        # accumulate one entry per distinct (name, quality, particle,
+        # craftable) combination forever, the same unbounded-growth
+        # pattern that caused a real OOM kill elsewhere in this project.
+        self._history_cache_max_entries = 20000
         self.local_listings = LocalListingStore()
         # Logs at most ONE raw sample of a bulk-scan entry that has no
         # resolvable particle_id, across this process's whole lifetime -
@@ -1316,10 +1334,38 @@ class BackpackTFPriceList:
                     if isinstance(s, dict) and s.get("name")
                 ]
                 entry_spell = entry_spells[0] if entry_spells else None
+                # Grade (Civilian..Elite rarity) - a real, confirmed gap
+                # matching the exact same shape as the spell one just
+                # above: this call never passed texture= at all,
+                # silently defaulting to None regardless of what the
+                # entry actually carried - meaning this scanner pooled
+                # every grade of a graded item's buy orders into the
+                # SAME "no grade" bucket, the identical bug already
+                # fixed for spell, just on a different dimension. Same
+                # "rarity" field correction as main.py's own fix (a
+                # documented backpack.tf API wrapper's own field list
+                # names it "rarity", not "texture").
+                entry_grade_obj = item.get("rarity") or item.get("texture")
+                entry_grade = (
+                    entry_grade_obj.get("name") if isinstance(entry_grade_obj, dict) else entry_grade_obj
+                )
+                # Paint - a real, confirmed gap matching the exact same
+                # shape as spell/grade above: this call never extracted
+                # paint from the entry at all, hardcoding None regardless
+                # of what the entry actually carried - pooling every
+                # painted variant (plus the unpainted one) of the same
+                # item together, since paint can carry a real value
+                # premium (rare colours especially) the same way a
+                # spell or grade does.
+                entry_paint_obj = item.get("paint")
+                entry_paint_name = (
+                    entry_paint_obj.get("name") if isinstance(entry_paint_obj, dict) else entry_paint_obj
+                )
+                entry_paint_decimal = paint_rgb_decimal(entry_paint_name) if entry_paint_name else None
                 key = listing_identity_key(
-                    name, entry_quality, particle_id, None, craftable,
+                    name, entry_quality, particle_id, entry_paint_decimal, craftable,
                     entry_spell, item.get("killstreakTier") or 0, name.startswith("Australium "),
-                    killstreaker=killstreaker_obj.get("name"), sheen=sheen_obj.get("name"),
+                    texture=entry_grade, killstreaker=killstreaker_obj.get("name"), sheen=sheen_obj.get("name"),
                     defindex=defindex,
                 )
                 self.local_listings.record(key, str(listing_id), str(seller), price_keys, "buy")
@@ -1342,7 +1388,7 @@ class BackpackTFPriceList:
 
     def fetch_live_buy_order_keys(self, name: str, quality_name: str, particle_id=None,
                                    craftable=True, australium: bool = False, killstreak_tier=None,
-                                   spell=None):
+                                   spell=None, texture=None, paint=None):
         """
         LIVE query to the snapshot API for this item's current best buy
         order - a deliberate, narrow exception to this project's "local
@@ -1463,6 +1509,24 @@ class BackpackTFPriceList:
                 entry_spell = entry_spells[0] if entry_spells else None
                 if (spell or None) != (entry_spell or None):
                     continue
+                # Grade (Civilian..Elite) - same gap, same fix as spell
+                # just above: this parameter didn't exist at all until
+                # now, so every grade of a graded item (plus the
+                # ungraded one) was pooled together here too, the exact
+                # same class of bug already found and fixed for the
+                # bulk scanner's own identity key on this dimension.
+                entry_grade_raw = item.get("rarity") or item.get("texture")
+                entry_grade = entry_grade_raw.get("name") if isinstance(entry_grade_raw, dict) else entry_grade_raw
+                if (texture or None) != (entry_grade or None):
+                    continue
+                # Paint - same gap, same fix as grade/spell above: this
+                # parameter didn't exist at all until now, so every
+                # painted variant (plus the unpainted one) was pooled
+                # together here too.
+                entry_paint_raw = item.get("paint")
+                entry_paint = entry_paint_raw.get("name") if isinstance(entry_paint_raw, dict) else entry_paint_raw
+                if (paint or None) != (entry_paint or None):
+                    continue
                 price_keys = self.currencies_to_keys(entry.get("currencies") or {})
                 if price_keys is not None and price_keys > 0:
                     prices.append(price_keys)
@@ -1504,6 +1568,14 @@ class BackpackTFPriceList:
         return (time.time() - most_recent) / 86400
 
     # -- price history (average) -----------------------------------------
+
+    def _history_cache_set(self, cache_key, value):
+        """FIFO-capped insert for _history_cache - see this cache's own
+        comment in __init__ for why the cap exists."""
+        if cache_key not in self._history_cache and len(self._history_cache) >= self._history_cache_max_entries:
+            oldest_key = next(iter(self._history_cache))
+            del self._history_cache[oldest_key]
+        self._history_cache[cache_key] = value
 
     def _fetch_price_history(self, name: str, quality_name: str, particle_id=None, craftable=True):
         """
@@ -1557,15 +1629,15 @@ class BackpackTFPriceList:
 
         response = data.get("response", {}) if isinstance(data, dict) else {}
         if response.get("success") not in (1, "1"):
-            self._history_cache[cache_key] = (now, None)
+            self._history_cache_set(cache_key, (now, None))
             return None
 
         history = response.get("history", [])
         if not isinstance(history, list) or not history:
-            self._history_cache[cache_key] = (now, None)
+            self._history_cache_set(cache_key, (now, None))
             return None
 
-        self._history_cache[cache_key] = (now, history)
+        self._history_cache_set(cache_key, (now, history))
         return history
 
     def get_average_price_keys(self, name: str, quality_name: str, particle_id=None,

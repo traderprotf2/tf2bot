@@ -413,6 +413,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
                 lookup_name, listing.quality, listing.particle_id,
                 craftable=listing.craftable, australium=australium,
                 killstreak_tier=listing.killstreak_tier, spell=primary_spell,
+                texture=listing.texture, paint=listing.paint,
             )
     if buy_order_keys is None or buy_order_keys <= 0:
         # No live buy order in the local store, and (for priority items)
@@ -525,6 +526,12 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         "display_name": clean_display_name(listing),
         "variant_label": detect_special_variant(listing.name),
         "particle_name": listing.particle_name,
+        # Grade (Civilian..Elite) - a real, confirmed gap this closes:
+        # already correctly extracted (from "rarity" - see main.py's own
+        # fix) and used for comparison, but never actually surfaced to
+        # the deal dict at all, so a graded item's alert never showed
+        # WHICH grade it was, only that the item matched.
+        "grade": listing.texture,
         "killstreaker": listing.killstreaker,
         "sheen": listing.sheen,
         "spells": spells,

@@ -52,13 +52,14 @@ HELP_TEXT = (
     "/liquidity [число] — игнорировать предметы без переоценки цены дольше N дней\n"
     "/qualities, /addquality Название, /removequality Название\n"
     "/categories, /addcategory weapon|cosmetic|taunt|killstreak_kit|other, /removecategory ...\n"
-    "/australium — переключить режим \"только Australium-оружие\" (в меню: кнопка внутри Категорий)\n"
+    "/australium — включить/выключить показ Australium-оружия в дополнение "
+    "к обычным настройкам, без отдельного включения Strange/оружия "
+    "(в меню: кнопка внутри Категорий)\n"
     "/checkitem Название — показать, что бот прямо сейчас знает про этот "
     "предмет (buy order, sell-референс, когда видели в последний раз)\n"
     "/priority, /addpriority Название, /removepriority Название — список "
     "приоритетных предметов (⭐ в алерте + живой запрос к backpack.tf, если "
     "в базе ещё нет buy order); Unusual и так всегда приоритетны\n"
-    "/setaccounts — настроить несколько аккаунтов backpack.tf для "
     "/setaccounts — настроить несколько аккаунтов backpack.tf, чтобы "
     "ускорить проактивное сканирование (Unusual и всё остальное, что "
     "ты отслеживаешь), живые запросы по "
@@ -603,7 +604,7 @@ def handle_command(text: str, runtime, stats=None, stats_since=None,
 
     if command == "status":
         state = "⏸ на паузе" if runtime.paused else "▶️ работает"
-        australium_line = "\nТолько Australium: ✅ включено" if runtime.australium_only else ""
+        australium_line = "\n+ Australium-оружие: ✅ включено" if runtime.australium_only else ""
         max_price_line = (
             f"\nМаксимальная цена: {runtime.max_price_keys:g} ключей"
             if runtime.max_price_keys is not None else ""
@@ -622,8 +623,8 @@ def handle_command(text: str, runtime, stats=None, stats_since=None,
     if command == "australium":
         runtime.australium_only = not runtime.australium_only
         runtime.save()
-        state = "включён - показываю только Australium-оружие" if runtime.australium_only else "выключен"
-        return f"Режим \"только Australium\" {state}."
+        state = "включён - показываю Australium-оружие в дополнение к обычным настройкам" if runtime.australium_only else "выключен"
+        return f"Показ Australium-оружия {state}."
 
     if command == "pause":
         runtime.paused = True

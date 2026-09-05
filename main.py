@@ -230,6 +230,13 @@ class Watcher:
             "discount_threshold_percent": self.runtime.discount_threshold_percent,
             "max_days_since_price_update": self.runtime.max_days_since_price_update,
             "priority_item_names": self.runtime.priority_item_names,
+            # A real, confirmed bug this closes: missing here meant
+            # /australium in Telegram only ever changed what /status
+            # displayed, never the actual filter is_watched() reads -
+            # cfg.get("australium_only") always saw config.json's own
+            # static value (itself never even defined until now, so
+            # always None/falsy) regardless of what was toggled.
+            "australium_only": self.runtime.australium_only,
         }
         self._effective_cfg_cache = merged
         self._effective_cfg_cache_version = version
@@ -304,6 +311,35 @@ class Watcher:
                 await asyncio.to_thread(self.bptf.local_listings.prune_expired)
             except Exception:
                 log.exception("Local listing store prune failed, will retry next cycle.")
+
+    async def alert_cooldowns_prune_loop(self):
+        """Periodically removes expired entries from
+        item_type_last_alerted (see send_deal's own cooldown check) -
+        a real, confirmed gap: unlike every other per-item/per-listing
+        collection in this project (LocalListingStore's own buckets,
+        _known_scan_items), this one had no cap or cleanup at all, so it
+        grew by one entry for every unique (source, seller, item,
+        attributes) combination that ever alerted, for the whole life
+        of a long-running process, with no eviction - the same class of
+        unbounded growth that caused a real OOM kill elsewhere, just on
+        a slower timescale since alerts are far rarer than raw events.
+        An entry past its own cooldown window is already useless for
+        the check it exists for, so pruning it costs nothing."""
+        while True:
+            await asyncio.sleep(1800)
+            try:
+                cooldown_seconds = self.cfg.get("item_type_cooldown_minutes", 60) * 60
+                now = time.time()
+                expired = [
+                    key for key, ts in self.item_type_last_alerted.items()
+                    if now - ts >= cooldown_seconds
+                ]
+                for key in expired:
+                    del self.item_type_last_alerted[key]
+                if expired:
+                    log.info("Pruned %d expired alert cooldown(s).", len(expired))
+            except Exception:
+                log.exception("Alert cooldown prune failed, will retry next cycle.")
 
     # Floor between two proactive refreshes of the SAME item, regardless
     # of how "stale" it looks relative to others - without this, a
@@ -466,6 +502,14 @@ class Watcher:
         import html
         effect = f" ({html.escape(deal['particle_name'], quote=False)})" if deal["particle_name"] else ""
         variant = f" [{html.escape(deal['variant_label'], quote=False)}]" if deal.get("variant_label") else ""
+        # Civilian..Elite grade - already correctly captured for
+        # comparison (see matcher.py's own "grade" field, sourced from
+        # main.py's "rarity" field fix), but previously never shown
+        # here either, so a graded item's alert never actually told the
+        # person which grade matched. {Curly braces} to stay visually
+        # distinct from (effect) and [variant] when more than one shows
+        # on the same line.
+        grade = f" {{{html.escape(deal['grade'], quote=False)}}}" if deal.get("grade") else ""
         usd = f", ${deal['price_usd']:.2f}" if deal["price_usd"] else ""
 
         # Every dynamic string below is backpack.tf-sourced text going
@@ -563,7 +607,7 @@ class Watcher:
         return (
             f"{priority_prefix}"
             f"🔥 <b>-{deal['discount_percent']:.0f}%</b> — {deal['source']}\n"
-            f"<b>{safe_display_name}</b>{effect}{variant}"
+            f"<b>{safe_display_name}</b>{effect}{variant}{grade}"
             f"{special_block}\n"
             f"Цена в объявлении: <b>{deal['price_keys']:.2f} ключей</b>{usd}"
             f"{sell_reference_line}"
@@ -872,23 +916,9 @@ class Watcher:
         item = bptf_client.safe_dict(payload.get("item"))
         quality_obj = bptf_client.safe_dict(item.get("quality"))
         quality = quality_obj.get("name")
-        # Unusual is unconditionally watched - never toggleable via
-        # /addquality-/removequality, unlike every other quality.
-        if quality != "Unusual" and quality not in self.runtime.watched_qualities:
-            self.stats["bptf_rejected_quality"] += 1
-            return
 
         name = item.get("name") or item.get("marketName") or item.get("baseName")
         if not name:
-            return
-        # Rejected here, before ever being recorded, not just later in
-        # evaluate_listing's own excluded_types filter - an explicitly
-        # banned item's data was otherwise still taking up store space
-        # it could never be used for anyway.
-        name_lower_for_exclusion = name.lower()
-        if any(excluded.lower() in name_lower_for_exclusion
-               for excluded in self.cfg.get("excluded_types", [])):
-            self.stats["bptf_rejected_excluded_type"] += 1
             return
         # backpack.tf's own particle-name resolution occasionally fails,
         # leaving a raw internal token in the name instead of (or
@@ -900,6 +930,35 @@ class Watcher:
         # whitespace in other text fields before.
         if "#Attrib_Particle" in name:
             name = name.split("#Attrib_Particle")[0].rstrip("(").rstrip()
+
+        # "Australium only" is ADDITIVE, not exclusive - same logic and
+        # reasoning as is_watched() in matcher.py (kept there too, since
+        # that function is shared by every source; this is a fast-path
+        # duplicate for the highest-volume path). Real, confirmed gap
+        # this closes: this early quality/category check used to have
+        # NO such exception, so an Australium weapon was rejected right
+        # here - before the name was even available to check for the
+        # "Australium " prefix - whenever Strange/weapon weren't already
+        # separately watched, regardless of the toggle.
+        is_australium_weapon_hint = quality == "Strange" and name.startswith("Australium ")
+        covered_by_australium_toggle = self.runtime.australium_only and is_australium_weapon_hint
+
+        # Unusual is unconditionally watched - never toggleable via
+        # /addquality-/removequality, unlike every other quality.
+        if not covered_by_australium_toggle:
+            if quality != "Unusual" and quality not in self.runtime.watched_qualities:
+                self.stats["bptf_rejected_quality"] += 1
+                return
+
+        # Rejected here, before ever being recorded, not just later in
+        # evaluate_listing's own excluded_types filter - an explicitly
+        # banned item's data was otherwise still taking up store space
+        # it could never be used for anyway.
+        name_lower_for_exclusion = name.lower()
+        if any(excluded.lower() in name_lower_for_exclusion
+               for excluded in self.cfg.get("excluded_types", [])):
+            self.stats["bptf_rejected_excluded_type"] += 1
+            return
 
         # Base item's own numeric schema ID - preferred identity anchor
         # over name text, see listing_identity_key's own docstring.
@@ -922,7 +981,7 @@ class Watcher:
         # there too, since that function is shared by every source) -
         # this is just a fast-path duplicate for the highest-volume path.
         category = classify_category(name, item.get("slot"))
-        if category not in self.runtime.watched_categories:
+        if not covered_by_australium_toggle and category not in self.runtime.watched_categories:
             self.stats["bptf_rejected_category"] += 1
             return
 
@@ -1102,17 +1161,37 @@ class Watcher:
 
         seller_steamid = payload.get("steamid")
 
-        # wearTier (Factory New..Battle-Scarred) only applies to War
-        # Paints/Decorated weapons. texture alone, WITHOUT wearTier,
-        # means a graded COSMETIC (Civilian..Elite rarity grade) - a
-        # separate, valuable category, previously conflated with actual
-        # weapon skins. Grade/texture is threaded into the identity key
+        # wearTier (Factory New..Battle-Scarred) applies to any painted
+        # weapon skin - both plain War Paint AND "Decorated Weapon"
+        # quality (the Smissmas garland variant). These are NOT the same
+        # thing and must not be treated alike: War Paint skins are
+        # excluded (pattern seed can swing value by an order of
+        # magnitude, data this project doesn't have), but Decorated
+        # Weapons are explicitly wanted - excluding them here was a real,
+        # confirmed mistake, conflating "has wearTier" with "is a plain
+        # War Paint" when it isn't the same test. texture alone, WITHOUT
+        # wearTier, means a graded COSMETIC (Civilian..Elite rarity
+        # grade) - a separate, valuable category, distinct from both of
+        # the above. Grade/texture is threaded into the identity key
         # (see listing_identity_key) rather than read from the item's
         # display name - some real items' names carry a different
         # grade's word than their true one.
-        is_skin = bool(item.get("wearTier"))
-        texture_obj = item.get("texture")
-        texture = texture_obj.get("name") if isinstance(texture_obj, dict) else texture_obj
+        is_skin = bool(item.get("wearTier")) and quality != "Decorated Weapon"
+        # Grade (Civilian..Elite rarity) - a real, confirmed field-name
+        # correction: a third-party backpack.tf API wrapper's own
+        # documented listing-object fields list "quality", "particle
+        # effect", "rarity", "origin", "wear_tier", "killstreaker",
+        # "strange_part" - "rarity" is the grade field, not "texture" as
+        # this project assumed without ever confirming it against a
+        # documented source. Reading only "texture" meant a graded
+        # cosmetic's actual grade was never captured at all, pooling
+        # every grade of the same item into one comparison - a name
+        # collision this project has hit before. Checks "rarity" first,
+        # "texture" as a fallback in case backpack.tf's real payload
+        # still separately carries a War Paint pattern name under that
+        # key for some item types.
+        grade_obj = item.get("rarity") or item.get("texture")
+        texture = grade_obj.get("name") if isinstance(grade_obj, dict) else grade_obj
         # Derived from the NAME TEXT, not the separate item.craftable
         # field - the two disagreed for some listings, so the displayed
         # name said "Non-Craftable X" while the buy order comparison
@@ -1412,6 +1491,7 @@ class Watcher:
             self.telegram_command_loop(),
             self.health_check_loop(),
             self.local_store_prune_loop(),
+            self.alert_cooldowns_prune_loop(),
             self.local_store_snapshot_loop(),
             self.proactive_buy_order_refresh_loop(),
             bptf_ws.stream_listing_events(self.handle_bptf_event),

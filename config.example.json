@@ -15,6 +15,7 @@
   "min_other_listings": 1,
   "item_type_cooldown_minutes": 60,
   "priority_item_names": ["Max's Severed Head"],
+  "australium_only": false,
   "health_check_interval_minutes": 180,
   "health_check_error_threshold": 5,
   "health_check_auto_pause": true,
