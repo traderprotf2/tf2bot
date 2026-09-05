@@ -1539,7 +1539,13 @@ class Watcher:
         self._telegram_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
         # Restores whatever the local listing store had saved before -
-        # comparison data available, not an empty store.
+        # comparison data available, not an empty store. Cleans up any
+        # orphaned temp files from a prior run's interrupted save first
+        # (see cleanup_stray_temp_files' own docstring for why these
+        # accumulate) - harmless to load_from_disk either way, just
+        # tidiness, done once here rather than leaving it to accumulate
+        # further.
+        bptf_client.LocalListingStore.cleanup_stray_temp_files(bptf_client.LOCAL_LISTINGS_STATE_PATH)
         await asyncio.to_thread(self.bptf.local_listings.load_from_disk, bptf_client.LOCAL_LISTINGS_STATE_PATH)
         self._load_alert_cooldowns()
 

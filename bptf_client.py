@@ -925,6 +925,38 @@ class LocalListingStore:
         except Exception:
             log.exception("Could not save local listing store to disk.")
 
+    @staticmethod
+    def cleanup_stray_temp_files(path):
+        """
+        Removes leftover save_to_disk temp files from a prior run that
+        never completed its os.replace() - confirmed real: an OOM kill
+        (or any other hard termination) landing between the temp file's
+        write and its rename leaves that file behind forever, since
+        nothing else ever points at or cleans up a PID-named orphan once
+        its own process is gone. Harmless on its own (disk clutter, not
+        memory), but real production evidence showed over a dozen
+        accumulated after a period of repeated crashes. Called once at
+        startup, before load_from_disk - safe even if a save is
+        genuinely in progress THIS run, since that file wouldn't match
+        this glob until it exists, and by the time this scans, nothing
+        from a fresh process has had a chance to save yet anyway.
+        """
+        import glob
+        pattern = f"{path}.*.tmp"
+        removed = 0
+        for stray in glob.glob(pattern):
+            try:
+                os.remove(stray)
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            log.warning(
+                "Removed %d stray local-listings temp file(s) left over from a prior "
+                "run that never completed its save (most likely an earlier crash).",
+                removed,
+            )
+
     def load_from_disk(self, path):
         """
         Restores a previous save_to_disk snapshot, if one exists -
@@ -1304,20 +1336,31 @@ class BackpackTFPriceList:
                 sheen_obj = item.get("sheen")
                 if not isinstance(sheen_obj, dict):
                     sheen_obj = {}
-                # Actual quality from THIS entry, defaulting to what was
-                # QUERIED (never hardcoded "Unusual") - a real, confirmed
-                # case: a "Strange Unusual" item (quality Strange, but
+                # Actual quality from THIS entry - NEVER assumed to be
+                # the queried one when missing. A real, confirmed
+                # incident this closes: falling back to quality_name
+                # (the queried value) whenever the entry's own field came
+                # back empty had the exact same effect as hardcoding
+                # "Unusual" - a "Strange Unusual" item (quality Strange,
                 # still carrying a particle effect - a real TF2
-                # combination this project never accounted for before)
-                # was coming back from a quality-filtered query anyway,
-                # and blindly labeling every result with the queried
-                # quality pooled it with a genuinely different item
-                # sharing the same particle_id - wrong buy order matched
-                # to the wrong item.
+                # combination) coming back from a quality-filtered query
+                # with its own quality field empty/differently-shaped
+                # got silently RELABELED as the queried quality instead
+                # of skipped, pooling it with a genuinely different item
+                # sharing the same particle_id - the wrong buy order
+                # matched to the wrong item, confirmed still happening
+                # in production after the same leniency was already
+                # fixed for fetch_live_buy_order_keys's own quality
+                # check, since this recording-side copy of the same
+                # pattern was missed at the time. Skipped entirely now
+                # when the entry's own quality can't be read - a missing
+                # value is never grounds to assume a match.
                 entry_quality_obj = item.get("quality")
                 if not isinstance(entry_quality_obj, dict):
                     entry_quality_obj = {}
-                entry_quality = entry_quality_obj.get("name") or quality_name
+                entry_quality = entry_quality_obj.get("name")
+                if not entry_quality:
+                    continue
                 defindex = item.get("defindex")
                 # Spell - a real, confirmed gap: this call hardcoded
                 # None here regardless of what the entry actually
