@@ -188,6 +188,19 @@ class Watcher:
         self._known_scan_items = {}
         self.MAX_KNOWN_SCAN_ITEMS = 2000
 
+        # particle_id -> {"name_hint", "item_name", "quality", "count",
+        # "first_seen"} for every resolved-but-unlisted Unusual effect
+        # id seen since startup (never in unusual_effects.py's own
+        # bundled data or the current schema) - lets the bundled
+        # database grow from what this project actually observes
+        # trading, rather than only from manual research, per explicit
+        # request. Loaded from/saved to disk (see _load_unknown_
+        # effects/_save_unknown_effects) so a discovery isn't lost to a
+        # routine restart before anyone's reviewed it - unlike
+        # _known_scan_items above, these are rare and worth keeping.
+        self._unknown_particle_ids = {}
+        self._load_unknown_effects()
+
         if not cfg.get("backpacktf_token"):
             log.warning(
                 "No backpacktf_token configured - comparisons will use backpack.tf's "
@@ -657,6 +670,28 @@ class Watcher:
         except Exception:
             log.exception("Could not load alert cooldowns from disk - starting fresh.")
 
+    UNKNOWN_EFFECTS_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unknown_effects_state.json")
+
+    def _load_unknown_effects(self):
+        if not os.path.exists(self.UNKNOWN_EFFECTS_STATE_PATH):
+            return
+        try:
+            with open(self.UNKNOWN_EFFECTS_STATE_PATH, "r", encoding="utf-8") as f:
+                self._unknown_particle_ids = {int(k): v for k, v in json.load(f).items()}
+            log.info("Loaded %d previously-discovered unknown effect id(s) from disk.",
+                      len(self._unknown_particle_ids))
+        except Exception:
+            log.exception("Could not load unknown-effects state from disk - starting fresh.")
+
+    def _save_unknown_effects(self):
+        try:
+            tmp_path = f"{self.UNKNOWN_EFFECTS_STATE_PATH}.{os.getpid()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump({str(k): v for k, v in self._unknown_particle_ids.items()}, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.UNKNOWN_EFFECTS_STATE_PATH)
+        except Exception:
+            log.exception("Could not save unknown-effects state to disk.")
+
     ACCOUNTS_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backpacktf_accounts_state.json")
 
     def _save_accounts(self, accounts):
@@ -741,6 +776,31 @@ class Watcher:
             f"вырастет до {len(pool_accounts)}, но только после перезапуска службы - "
             f"systemctl restart tf2-deal-watcher."
         )
+
+    def _format_unknown_effects(self) -> str:
+        """
+        /unknowneffects - lists every Unusual particle effect id seen
+        since the bundled database (unusual_effects.py) was last
+        updated, that isn't in it (or the live schema) yet - see the
+        discovery logic in handle_bptf_event. Lets the database grow
+        from real observed trading over time, rather than only from
+        periodic manual research.
+        """
+        if not self._unknown_particle_ids:
+            return "Пока не встречалось ни одного неизвестного эффекта Unusual."
+        lines = [f"Неизвестных эффектов: {len(self._unknown_particle_ids)}\n"]
+        for particle_id, info in sorted(self._unknown_particle_ids.items(), key=lambda kv: -kv[1]["count"]):
+            name_bit = f" — похоже на {info['name_hint']!r}" if info.get("name_hint") else ""
+            lines.append(
+                f"ID {particle_id}{name_bit} (сырое поле: {info.get('raw_particle_name')!r}), "
+                f"впервые на {info.get('item_name')!r} [{info.get('quality')}], "
+                f"встречалось {info.get('count')} раз(а)"
+            )
+        lines.append(
+            "\nЧтобы добавить: впиши точное название эффекта и это ID в NAME_TO_ID "
+            "в unusual_effects.py."
+        )
+        return "\n".join(lines)
 
     def _check_item(self, name_query: str) -> str:
         """
@@ -1063,6 +1123,36 @@ class Watcher:
             # the raw name only for an id not yet in the bundled data.
             particle_name = self.particle_id_to_name.get(particle_id) or particle_name
 
+            if particle_id not in self.particle_id_to_name:
+                # Not in the bundled database (unusual_effects.py) or the
+                # live schema - per explicit request, tracked here so the
+                # bundled database can grow from what this project
+                # actually observes trading, not just manual research.
+                # Saved to disk only on first discovery of a given id -
+                # a common unknown effect re-appearing many times updates
+                # the in-memory count for context, but doesn't need a
+                # disk write every single time.
+                if particle_id not in self._unknown_particle_ids:
+                    name_hint = particle_name if particle_name and not particle_name.startswith("#") else None
+                    self._unknown_particle_ids[particle_id] = {
+                        "name_hint": name_hint,
+                        "raw_particle_name": particle_name,
+                        "item_name": name,
+                        "quality": quality,
+                        "count": 1,
+                        "first_seen": time.time(),
+                    }
+                    log.warning(
+                        "DISCOVERED an Unusual effect id (%d) not in the bundled database - "
+                        "name hint: %r, raw field: %r, seen on item: %r. See /unknowneffects "
+                        "in Telegram, or unusual_effects.py's own docstring, to add it once "
+                        "its real name is confirmed.",
+                        particle_id, name_hint, particle_name, name,
+                    )
+                    await asyncio.to_thread(self._save_unknown_effects)
+                else:
+                    self._unknown_particle_ids[particle_id]["count"] += 1
+
         if particle_name and particle_name.startswith("#"):
             # item.particle.name is sometimes itself an unresolved raw
             # token ("#Attrib_ParticleNN"), not a display name - treated
@@ -1210,7 +1300,13 @@ class Watcher:
         )
         identity_key = bptf_client.listing_identity_key(
             name, quality, particle_id, paint_value_for_identity, bool(craftable),
-            spells[0] if spells else None, killstreak_tier, name.startswith("Australium "),
+            # ALL spells, sorted - not just the first. A real, confirmed
+            # case: a two-spell item's buy order backing a one-spell (or
+            # spell-less) sell listing's alert, since this used to track
+            # only spells[0] - a second spell adds real value on its
+            # own, so two items agreeing on spell #1 but differing on
+            # whether a second exists were wrongly treated as identical.
+            tuple(sorted(spells)) if spells else None, killstreak_tier, name.startswith("Australium "),
             texture=texture, defindex=defindex, killstreaker=killstreaker, sheen=sheen,
         )
         self._name_to_identity_keys[name.lower()].add(identity_key)
@@ -1363,6 +1459,9 @@ class Watcher:
                 reply = await asyncio.to_thread(
                     self._check_item, text.split(maxsplit=1)[1] if " " in text else ""
                 )
+                await self._run_telegram(self.telegram.send, reply)
+            elif command == "unknowneffects":
+                reply = self._format_unknown_effects()
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "setaccounts":
                 raw = text.split(maxsplit=1)[1] if " " in text or "\n" in text else ""

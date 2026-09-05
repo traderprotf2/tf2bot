@@ -1327,13 +1327,14 @@ class BackpackTFPriceList:
                 # this scanner records - spelled or not - filed into the
                 # SAME "no spell" bucket, silently pooling a spelled
                 # variant's (often far higher) buy order price into a
-                # plain item's comparison. Same extraction pattern as
-                # main.py's own handle_bptf_event: first spell only.
+                # plain item's comparison. ALL spells (sorted), not just
+                # the first - see listing_identity_key's own callers for
+                # why (a second spell adds real value on its own).
                 entry_spells = [
                     s.get("name") for s in (item.get("spells") or [])
                     if isinstance(s, dict) and s.get("name")
                 ]
-                entry_spell = entry_spells[0] if entry_spells else None
+                entry_spell = tuple(sorted(entry_spells)) if entry_spells else None
                 # Grade (Civilian..Elite rarity) - a real, confirmed gap
                 # matching the exact same shape as the spell one just
                 # above: this call never passed texture= at all,
@@ -1468,10 +1469,18 @@ class BackpackTFPriceList:
                 # Quality must match what was actually requested - a real,
                 # confirmed case: a "Strange Unusual" item (Strange quality,
                 # but still carrying a particle effect) came back from a
-                # quality-filtered query anyway, which would have silently
-                # let a different item's price into this max() otherwise.
+                # quality-filtered query anyway. Strict now, not just
+                # "reject only if present AND different" - that leniency
+                # was itself the bug: an entry with quality missing or
+                # empty for any reason (a "Strange Unusual" item's own
+                # quality field parsing differently, or any other cause)
+                # sailed through unfiltered, since `if entry_quality and
+                # ...` short-circuits to False (no rejection) whenever
+                # entry_quality itself is falsy - a real, confirmed case
+                # of exactly this happening. Missing quality info is
+                # never grounds to assume a match.
                 entry_quality = safe_dict(item.get("quality")).get("name")
-                if entry_quality and entry_quality != quality_name:
+                if entry_quality != quality_name:
                     continue
                 # particle/craftable/killstreak_tier/australium are now
                 # filtered HERE, client-side, instead of as query params -
@@ -1497,16 +1506,16 @@ class BackpackTFPriceList:
                 # rare, high-value spells like Voices from Below - a
                 # spell-less sell listing could get "verified" against a
                 # spelled item's buy order this way, a real, confirmed
-                # case of exactly that. Same convention as the local
-                # store's own identity key (see listing_identity_key):
-                # entries are compared by their FIRST spell only, since
-                # that's the one dimension TF2 items are actually priced
-                # by even when a second, cosmetic-only spell is present.
+                # case of exactly that. ALL spells (sorted), not just the
+                # first - see listing_identity_key's own callers for why
+                # (a second spell adds real value on its own, so an item
+                # with two spells must never match one with only the
+                # first of the two).
                 entry_spells = [
                     s.get("name") for s in (item.get("spells") or [])
                     if isinstance(s, dict) and s.get("name")
                 ]
-                entry_spell = entry_spells[0] if entry_spells else None
+                entry_spell = tuple(sorted(entry_spells)) if entry_spells else None
                 if (spell or None) != (entry_spell or None):
                     continue
                 # Grade (Civilian..Elite) - same gap, same fix as spell

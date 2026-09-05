@@ -50,3 +50,20 @@ push event**) → **Add webhook**.
 - Статус: `systemctl status tf2-deal-watcher`
 - Логи: `journalctl -u tf2-deal-watcher -f`
 - Перезапуск: `systemctl restart tf2-deal-watcher`
+
+## Обновление базы Unusual-эффектов (по желанию, вручную)
+
+Бот работает полностью без Steam API — база эффектов (`unusual_effects.py`)
+встроена и не требует сети. Если хочешь пополнить её самыми новыми
+эффектами (добавленными после её последнего сбора), можно один раз
+запустить `tools/update_effects_from_schema.py` с бесплатным Steam Web
+API ключом (https://steamcommunity.com/dev/apikey) — он скачает
+актуальную схему прямо у Valve и допишет в файл только то, чего там ещё
+нет, не трогая остальное:
+
+```bash
+python3 tools/update_effects_from_schema.py ТВОЙ_STEAM_API_КЛЮЧ
+```
+
+Это разовая, необязательная утилита обслуживания — сам бот её никогда
+не вызывает и в ней не нуждается для работы.

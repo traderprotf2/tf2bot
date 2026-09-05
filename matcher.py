@@ -324,10 +324,20 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
     spells = filter_spells_for_category(listing.spells, listing.category)
     # backpack.tf's search only takes one spell value - a real, confirmed
     # search the user built by hand includes `spell=<name>` and it's this
-    # param specifically that was missing before, so an item's search/
-    # reference lookups are only as precise as the first spell it has
-    # (the overwhelming majority of spelled items have exactly one).
+    # param specifically that was missing before, so the SEARCH LINK's
+    # own reference lookup is only as precise as the first spell an item
+    # has. Used ONLY for the search link below (build_classifieds_url) -
+    # never for comparison, see spell_combo just below for why.
     primary_spell = spells[0] if spells else None
+    # Comparison/identity dimension - ALL spells, not just the first.
+    # A real, confirmed case: a two-spell item's buy order backing a
+    # one-spell (or spell-less) sell listing's alert, since the identity
+    # key used to track only the first spell - two items agreeing on
+    # spell #1 but differing on whether a second spell exists (or which
+    # one) were treated as identical, even though a second spell adds
+    # real value on its own. Sorted so the same TWO spells in either
+    # order still hash to the same tuple.
+    spell_combo = tuple(sorted(spells)) if spells else None
     australium = lookup_name.startswith("Australium ")
 
     exclude_id = listing.listing_id if listing.source == "backpack.tf" else ""
@@ -348,7 +358,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         # don't give this directly.
         ref_keys = _get_reference_price_keys(
             bptf, lookup_name, listing.quality, listing.particle_id, listing.craftable,
-            spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
+            spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
             min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
             paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
             texture=listing.texture, defindex=listing.defindex,
@@ -360,7 +370,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         for candidate in team_color_decimals:
             ref_keys = _get_reference_price_keys(
                 bptf, lookup_name, listing.quality, listing.particle_id, listing.craftable,
-                spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
+                spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
                 min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
                 paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
                 texture=listing.texture, defindex=listing.defindex,
@@ -372,7 +382,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
     else:
         ref_keys = _get_reference_price_keys(
             bptf, lookup_name, listing.quality, listing.particle_id, listing.craftable,
-            spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
+            spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
             min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
             paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
             texture=listing.texture, defindex=listing.defindex,
@@ -392,7 +402,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
 
     buy_order_keys, buy_order_count = bptf.get_best_buy_order_keys(
         lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable,
-        spell=primary_spell, australium=australium, killstreak_tier=listing.killstreak_tier,
+        spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
         paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
         texture=listing.texture, defindex=listing.defindex,
         paint_decimal_override=winning_paint_decimal,
@@ -412,7 +422,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
             buy_order_keys, buy_order_count = bptf.fetch_live_buy_order_keys(
                 lookup_name, listing.quality, listing.particle_id,
                 craftable=listing.craftable, australium=australium,
-                killstreak_tier=listing.killstreak_tier, spell=primary_spell,
+                killstreak_tier=listing.killstreak_tier, spell=spell_combo,
                 texture=listing.texture, paint=listing.paint,
             )
     if buy_order_keys is None or buy_order_keys <= 0:
