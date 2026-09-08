@@ -182,13 +182,25 @@ def is_rate_limited() -> bool:
     return not _account_pool.any_account_available()
 
 
-def _get_with_retry(session, url, params, timeout=20):
+def _get_with_retry(session, url, params, timeout=20, treat_missing_listings_as_rate_limit=False):
     """
     Shared GET for the two backpack.tf endpoints that scale with
     evaluation volume (snapshot + price-history). Tracks a 429 against
     the SPECIFIC account that got it (see _AccountPool.note_rate_limited)
     - not every other account in the pool. Retries once, after a short
     pause, on a 5xx (backpack.tf's own infra briefly overloaded).
+
+    treat_missing_listings_as_rate_limit=True (snapshot calls only) also
+    catches a real, confirmed SOFT rate-limit shape this endpoint uses
+    alongside real 429s: a 200 OK whose body is just {"appid", "sku",
+    "createdAt"} - no "listings" key at all - rather than an HTTP error
+    status. Without this, the existing 429-only detection above never
+    saw these hits, so the SAME account kept getting reused at the SAME
+    pace immediately afterward, compounding the rate limiting instead of
+    backing off from it (backpack.tf's own forums confirm this endpoint
+    is rate-limited to roughly one request per 10+ seconds, well below
+    what a proactive scanner making hundreds of requests would naturally
+    produce without this backoff).
 
     `params` should NOT include "key"/"token" - _AccountPool.acquire()
     picks which account's credentials to use for this specific request,
@@ -207,6 +219,13 @@ def _get_with_retry(session, url, params, timeout=20):
         with _request_semaphore:
             resp = session.get(url, params=request_params, timeout=timeout)
         if resp.status_code == 429:
+            _account_pool.note_rate_limited(idx)
+    elif treat_missing_listings_as_rate_limit and resp.status_code == 200:
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and "listings" not in body:
             _account_pool.note_rate_limited(idx)
     return resp
 
@@ -1323,7 +1342,7 @@ class BackpackTFPriceList:
                 "sku": strip_variant_prefixes(name), "appid": 440,
                 "quality": QUALITY_NAME_TO_ID.get(quality_name), "intent": "buy",
             }
-            resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=10)
+            resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=10, treat_missing_listings_as_rate_limit=True)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
@@ -1588,7 +1607,7 @@ class BackpackTFPriceList:
             # including Telegram responsiveness. A live buy order that
             # takes this long to answer isn't worth blocking a thread
             # for anyway - the local-store value remains the fallback.
-            resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=5)
+            resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=5, treat_missing_listings_as_rate_limit=True)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
