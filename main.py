@@ -34,6 +34,7 @@ import matcher
 import runtime_settings
 import steam_inventory
 import unusual_effects
+import spell_effects
 import telegram_commands
 import telegram_notify
 from config import load_config
@@ -798,22 +799,48 @@ class Watcher:
         discovery logic in handle_bptf_event. Lets the database grow
         from real observed trading over time, rather than only from
         periodic manual research.
+
+        Defensive throughout - a real, confirmed crash report: any
+        entry missing an expected key (state loaded from disk in a
+        different shape than this run's code expects - an older
+        version's file, or a save interrupted mid-write, both plausible
+        given this project's own history of hard crashes) must never
+        take the whole Telegram command loop down with it, only this
+        one reply. Also caps the reply length - Telegram's own 4096-
+        character message limit is a real, hard ceiling, and nothing
+        here previously accounted for it, so a long enough discovery
+        list could fail to send at all.
         """
-        if not self._unknown_particle_ids:
-            return "Пока не встречалось ни одного неизвестного эффекта Unusual."
-        lines = [f"Неизвестных эффектов: {len(self._unknown_particle_ids)}\n"]
-        for particle_id, info in sorted(self._unknown_particle_ids.items(), key=lambda kv: -kv[1]["count"]):
-            name_bit = f" — похоже на {info['name_hint']!r}" if info.get("name_hint") else ""
-            lines.append(
-                f"ID {particle_id}{name_bit} (сырое поле: {info.get('raw_particle_name')!r}), "
-                f"впервые на {info.get('item_name')!r} [{info.get('quality')}], "
-                f"встречалось {info.get('count')} раз(а)"
+        try:
+            if not self._unknown_particle_ids:
+                return "Пока не встречалось ни одного неизвестного эффекта Unusual."
+            lines = [f"Неизвестных эффектов: {len(self._unknown_particle_ids)}\n"]
+            sorted_items = sorted(
+                self._unknown_particle_ids.items(),
+                key=lambda kv: -(kv[1].get("count", 0) if isinstance(kv[1], dict) else 0),
             )
-        lines.append(
-            "\nЧтобы добавить: впиши точное название эффекта и это ID в NAME_TO_ID "
-            "в unusual_effects.py."
-        )
-        return "\n".join(lines)
+            for particle_id, info in sorted_items:
+                if not isinstance(info, dict):
+                    continue
+                name_bit = f" — похоже на {info['name_hint']!r}" if info.get("name_hint") else ""
+                lines.append(
+                    f"ID {particle_id}{name_bit} (сырое поле: {info.get('raw_particle_name')!r}), "
+                    f"впервые на {info.get('item_name')!r} [{info.get('quality')}], "
+                    f"встречалось {info.get('count', '?')} раз(а)"
+                )
+            lines.append(
+                "\nЧтобы добавить: впиши точное название эффекта и это ID в NAME_TO_ID "
+                "в unusual_effects.py."
+            )
+            text = "\n".join(lines)
+            # Telegram's own hard message-length ceiling - truncated with
+            # a note rather than failing to send at all.
+            if len(text) > 3900:
+                text = text[:3900] + "\n\n… (список обрезан, слишком длинный для одного сообщения)"
+            return text
+        except Exception:
+            log.exception("Failed to format /unknowneffects reply.")
+            return "Не получилось собрать список - подробности в логах."
 
     def _check_item(self, name_query: str) -> str:
         """
@@ -1181,7 +1208,20 @@ class Watcher:
             # item name while also passing particle= separately.
             name = bptf_client.strip_effect_prefix(name, particle_name)
 
-        spells = [s.get("name") for s in (item.get("spells") or []) if isinstance(s, dict) and s.get("name")]
+        # Resolves via id -> name (spell_effects.py) when a spell entry
+        # has no usable "name" field, same reasoning and pattern as
+        # particle_id's own id-only fallback above - a real, confirmed
+        # gap: a third-party TF2-item-parsing library explicitly
+        # documents needing a "spell defindex to name" table for exactly
+        # this reason, meaning backpack.tf's real-time payload can carry
+        # a spell as an id-only attribute with no name resolved. Reading
+        # only s.get("name") silently dropped any spell in that shape -
+        # a two-spell item losing one (or both) of its spells this way
+        # is the exact mechanism behind several repeated "buy order from
+        # a spelled item" reports this project has seen. Also
+        # normalizes every name to its canonical form - see
+        # extract_spell_names' own docstring in spell_effects.py.
+        spells = spell_effects.extract_spell_names(item.get("spells"))
         # Same filter matcher.py's own evaluate_listing applies
         # (filter_spells_for_category) - keeps the recording side and
         # the lookup side from ever disagreeing about which bucket a
@@ -1295,6 +1335,32 @@ class Watcher:
         # key for some item types.
         grade_obj = item.get("rarity") or item.get("texture")
         texture = grade_obj.get("name") if isinstance(grade_obj, dict) else grade_obj
+        # Second quality (e.g. "Strange" on a "Strange Unusual" item) -
+        # per Valve's own item schema (confirmed on the official TF2
+        # wiki), an unboxed item can genuinely have 1 or 2 qualities at
+        # once, added via a Strangifier/Unusualifier - the item's
+        # PRIMARY quality (the `quality` variable above) stays
+        # "Unusual" for one of these, so it alone can never distinguish
+        # a "Strange Unusual" item from a plain one. THE actual root
+        # cause of a repeatedly-reported symptom (a plain Unusual sell
+        # listing's alert backed by a "Strange Unusual" variant's much
+        # higher buy order) that survived two earlier attempts to fix
+        # the PRIMARY quality check - that field was never wrong, this
+        # entirely separate one was just never read at all.
+        # backpack.tf's own classifieds search has a dedicated
+        # "elevated=<quality id>" URL filter for this (confirmed via
+        # a backpack.tf forums post), but the exact JSON field name in
+        # this real-time payload is unconfirmed beyond that - tries the
+        # likeliest camelCase/snake_case candidates, same approach this
+        # project already takes for other unconfirmed field paths
+        # (killstreaker/sheen) - falls back to None rather than guess
+        # wrong, so a plain item is never penalized by a bad guess here.
+        elevated_quality_obj = (
+            item.get("elevatedQuality") or item.get("elevated_quality") or item.get("elevated")
+        )
+        elevated_quality = (
+            elevated_quality_obj.get("name") if isinstance(elevated_quality_obj, dict) else elevated_quality_obj
+        )
         # Derived from the NAME TEXT, not the separate item.craftable
         # field - the two disagreed for some listings, so the displayed
         # name said "Non-Craftable X" while the buy order comparison
@@ -1321,6 +1387,7 @@ class Watcher:
             # whether a second exists were wrongly treated as identical.
             tuple(sorted(spells)) if spells else None, killstreak_tier, name.startswith("Australium "),
             texture=texture, defindex=defindex, killstreaker=killstreaker, sheen=sheen,
+            elevated_quality=elevated_quality,
         )
         self._name_to_identity_keys[name.lower()].add(identity_key)
         # excluded_types already rejected above - anything reaching here
@@ -1382,6 +1449,7 @@ class Watcher:
             # "details" is at the LISTING level, not nested under "item".
             seller_note=(payload.get("details") or "").strip() or None,
             paint_decimal_hint=paint_decimal_hint,
+            elevated_quality=elevated_quality,
         )
 
         self.stats["bptf_evaluated"] += 1

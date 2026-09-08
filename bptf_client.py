@@ -25,6 +25,7 @@ import uuid
 import requests
 
 import unusual_effects
+import spell_effects
 
 log = logging.getLogger("bptf")
 
@@ -517,7 +518,7 @@ def strip_variant_prefixes(name: str) -> str:
 def build_classifieds_url(name: str, quality_name: str, particle_id=None,
                            steamid=None, killstreak_tier=None, australium: bool = False,
                            spell=None, paint=None, craftable: bool = True,
-                           killstreaker=None, sheen=None) -> str:
+                           killstreaker=None, sheen=None, elevated_quality=None) -> str:
     """
     Link to backpack.tf's classifieds search, filtered to this exact
     item/quality/effect/spell - the closest thing to a permalink that
@@ -576,6 +577,17 @@ def build_classifieds_url(name: str, quality_name: str, particle_id=None,
     params["tradable"] = 1
     if steamid:
         params["steamid"] = steamid
+    if elevated_quality:
+        # "Strange Unusual" etc - a real, confirmed URL parameter from
+        # backpack.tf's own classifieds search (a forum post confirms
+        # "elevated=<quality id>"), using the same numeric quality ids
+        # as QUALITY_NAME_TO_ID. Omitted entirely when there's no second
+        # quality, matching every other optional filter's convention
+        # here - never sent as some "not applicable" sentinel value,
+        # since none is confirmed for this specific parameter.
+        elevated_id = QUALITY_NAME_TO_ID.get(elevated_quality)
+        if elevated_id is not None:
+            params["elevated"] = elevated_id
     return f"{CLASSIFIEDS_URL}?{urlencode(params)}"
 
 
@@ -1020,12 +1032,25 @@ class LocalListingStore:
 
 def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftable,
                           spell, killstreak_tier, australium, texture=None, defindex=None,
-                          killstreaker=None, sheen=None):
+                          killstreaker=None, sheen=None, elevated_quality=None):
     """
     The exact tuple LocalListingStore keys entries by - every field is
     already extracted/validated from the raw websocket payload, so two
     listings only share a bucket when genuinely identical in every
     tracked dimension.
+
+    elevated_quality is the item's SECOND quality (e.g. "Strange" on a
+    "Strange Unusual" item) - per Valve's own item schema, an unboxed
+    item can genuinely have 1 or 2 qualities at once (added via a
+    Strangifier/Unusualifier), confirmed on the official TF2 wiki. The
+    item's PRIMARY quality field (quality_name above) stays "Unusual"
+    for one of these - it's this SEPARATE field that distinguishes it
+    from a plain Unusual, and backpack.tf's own classifieds search has
+    a dedicated "elevated=<quality id>" filter for exactly this (a real,
+    confirmed case: a "Strange Unusual" item's buy order backing a
+    plain Unusual sell listing's alert, since nothing tracked this
+    second quality at all before - not a missing/mismatched check on
+    the primary quality field, which was always correct on its own).
 
     texture is a cosmetic/weapon "grade" (Civilian..Elite) - a separate
     sub-quality with real value differences. Can NOT be read from the
@@ -1045,7 +1070,7 @@ def listing_identity_key(name, quality_name, particle_id, paint_decimal, craftab
     return (
         name_component, quality_name, particle_id, paint_decimal,
         bool(craftable), spell or None, killstreak_tier or 0, bool(australium),
-        texture or None, killstreaker or None, sheen or None,
+        texture or None, killstreaker or None, sheen or None, elevated_quality or None,
     )
 
 
@@ -1176,7 +1201,7 @@ class BackpackTFPriceList:
                                      particle_id=None, craftable=True, spell=None,
                                      australium: bool = False, killstreak_tier=None, paint=None,
                                      killstreaker=None, sheen=None, paint_decimal_override=None,
-                                     texture=None, defindex=None):
+                                     texture=None, defindex=None, elevated_quality=None):
         """
         Returns (min_price_in_keys_among_OTHER_sell_listings,
         count_of_other_listings), or (None, 0) if not enough fresh,
@@ -1194,13 +1219,13 @@ class BackpackTFPriceList:
         )
         key = listing_identity_key(name, quality_name, particle_id, paint_value, craftable,
                                     spell, killstreak_tier, australium, texture=texture, defindex=defindex,
-                                    killstreaker=killstreaker, sheen=sheen)
+                                    killstreaker=killstreaker, sheen=sheen, elevated_quality=elevated_quality)
         return self.local_listings.get_min_sell_price(key, exclude_listing_id=exclude_listing_id)
 
     def get_best_buy_order_keys(self, name: str, quality_name: str, particle_id=None, craftable=True,
                                  spell=None, australium: bool = False, killstreak_tier=None, paint=None,
                                  killstreaker=None, sheen=None, paint_decimal_override=None,
-                                 texture=None, defindex=None):
+                                 texture=None, defindex=None, elevated_quality=None):
         """
         Highest current self-collected BUY-intent price for this exact
         item, in keys, plus how many fresh buy-intent listings that
@@ -1214,7 +1239,7 @@ class BackpackTFPriceList:
         )
         key = listing_identity_key(name, quality_name, particle_id, paint_value, craftable,
                                     spell, killstreak_tier, australium, texture=texture, defindex=defindex,
-                                    killstreaker=killstreaker, sheen=sheen)
+                                    killstreaker=killstreaker, sheen=sheen, elevated_quality=elevated_quality)
         return self.local_listings.get_max_buy_price(key)
 
     def fetch_and_record_all_buy_orders(self, name: str, quality_name: str) -> int:
@@ -1309,17 +1334,32 @@ class BackpackTFPriceList:
                 price_keys = self.currencies_to_keys(entry.get("currencies") or {})
                 if price_keys is None or price_keys <= 0:
                     continue
-                # Falls back to an index-based id (never just
-                # seller+particle, which - for any quality other than
-                # Unusual - would ALWAYS be seller+None, colliding
-                # between different real listings from the same seller
-                # within one response) only if the response entry itself
-                # has no id at all.
-                listing_id = entry.get("id") or entry.get("listing_id") or f"bulk-{i}"
                 user_obj = entry.get("user")
                 if not isinstance(user_obj, dict):
                     user_obj = {}
                 seller = user_obj.get("id") or (entry.get("steamid")) or "unknown"
+                # Falls back to a CONTENT-derived id (seller+item+quality+
+                # price), never a purely positional one - a real,
+                # confirmed severe bug this closes: a plain index-based
+                # fallback ("bulk-{i}") is only unique WITHIN one single
+                # API response, and isn't even stable for the SAME
+                # listing across two calls of this same function (this
+                # scanner re-runs periodically - see main.py's proactive
+                # refresh loop - and the response's own entry order can
+                # shift between calls as prices/listings change). Worse,
+                # since i resets to 0 on every call, completely UNRELATED
+                # listings from DIFFERENT items' own scans can land on
+                # the exact same fallback id. Either case meant
+                # record()'s own listing-relocation logic (see its
+                # docstring) - built to follow a listing's identity
+                # changing over time - instead followed pure coincidence,
+                # deleting one real buy order's data and overwriting it
+                # with an entirely unrelated one under the same id. Only
+                # used when the response entry itself has no id at all.
+                listing_id = (
+                    entry.get("id") or entry.get("listing_id")
+                    or f"bulk-{name}-{quality_name}-{seller}-{price_keys}"
+                )
                 # Derived from name text, NOT the raw item.craftable
                 # field - same confirmed-unreliable field, same fix, as
                 # main.py's own handle_bptf_event. Matters MORE here than
@@ -1366,10 +1406,11 @@ class BackpackTFPriceList:
                 # plain item's comparison. ALL spells (sorted), not just
                 # the first - see listing_identity_key's own callers for
                 # why (a second spell adds real value on its own).
-                entry_spells = [
-                    s.get("name") for s in (item.get("spells") or [])
-                    if isinstance(s, dict) and s.get("name")
-                ]
+                # extract_spell_names also resolves an id-only spell
+                # entry (no "name" field) and normalizes alternate/
+                # historical spell names to their canonical form - see
+                # its own docstring in spell_effects.py.
+                entry_spells = spell_effects.extract_spell_names(item.get("spells"))
                 entry_spell = tuple(sorted(entry_spells)) if entry_spells else None
                 # Grade (Civilian..Elite rarity) - a real, confirmed gap
                 # matching the exact same shape as the spell one just
@@ -1399,11 +1440,25 @@ class BackpackTFPriceList:
                     entry_paint_obj.get("name") if isinstance(entry_paint_obj, dict) else entry_paint_obj
                 )
                 entry_paint_decimal = paint_rgb_decimal(entry_paint_name) if entry_paint_name else None
+                # Second quality (e.g. "Strange" on a "Strange Unusual"
+                # item) - see listing_identity_key's own docstring. THE
+                # actual root cause of a repeatedly-reported symptom
+                # (a plain Unusual sell listing's alert backed by a
+                # "Strange Unusual" variant's buy order) that survived
+                # two earlier attempts to fix the PRIMARY quality check
+                # - the primary quality field was never wrong, this
+                # SEPARATE dimension was just never tracked at all.
+                entry_elevated_raw = (
+                    item.get("elevatedQuality") or item.get("elevated_quality") or item.get("elevated")
+                )
+                entry_elevated = (
+                    entry_elevated_raw.get("name") if isinstance(entry_elevated_raw, dict) else entry_elevated_raw
+                )
                 key = listing_identity_key(
                     name, entry_quality, particle_id, entry_paint_decimal, craftable,
                     entry_spell, item.get("killstreakTier") or 0, name.startswith("Australium "),
                     texture=entry_grade, killstreaker=killstreaker_obj.get("name"), sheen=sheen_obj.get("name"),
-                    defindex=defindex,
+                    defindex=defindex, elevated_quality=entry_elevated,
                 )
                 self.local_listings.record(key, str(listing_id), str(seller), price_keys, "buy")
                 recorded += 1
@@ -1425,7 +1480,7 @@ class BackpackTFPriceList:
 
     def fetch_live_buy_order_keys(self, name: str, quality_name: str, particle_id=None,
                                    craftable=True, australium: bool = False, killstreak_tier=None,
-                                   spell=None, texture=None, paint=None):
+                                   spell=None, texture=None, paint=None, elevated_quality=None):
         """
         LIVE query to the snapshot API for this item's current best buy
         order - a deliberate, narrow exception to this project's "local
@@ -1549,11 +1604,12 @@ class BackpackTFPriceList:
                 # first - see listing_identity_key's own callers for why
                 # (a second spell adds real value on its own, so an item
                 # with two spells must never match one with only the
-                # first of the two).
-                entry_spells = [
-                    s.get("name") for s in (item.get("spells") or [])
-                    if isinstance(s, dict) and s.get("name")
-                ]
+                # first of the two). extract_spell_names also resolves
+                # an id-only spell entry (no "name" field) and
+                # normalizes alternate/historical spell names to their
+                # canonical form - see its own docstring in
+                # spell_effects.py.
+                entry_spells = spell_effects.extract_spell_names(item.get("spells"))
                 entry_spell = tuple(sorted(entry_spells)) if entry_spells else None
                 if (spell or None) != (entry_spell or None):
                     continue
@@ -1574,6 +1630,26 @@ class BackpackTFPriceList:
                 entry_paint_raw = item.get("paint")
                 entry_paint = entry_paint_raw.get("name") if isinstance(entry_paint_raw, dict) else entry_paint_raw
                 if (paint or None) != (entry_paint or None):
+                    continue
+                # Second quality (e.g. "Strange" on a "Strange Unusual"
+                # item) - see listing_identity_key's own docstring for
+                # the full explanation. Field path unconfirmed beyond
+                # backpack.tf's own classifieds search using
+                # "elevated=<quality id>" as its URL parameter (a real
+                # forum post confirms this) - tries the most likely
+                # camelCase/snake_case candidates for the JSON response
+                # shape, same as this project's approach to every other
+                # unconfirmed field (killstreaker/sheen, etc): falls
+                # back to None (no elevated quality) rather than guess
+                # wrong, so a query for a PLAIN item is never rejected
+                # just because none of these guesses matched.
+                entry_elevated_raw = (
+                    item.get("elevatedQuality") or item.get("elevated_quality") or item.get("elevated")
+                )
+                entry_elevated = (
+                    entry_elevated_raw.get("name") if isinstance(entry_elevated_raw, dict) else entry_elevated_raw
+                )
+                if (elevated_quality or None) != (entry_elevated or None):
                     continue
                 price_keys = self.currencies_to_keys(entry.get("currencies") or {})
                 if price_keys is not None and price_keys > 0:

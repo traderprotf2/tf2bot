@@ -57,6 +57,7 @@ class NormalizedListing:
     killstreaker: Optional[str] = None                    # Professional Killstreak only - the eye-particle effect
     sheen: Optional[str] = None                           # Specialized/Professional Killstreak - the kill-flash colour
     seller_note: Optional[str] = None                     # the seller's own comment on the listing, if any
+    elevated_quality: Optional[str] = None                # SECOND quality (e.g. "Strange" on a "Strange Unusual" item) - Valve's schema allows 1 or 2 qualities per unboxed item; primary quality above stays "Unusual" for these, this is what actually distinguishes them - see listing_identity_key's own docstring
 
 
 def clean_display_name(listing: NormalizedListing) -> str:
@@ -65,13 +66,20 @@ def clean_display_name(listing: NormalizedListing) -> str:
     the source's raw `name` already included the quality prefix.
     Australium weapons are always Strange quality, but nobody calls one
     "Strange Australium Rocket Launcher" - left without the prefix.
+
+    elevated_quality (a genuine second quality - see NormalizedListing's
+    own field comment) is shown as a further prefix ahead of the
+    primary quality - "Strange Unusual X" - matching backpack.tf's own
+    naming convention for these (confirmed via their own stats page
+    URLs, e.g. "Strange Unusual Field Practice").
     """
     base = strip_quality_prefix(listing.name, listing.quality)
     if base.startswith("Australium "):
         return base
+    elevated_prefix = f"{listing.elevated_quality} " if listing.elevated_quality else ""
     if listing.quality and listing.quality != "Unique":
-        return f"{listing.quality} {base}"
-    return base
+        return f"{elevated_prefix}{listing.quality} {base}"
+    return f"{elevated_prefix}{base}" if elevated_prefix else base
 
 
 def detect_special_variant(name: str):
@@ -117,8 +125,21 @@ def filter_spells_for_category(spells, category: str):
     """Drops any spell that's confirmed impossible for this item's
     category (see WEAPON_ONLY_SPELLS / COSMETIC_ONLY_SPELLS above).
     Unrecognised spell names are kept as-is - only known-incompatible
-    combinations are removed, never guessed at."""
-    if not spells:
+    combinations are removed, never guessed at.
+
+    Only applies when category is confidently "weapon" or "cosmetic" -
+    a real, confirmed bug this closes: for "other" (this project's own
+    catch-all for "not confident this is a weapon or a cosmetic", not a
+    confirmed third category actually incompatible with spells), the
+    original condition (category != "weapon" AND category != "cosmetic"
+    both true at once) stripped spells from BOTH restricted lists
+    simultaneously - meaning a genuinely spelled item that only ended up
+    classified as "other" (e.g. an ambiguous/missing slot value) could
+    have every one of its spells silently removed, collapsing it down
+    to the SAME identity key a truly spell-less item uses - the exact
+    shape of a real, confirmed report (a two-spell item's high buy order
+    backing a "no spells shown" sell listing's alert)."""
+    if not spells or category not in ("weapon", "cosmetic"):
         return spells
     return [
         s for s in spells
@@ -130,7 +151,7 @@ def filter_spells_for_category(spells, category: str):
 def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, spell, australium,
                                killstreak_tier, min_other_listings, exclude_listing_id="",
                                paint=None, killstreaker=None, sheen=None, paint_decimal_override=None,
-                               texture=None, defindex=None):
+                               texture=None, defindex=None, elevated_quality=None):
     """
     Live-buy-order-ONLY reference price lookup. Used both for the item
     being evaluated, and (in check_killstreak_tier_pricing below) for its
@@ -149,6 +170,7 @@ def _get_reference_price_keys(bptf, name, quality_name, particle_id, craftable, 
         australium=australium, killstreak_tier=killstreak_tier,
         paint=paint, killstreaker=killstreaker, sheen=sheen,
         paint_decimal_override=paint_decimal_override, texture=texture, defindex=defindex,
+        elevated_quality=elevated_quality,
     )
 
     if ref_keys is not None and other_count >= min_other_listings:
@@ -208,7 +230,7 @@ def check_killstreak_tier_pricing(bptf, listing: "NormalizedListing", lookup_nam
         bptf, tier0_name, listing.quality, listing.particle_id, listing.craftable,
         spell=None, australium=is_australium, killstreak_tier=0,
         min_other_listings=cfg["min_other_listings"],
-        texture=listing.texture, defindex=listing.defindex,
+        texture=listing.texture, defindex=listing.defindex, elevated_quality=listing.elevated_quality,
     )
     if tier0_ref is not None and tier0_ref > ref_keys:
         log.info(
@@ -361,7 +383,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
             spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
             min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
             paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
-            texture=listing.texture, defindex=listing.defindex,
+            texture=listing.texture, defindex=listing.defindex, elevated_quality=listing.elevated_quality,
             paint_decimal_override=listing.paint_decimal_hint,
         )
         if ref_keys is not None:
@@ -373,7 +395,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
                 spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
                 min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
                 paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
-                texture=listing.texture, defindex=listing.defindex,
+                texture=listing.texture, defindex=listing.defindex, elevated_quality=listing.elevated_quality,
                 paint_decimal_override=candidate,
             )
             if ref_keys is not None:
@@ -385,7 +407,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
             spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
             min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
             paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
-            texture=listing.texture, defindex=listing.defindex,
+            texture=listing.texture, defindex=listing.defindex, elevated_quality=listing.elevated_quality,
         )
 
     if ref_keys is None or ref_keys <= 0:
@@ -405,7 +427,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
         paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
         texture=listing.texture, defindex=listing.defindex,
-        paint_decimal_override=winning_paint_decimal,
+        paint_decimal_override=winning_paint_decimal, elevated_quality=listing.elevated_quality,
     )
     if buy_order_keys is None or buy_order_keys <= 0:
         # Live-query supplement, ONLY for priority items - see
@@ -423,7 +445,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
                 lookup_name, listing.quality, listing.particle_id,
                 craftable=listing.craftable, australium=australium,
                 killstreak_tier=listing.killstreak_tier, spell=spell_combo,
-                texture=listing.texture, paint=listing.paint,
+                texture=listing.texture, paint=listing.paint, elevated_quality=listing.elevated_quality,
             )
     # Unpainted-buy-order fallback, painted items only, per explicit
     # request: an unpopular paint can have NO buy order at all in
@@ -449,7 +471,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
             lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable,
             spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
             killstreaker=listing.killstreaker, sheen=listing.sheen,
-            texture=listing.texture, defindex=listing.defindex,
+            texture=listing.texture, defindex=listing.defindex, elevated_quality=listing.elevated_quality,
         )
         if buy_order_keys is not None and buy_order_keys > 0:
             unpainted_reference = True
@@ -553,6 +575,7 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         australium=australium, spell=primary_spell,
         paint=listing.paint, craftable=listing.craftable,
         killstreaker=listing.killstreaker, sheen=listing.sheen,
+        elevated_quality=listing.elevated_quality,
     )
 
     # Real item picture for the Telegram alert, straight from Valve's own
