@@ -369,46 +369,51 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
     # only if RED found nothing. Trying the wrong one first just costs
     # one extra request (backpack.tf's paint= filter returns no matches
     # for the wrong colour, never wrong data), never a bad comparison.
-    # Whichever decimal succeeds is reused for the buy-order lookup
-    # below too, so both describe the same colour.
-    winning_paint_decimal = None
+    #
+    # This candidate list is walked TWICE below - once for the sell-side
+    # reference, once (independently) for the buy order - rather than
+    # resolving it once and reusing whichever candidate won the sell
+    # trial. A real, confirmed bug this fixes: the buy-order lookup used
+    # to reuse the SELL reference's own winning candidate, which stays
+    # None whenever no other live sell listing exists in either colour
+    # right now (common for a niche paint - and explicitly NOT required,
+    # see ref_keys handling below, since the sell reference is only
+    # informational). That None then flowed into
+    # get_best_buy_order_keys(paint_decimal_override=None), which falls
+    # back to paint_rgb_decimal(listing.paint) - also None for a
+    # team-coloured paint, since none of the 7 are in PAINT_NAME_TO_RGB
+    # (only in TEAM_COLOR_PAINT_RGB). The buy-order search then silently
+    # matched on paint_decimal=None - the exact same identity-key slot a
+    # genuinely UNPAINTED item uses - reporting an unrelated unpainted
+    # buy order as if it were this specific colour's, without ever
+    # setting unpainted_reference (that flag only fires in the later,
+    # explicit fallback further down, which never ran here since this
+    # accidental unpainted match usually isn't empty).
     if listing.paint_decimal_hint is not None:
         # The source told us exactly which colour this listing is
         # (confirmed real for mannco.store - see mannco_paint_decimal_
         # hint) - go straight to it, no need to guess-and-try RED then
         # BLU the way team_color_decimals below does for sources that
         # don't give this directly.
-        ref_keys = _get_reference_price_keys(
-            bptf, lookup_name, listing.quality, listing.particle_id, listing.craftable,
-            spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
-            min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
-            paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
-            texture=listing.texture, defindex=listing.defindex, elevated_quality=listing.elevated_quality,
-            paint_decimal_override=listing.paint_decimal_hint,
-        )
-        if ref_keys is not None:
-            winning_paint_decimal = listing.paint_decimal_hint
+        paint_candidates = [listing.paint_decimal_hint]
     elif team_color_decimals:
-        for candidate in team_color_decimals:
-            ref_keys = _get_reference_price_keys(
-                bptf, lookup_name, listing.quality, listing.particle_id, listing.craftable,
-                spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
-                min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
-                paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
-                texture=listing.texture, defindex=listing.defindex, elevated_quality=listing.elevated_quality,
-                paint_decimal_override=candidate,
-            )
-            if ref_keys is not None:
-                winning_paint_decimal = candidate
-                break
+        paint_candidates = team_color_decimals
     else:
-        ref_keys = _get_reference_price_keys(
+        paint_candidates = [None]
+
+    ref_keys = None
+    for candidate in paint_candidates:
+        candidate_ref_keys = _get_reference_price_keys(
             bptf, lookup_name, listing.quality, listing.particle_id, listing.craftable,
             spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
             min_other_listings=cfg["min_other_listings"], exclude_listing_id=exclude_id,
             paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
             texture=listing.texture, defindex=listing.defindex, elevated_quality=listing.elevated_quality,
+            paint_decimal_override=candidate,
         )
+        if candidate_ref_keys is not None:
+            ref_keys = candidate_ref_keys
+            break
 
     if ref_keys is None or ref_keys <= 0:
         # No longer a rejection for being ABSENT - the sell-side
@@ -432,13 +437,23 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         # about one existing and being worse than the alert would be.
         return reject("cheaper_listing_already_available")
 
-    buy_order_keys, buy_order_count = bptf.get_best_buy_order_keys(
-        lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable,
-        spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
-        paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
-        texture=listing.texture, defindex=listing.defindex,
-        paint_decimal_override=winning_paint_decimal, elevated_quality=listing.elevated_quality,
-    )
+    # Independent RED/BLU trial from the sell reference above - see the
+    # comment on paint_candidates for why these must not share one
+    # resolved colour between the two. Stops at the first candidate that
+    # actually has a live buy order; for a non-team-coloured paint (or
+    # none at all) paint_candidates has exactly one entry, so this
+    # behaves exactly as a single lookup always did.
+    buy_order_keys, buy_order_count = None, 0
+    for candidate in paint_candidates:
+        buy_order_keys, buy_order_count = bptf.get_best_buy_order_keys(
+            lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable,
+            spell=spell_combo, australium=australium, killstreak_tier=listing.killstreak_tier,
+            paint=listing.paint, killstreaker=listing.killstreaker, sheen=listing.sheen,
+            texture=listing.texture, defindex=listing.defindex,
+            paint_decimal_override=candidate, elevated_quality=listing.elevated_quality,
+        )
+        if buy_order_keys is not None and buy_order_keys > 0:
+            break
     if buy_order_keys is None or buy_order_keys <= 0:
         # Live-query supplement, ONLY for priority items - see
         # fetch_live_buy_order_keys' own docstring. Same priority rule
