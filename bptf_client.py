@@ -18,6 +18,7 @@ import collections
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -287,6 +288,50 @@ TEAM_COLOR_PAINT_RGB = {
     "The Value of Teamwork": {"RED": (128, 48, 32), "BLU": (37, 109, 141)},
     "Waterlogged Lab Coat": {"RED": (168, 154, 140), "BLU": (131, 159, 163)},
 }
+
+# Common informal/shorthand names traders actually use in free-text buy
+# order notes for a specific paint, alongside (not instead of) the
+# official names above - e.g. "black" for A Color Similar to Slate,
+# "TS"/"team colored" for Team Spirit. Checked on word boundaries only.
+_PAINT_COLLOQUIAL_TERMS = (
+    "black", "white", "pink", "team spirit", "team colored", "team coloured",
+    "ts paint", "dark green", "light blue", "drab", "australium gold",
+)
+
+
+def note_mentions_paint(text):
+    """
+    Whether a buy-order's own free-text note mentions a specific paint
+    by name (official or common shorthand) - the same pattern and
+    reasoning as spell_effects.note_mentions_spell (see its own
+    docstring), just for paint: a buy-order bot can post one structured
+    listing whose price is stated in free text to apply only to one
+    specific colour (or a tiered set of colours at different prices),
+    with the listing's own structured "paint" field left empty/unset
+    the whole time, since backpack.tf has no structured way to express
+    "this price is colour-conditional" either. Recording that price
+    under the UNPAINTED identity bucket would silently misprice every
+    genuinely unpainted sell listing of the same item that compares
+    against it. Pattern-matches on word boundaries only (never a bare
+    substring). Never guesses WHICH colour - just flags the note as
+    colour-conditional so the caller can treat this entry's price as
+    unreliable for an unpainted comparison.
+    """
+    if not text:
+        return False
+    text_lower = text.lower()
+    for name in PAINT_NAME_TO_RGB:
+        if name.lower() in text_lower:
+            return True
+    for name in TEAM_COLOR_PAINT_RGB:
+        if name.lower() in text_lower:
+            return True
+    for term in _PAINT_COLLOQUIAL_TERMS:
+        if re.search(r"\b" + re.escape(term) + r"\b", text_lower):
+            return True
+    if re.search(r"\bpaint(ed)?\b", text_lower):
+        return True
+    return False
 
 
 def paint_rgb_decimal(paint_name: str):
@@ -1470,6 +1515,10 @@ class BackpackTFPriceList:
                 # separate intent check is needed the way main.py's is.
                 if not entry_spells and spell_effects.note_mentions_spell(entry.get("details")):
                     continue
+                # Same gap, same fix, for paint - see
+                # bptf_client.note_mentions_paint's own docstring.
+                if not entry_paint_name and note_mentions_paint(entry.get("details")):
+                    continue
                 self.local_listings.record(key, str(listing_id), str(seller), price_keys, "buy")
                 recorded += 1
             except Exception:
@@ -1652,6 +1701,13 @@ class BackpackTFPriceList:
                 entry_paint_raw = item.get("paint")
                 entry_paint = entry_paint_raw.get("name") if isinstance(entry_paint_raw, dict) else entry_paint_raw
                 if (paint or None) != (entry_paint or None):
+                    continue
+                # Skipped when this entry has no structured paint (the
+                # check above already matched, since an unpainted LOOKUP
+                # accepts an unpainted ENTRY) but its own free-text note
+                # mentions one anyway - see note_mentions_paint's own
+                # docstring for the full reasoning.
+                if not entry_paint and note_mentions_paint(entry.get("details")):
                     continue
                 # Second quality (e.g. "Strange" on a "Strange Unusual"
                 # item) - see listing_identity_key's own docstring for

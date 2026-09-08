@@ -176,9 +176,22 @@ class Watcher:
 
         # name -> identity_key(s), for /checkitem's name-based lookup
         # (identity keys themselves may be defindex-anchored, not
-        # name-based). Unbounded on purpose - distinct item NAMES are a
-        # small set relative to listing volume.
+        # name-based). The OUTER dict is still fine unbounded - distinct
+        # item NAMES are a small, finite set. The INNER set per name is
+        # capped (MAX_IDENTITY_KEYS_PER_NAME below) - a defensive
+        # tightening: this project's own identity key has grown from a
+        # handful of dimensions to a dozen over this session (spell
+        # combos, paint, grade, elevated quality, killstreaker/sheen
+        # combinations...), so a single popular item's own realistic
+        # variant count is far larger now than when this was first
+        # called "small enough not to matter" - given this project's
+        # repeated real OOM incidents from exactly this kind of
+        # "theoretically bounded, never actually capped" structure,
+        # capping here too costs nothing (this is diagnostic-only, for
+        # /checkitem, not core matching logic) and removes one more
+        # structure from that risk category entirely.
         self._name_to_identity_keys = collections.defaultdict(set)
+        self.MAX_IDENTITY_KEYS_PER_NAME = 500
 
         # (name, quality_name) -> {"ts": last proactive-refresh time (0 =
         # never), "category": classify_category() result} - drives
@@ -199,7 +212,16 @@ class Watcher:
         # effects/_save_unknown_effects) so a discovery isn't lost to a
         # routine restart before anyone's reviewed it - unlike
         # _known_scan_items above, these are rare and worth keeping.
+        # Capped defensively (MAX_UNKNOWN_PARTICLE_IDS) even though
+        # normal operation should never approach it (most effects are
+        # already in the bundled database) - a pathological failure mode
+        # generating many distinct bogus "unknown" ids would otherwise
+        # have no ceiling at all, and this project has already seen more
+        # than one structure that was "small in practice" turn into a
+        # real OOM incident once something unexpected made it not stay
+        # that way.
         self._unknown_particle_ids = {}
+        self.MAX_UNKNOWN_PARTICLE_IDS = 1000
         self._load_unknown_effects()
 
         if not cfg.get("backpacktf_token"):
@@ -1172,7 +1194,9 @@ class Watcher:
                 # a common unknown effect re-appearing many times updates
                 # the in-memory count for context, but doesn't need a
                 # disk write every single time.
-                if particle_id not in self._unknown_particle_ids:
+                if particle_id in self._unknown_particle_ids:
+                    self._unknown_particle_ids[particle_id]["count"] += 1
+                elif len(self._unknown_particle_ids) < self.MAX_UNKNOWN_PARTICLE_IDS:
                     name_hint = particle_name if particle_name and not particle_name.startswith("#") else None
                     self._unknown_particle_ids[particle_id] = {
                         "name_hint": name_hint,
@@ -1190,8 +1214,9 @@ class Watcher:
                         particle_id, name_hint, particle_name, name,
                     )
                     await asyncio.to_thread(self._save_unknown_effects)
-                else:
-                    self._unknown_particle_ids[particle_id]["count"] += 1
+                # else: cap reached and this is a genuinely new id - not
+                # tracked at all, silently, rather than raising (there
+                # was no entry to increment a count on).
 
         if particle_name and particle_name.startswith("#"):
             # item.particle.name is sometimes itself an unresolved raw
@@ -1397,6 +1422,17 @@ class Watcher:
         if intent == "buy" and not spells and spell_effects.note_mentions_spell(payload.get("details")):
             self.stats["bptf_buy_skipped_spell_conditional_note"] += 1
             return
+        # Same gap, same fix, for paint - see bptf_client.note_mentions_
+        # paint's own docstring: a buy-order bot's structured price can
+        # likewise be stated in free text to apply only to one specific
+        # colour ("Black paint - 20 keys, other colours less"), with the
+        # listing's own structured "paint" field left empty the whole
+        # time - recording that price under the UNPAINTED bucket would
+        # misprice every genuinely unpainted sell listing that compares
+        # against it.
+        if intent == "buy" and not paint and bptf_client.note_mentions_paint(payload.get("details")):
+            self.stats["bptf_buy_skipped_paint_conditional_note"] += 1
+            return
 
         paint_value_for_identity = paint_decimal_hint if paint_decimal_hint is not None else (
             bptf_client.paint_rgb_decimal(paint) if paint else None
@@ -1413,7 +1449,9 @@ class Watcher:
             texture=texture, defindex=defindex, killstreaker=killstreaker, sheen=sheen,
             elevated_quality=elevated_quality,
         )
-        self._name_to_identity_keys[name.lower()].add(identity_key)
+        name_keys_set = self._name_to_identity_keys[name.lower()]
+        if identity_key in name_keys_set or len(name_keys_set) < self.MAX_IDENTITY_KEYS_PER_NAME:
+            name_keys_set.add(identity_key)
         # excluded_types already rejected above - anything reaching here
         # is guaranteed not excluded.
         is_currently_watched_quality = quality == "Unusual" or quality in self.runtime.watched_qualities
