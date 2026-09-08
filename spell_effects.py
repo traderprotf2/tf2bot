@@ -31,6 +31,8 @@ spell AND a voice spell simultaneously) - this project's own spell_combo
 handling (see matcher.py) already accounts for that.
 """
 
+import re
+
 # Source: https://spells.pricedb.io/api/spell/spells (fetched directly,
 # a dedicated live spell-data API collecting from backpack.tf's own
 # listings) - id -> (name, type). type is informational only (not used
@@ -131,3 +133,48 @@ def extract_spell_names(raw_spells):
         if spell_name:
             names.append(normalize_spell_name(spell_name))
     return names
+
+
+# Common abbreviations/shorthand for spells seen in real buy-order seller
+# notes, beyond the canonical names themselves (checked separately, via
+# NAME_TO_ID) - "VFB" for Voices From Below is by far the most common,
+# confirmed directly from a real buy order's own text: "VFB - Listed
+# Price" (i.e. the listing's own structured price applies ONLY to that
+# one spell, not to a plain item at all).
+_KNOWN_SPELL_ABBREVIATIONS = ("vfb", "cc", "dj", "ss", "pp", "hh")
+
+
+def note_mentions_spell(text):
+    """
+    Whether a buy-order's own free-text note (its "details"/description
+    field) mentions a specific spell by name or common abbreviation -
+    used to catch a real, confirmed pattern: a buy-order bot posts ONE
+    structured listing whose price covers only ONE specific spell (or a
+    tiered set of different spells at different prices), stated entirely
+    in free text ("VFB - Listed Price / CC - Spec - 9k / Any footprints
+    - 41+ keys") - backpack.tf has no structured way to express "this
+    price is spell-conditional" at all, so the listing's own "spells"
+    field is empty/unset even though the price plainly isn't for a plain
+    item. Recording this price under the spell-less identity bucket
+    would silently misprice every genuinely spell-less sell listing of
+    the same item - the exact mechanism behind a real, confirmed report.
+    Pattern-matches on word boundaries only (never a bare substring), so
+    "shhh" doesn't match "hh" etc. Never guesses WHICH spell - just
+    flags the note as spell-conditional so the caller can treat this
+    entry's price as unreliable for a spell-less comparison.
+    """
+    if not text:
+        return False
+    text_lower = text.lower()
+    for name in NAME_TO_ID:
+        if name.lower() in text_lower:
+            return True
+    for name in ALTERNATE_NAME_TO_CANONICAL:
+        if name.lower() in text_lower:
+            return True
+    if "spell" in text_lower:
+        return True
+    for abbrev in _KNOWN_SPELL_ABBREVIATIONS:
+        if re.search(rf"\b{re.escape(abbrev)}\b", text_lower):
+            return True
+    return False

@@ -1460,6 +1460,16 @@ class BackpackTFPriceList:
                     texture=entry_grade, killstreaker=killstreaker_obj.get("name"), sheen=sheen_obj.get("name"),
                     defindex=defindex, elevated_quality=entry_elevated,
                 )
+                # Skipped when this entry has no structured spell but its
+                # own free-text note mentions one anyway - see
+                # main.py's own identical check for the full reasoning
+                # (a real, confirmed buy order whose structured price
+                # explicitly, per its own text, only applies to one
+                # specific spell). Every entry here is buy-intent (this
+                # whole function only ever queries intent=buy), so no
+                # separate intent check is needed the way main.py's is.
+                if not entry_spells and spell_effects.note_mentions_spell(entry.get("details")):
+                    continue
                 self.local_listings.record(key, str(listing_id), str(seller), price_keys, "buy")
                 recorded += 1
             except Exception:
@@ -1612,6 +1622,18 @@ class BackpackTFPriceList:
                 entry_spells = spell_effects.extract_spell_names(item.get("spells"))
                 entry_spell = tuple(sorted(entry_spells)) if entry_spells else None
                 if (spell or None) != (entry_spell or None):
+                    continue
+                # Skipped when this entry has no structured spell (the
+                # check above already matched, since a spell-less LOOKUP
+                # accepts a spell-less ENTRY) but its own free-text note
+                # mentions one anyway - see main.py's own identical check
+                # for the full reasoning (a real, confirmed buy order
+                # whose structured price explicitly, per its own text,
+                # only applies to one specific spell - the note-mentions
+                # check above wouldn't catch this on its own, since it
+                # only compares the STRUCTURED spell field, which stays
+                # empty for exactly this pattern).
+                if not entry_spell and spell_effects.note_mentions_spell(entry.get("details")):
                     continue
                 # Grade (Civilian..Elite) - same gap, same fix as spell
                 # just above: this parameter didn't exist at all until

@@ -1374,6 +1374,30 @@ class Watcher:
         # endpoint. Happens for every listing, not just qualifying
         # deals - a listing that isn't a bargain is still comparison
         # data a later listing of the same item needs.
+        #
+        # EXCEPT: a buy-intent listing with NO structured spell whose
+        # own free-text note mentions one anyway - a real, confirmed
+        # pattern: a spell-buying bot posts ONE listing whose structured
+        # price covers only ONE specific spell (or several spells at
+        # different prices), stated entirely in free text ("VFB - Listed
+        # Price / CC - Spec - 9k / Any footprints - 41+ keys") -
+        # backpack.tf has no structured way to express "this price is
+        # spell-conditional" at all, so this listing's own "spells"
+        # field stays empty even though the price plainly isn't for a
+        # plain item. Recording it under the spell-less bucket anyway
+        # would silently misprice every genuinely spell-less sell
+        # listing of the same item that ever compares against it - the
+        # exact mechanism behind a real, confirmed report (a 9-key plain
+        # sell listing "matched" against a buy order whose own text says
+        # its price is for Voices From Below specifically). Skipped
+        # entirely rather than guessed at - this project already has an
+        # unpainted-buy-order fallback for a related gap (see matcher.py)
+        # deliberately built the same way: a missing comparison costs one
+        # possible alert, a wrong one costs trust in every alert.
+        if intent == "buy" and not spells and spell_effects.note_mentions_spell(payload.get("details")):
+            self.stats["bptf_buy_skipped_spell_conditional_note"] += 1
+            return
+
         paint_value_for_identity = paint_decimal_hint if paint_decimal_hint is not None else (
             bptf_client.paint_rgb_decimal(paint) if paint else None
         )

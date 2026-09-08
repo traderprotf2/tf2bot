@@ -411,16 +411,26 @@ def evaluate_listing(listing: NormalizedListing, bptf, cfg: dict, stats=None):
         )
 
     if ref_keys is None or ref_keys <= 0:
-        # No longer a rejection - the sell-side reference is now purely
-        # informational ("Было: X") when available, not required. The
-        # actual discount decision now runs entirely on the buy order
-        # fetched below, per direct correction: comparing against OTHER
-        # active sell listings needed at least one other exact-match
-        # listing to exist at the same time, which for anything not
-        # extremely popular could take a long time to happen even once -
-        # a buy order is a single standing signal that, once posted,
-        # doesn't need a SECOND coincidental listing to compare against.
+        # No longer a rejection for being ABSENT - the sell-side
+        # reference is informational ("Было: X") when available, not
+        # required to exist. Comparing against OTHER active sell
+        # listings needed at least one other exact-match listing to
+        # exist at the same time, which for anything not extremely
+        # popular could take a long time to happen even once - a buy
+        # order is a single standing signal that, once posted, doesn't
+        # need a SECOND coincidental listing to compare against.
         ref_keys = None
+    elif ref_keys < listing.price_keys:
+        # But IS still a rejection when it exists AND is cheaper than
+        # THIS listing - a real, confirmed case: alerting on a listing
+        # priced above another currently-live, identical listing has no
+        # point at all - a strictly better deal for the exact same item
+        # is already sitting there, so this one was never actually the
+        # best available price, whatever discount it shows against the
+        # buy order. Different from the reasoning above: that was about
+        # a reference not EXISTING (common, shouldn't block); this is
+        # about one existing and being worse than the alert would be.
+        return reject("cheaper_listing_already_available")
 
     buy_order_keys, buy_order_count = bptf.get_best_buy_order_keys(
         lookup_name, listing.quality, listing.particle_id, craftable=listing.craftable,
