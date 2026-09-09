@@ -532,9 +532,10 @@ def _format_stats(stats, stats_since, currently_rate_limited=False,
     scans = stats.get("proactive_unusual_scans", 0)
     if scans:
         recorded = stats.get("proactive_unusual_buy_orders_recorded", 0)
+        sell_recorded = stats.get("proactive_sell_listings_recorded", 0)
         lines.append(
-            f"\n🔄 Проактивное сканирование: {scans} запрос(ов), "
-            f"{recorded} buy-заявок обновлено"
+            f"\n🔄 Проактивное сканирование: {scans} предмет(ов), "
+            f"{recorded} buy-заявок / {sell_recorded} sell-листингов обновлено"
         )
 
     return header + memory_line + "\n".join(lines)

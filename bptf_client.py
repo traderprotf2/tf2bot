@@ -123,11 +123,20 @@ class _AccountPool:
                     return best_idx, account["api_key"], account["token"]
             time.sleep(max(wait, 0.05))
 
-    def note_rate_limited(self, index):
+    def note_rate_limited(self, index, retry_after_seconds=None):
         """Per-account version of the old global _note_rate_limited -
         same adaptive backoff (doubles on a hit shortly after the last
         one, resets to base after a quiet while), scoped to just this
-        one account's own cooldown clock."""
+        one account's own cooldown clock.
+
+        retry_after_seconds: backpack.tf's own Retry-After header value
+        (added to 429 responses per their own May 2025 changelog) -
+        authoritative, straight from the server that actually knows when
+        THIS account's limit resets, not a guess. Used directly for how
+        long to actually wait whenever present; _cooldown_seconds is
+        still advanced by the adaptive doubling below regardless, so the
+        guess stays reasonable for a future 429 that doesn't include
+        this header."""
         with self._lock:
             now = time.time()
             if now - self._last_hit_at[index] > _RATE_LIMIT_RESET_AFTER_SECONDS:
@@ -137,7 +146,10 @@ class _AccountPool:
                     self._cooldown_seconds[index] * 2, _RATE_LIMIT_MAX_COOLDOWN_SECONDS
                 )
             self._last_hit_at[index] = now
-            self._cooldown_until[index] = now + self._cooldown_seconds[index]
+            if retry_after_seconds is not None:
+                self._cooldown_until[index] = now + retry_after_seconds
+            else:
+                self._cooldown_until[index] = now + self._cooldown_seconds[index]
 
     def any_account_available(self):
         """Whether at least one account is NOT currently on cooldown -
@@ -182,6 +194,22 @@ def is_rate_limited() -> bool:
     return not _account_pool.any_account_available()
 
 
+def _parse_retry_after(header_value):
+    """Parses an HTTP Retry-After header value into a float number of
+    seconds, or None if missing/unparseable. Per RFC 9110 this can be
+    either an integer number of seconds (backpack.tf's own case, per
+    their changelog) or an HTTP-date - only the seconds form is handled
+    here since that's the confirmed real shape; an HTTP-date falls
+    through to None (the caller's existing adaptive-backoff guess),
+    never raises."""
+    if not header_value:
+        return None
+    try:
+        return max(0.0, float(header_value))
+    except (TypeError, ValueError):
+        return None
+
+
 def _get_with_retry(session, url, params, timeout=20, treat_missing_listings_as_rate_limit=False):
     """
     Shared GET for the two backpack.tf endpoints that scale with
@@ -209,17 +237,19 @@ def _get_with_retry(session, url, params, timeout=20, treat_missing_listings_as_
     idx, api_key, token = _account_pool.acquire()
     request_params = dict(params, key=api_key, token=token)
     with _request_semaphore:
-        resp = session.get(url, params=request_params, timeout=timeout)
+        resp = session.get(url, params=request_params, timeout=timeout, headers=BPTF_REQUEST_HEADERS)
     if resp.status_code == 429:
-        _account_pool.note_rate_limited(idx)
+        _account_pool.note_rate_limited(idx, retry_after_seconds=_parse_retry_after(resp.headers.get("Retry-After")))
     elif resp.status_code >= 500:
         time.sleep(1.5)
         idx, api_key, token = _account_pool.acquire()
         request_params = dict(params, key=api_key, token=token)
         with _request_semaphore:
-            resp = session.get(url, params=request_params, timeout=timeout)
+            resp = session.get(url, params=request_params, timeout=timeout, headers=BPTF_REQUEST_HEADERS)
         if resp.status_code == 429:
-            _account_pool.note_rate_limited(idx)
+            _account_pool.note_rate_limited(
+                idx, retry_after_seconds=_parse_retry_after(resp.headers.get("Retry-After"))
+            )
     elif treat_missing_listings_as_rate_limit and resp.status_code == 200:
         try:
             body = resp.json()
@@ -386,6 +416,16 @@ def team_color_paint_decimals(paint_name: str):
 
 PRICES_URL = "https://backpack.tf/api/IGetPrices/v4"
 SNAPSHOT_URL = "https://backpack.tf/api/classifieds/listings/snapshot"
+
+# Sent on every backpack.tf request (see _get_with_retry and refresh()
+# below) per their own OpenAPI spec's explicit forward-compatibility
+# note on the X-App-Context parameter: "In the future, backpack.tf API
+# requests may require an app context, which is an appid. For forwards
+# compatibility, it is recommended you set this to something (probably
+# 440)." Not required yet, so its absence was never a bug - sent now
+# specifically so a future requirement doesn't silently start rejecting
+# every request this project makes with no warning.
+BPTF_REQUEST_HEADERS = {"X-App-Context": "440"}
 
 # Same directory-relative convention as runtime_settings.py's own
 # STATE_PATH - where LocalListingStore's save_to_disk/load_from_disk
@@ -1222,7 +1262,7 @@ class BackpackTFPriceList:
         self.local_listings = LocalListingStore()
         # Logs at most ONE raw sample of a bulk-scan entry that has no
         # resolvable particle_id, across this process's whole lifetime -
-        # see fetch_and_record_all_buy_orders' own diagnostic
+        # see fetch_and_record_all_listings' own diagnostic
         # comment for why. One real sample is enough to check a field-
         # name assumption against; a warning on every one of potentially
         # thousands of scans would just spam the log for no extra value.
@@ -1230,7 +1270,7 @@ class BackpackTFPriceList:
 
     def refresh(self):
         log.info("Refreshing backpack.tf price list...")
-        resp = requests.get(PRICES_URL, params={"key": self.api_key}, timeout=30)
+        resp = requests.get(PRICES_URL, params={"key": self.api_key}, timeout=30, headers=BPTF_REQUEST_HEADERS)
         resp.raise_for_status()
         payload = resp.json()
 
@@ -1369,25 +1409,47 @@ class BackpackTFPriceList:
                                     killstreaker=killstreaker, sheen=sheen, elevated_quality=elevated_quality)
         return self.local_listings.get_max_buy_price(key)
 
-    def fetch_and_record_all_buy_orders(self, name: str, quality_name: str) -> int | None:
+    def fetch_and_record_all_listings(self, name: str, quality_name: str, intent: str,
+                                       min_price_keys=None, max_price_keys=None) -> int | None:
         """
         Bulk proactive scan: ONE snapshot API request for this item at
-        this quality (buy intent) - for Unusual, covers EVERY particle
-        effect at once; for any other quality, just that one quality's
-        buy orders (no particle dimension to split by). Not scoped to a
-        single effect the way fetch_live_buy_order_keys is. Records
-        every listing directly into LocalListingStore, so a real sell
-        listing later likely finds a fresh buy order already waiting -
-        no live-query wait needed. Returns how many listings recorded,
-        or None specifically when the snapshot for this SKU was still
-        being generated server-side (see the "createdAt"-only shape
-        check below) - the caller (main.py's proactive worker) treats
-        that as worth a quick retry, NOT the same as a genuine zero.
+        this quality, for the given intent ("buy" or "sell") - for
+        Unusual, covers EVERY particle effect at once; for any other
+        quality, just that one quality's listings (no particle dimension
+        to split by). Not scoped to a single effect the way
+        fetch_live_buy_order_keys is. Records every listing directly
+        into LocalListingStore, so a real evaluation later likely finds
+        fresh data already waiting - no live-query wait needed. Returns
+        how many listings recorded, or None specifically when the
+        snapshot for this SKU was still being generated server-side (see
+        the "createdAt"-only shape check below) - the caller (main.py's
+        proactive worker) treats that as worth a quick retry, NOT the
+        same as a genuine zero.
+
+        Originally buy-only (still the more important half - see
+        min_price_keys below for exactly why a too-cheap BUY order is
+        provably useless, which has no sell-side equivalent). Extended to
+        cover sell too after a real, confirmed gap: unlike buy orders,
+        which get BOTH this periodic scan AND live-stream updates, a sell
+        listing had ONLY the live websocket stream - if this project's
+        own process missed that ONE event (a reconnect gap, a restart -
+        and this project has had several of both), that specific listing
+        stayed invisible until it changed again for any other reason, no
+        matter how good a deal it was. min_price_keys/max_price_keys
+        (optional): for "buy", only the lower bound applies (see the
+        per-entry loop's own comment - a buy order below min_price_keys
+        can never back a valid alert, but there's no safe upper bound to
+        apply to a buy order the same way). For "sell", BOTH bounds apply
+        directly (a sell listing outside either is never a valid alert
+        candidate either - the exact same reasoning matcher.py's own
+        min_price/max_price check applies). None (the default for either
+        bound) skips that check entirely, for any caller without a
+        runtime settings object handy.
 
         Covers every watched quality, not just Unusual - a real, direct
         point: with fewer known items than worker accounts, idle workers
         were sleeping instead of doing useful work, when they could
-        equally well keep other qualities' buy orders fresh too.
+        equally well keep other qualities' listings fresh too.
 
         Queries by "sku" - confirmed directly on backpack.tf's own
         forums (a trusted community member correcting another user's
@@ -1401,19 +1463,19 @@ class BackpackTFPriceList:
         Missing texture (unlike handle_bptf_event's fuller extraction) -
         a supplementary cache-warming pass, not the final decision path.
         craftable/killstreaker/sheen ARE derived the same careful way as
-        the main path, since buy orders here can sit unrefreshed for
-        hours before their own next real event.
+        the main path, since a listing here can sit unrefreshed for
+        hours before its own next real event.
         """
         try:
             params = {
                 "sku": strip_variant_prefixes(name), "appid": 440,
-                "quality": QUALITY_NAME_TO_ID.get(quality_name), "intent": "buy",
+                "quality": QUALITY_NAME_TO_ID.get(quality_name), "intent": intent,
             }
             resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=10, treat_missing_listings_as_rate_limit=True)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
-            log.warning("Bulk buy-order scan failed for %s (%s).", name, quality_name)
+            log.warning("Bulk %s scan failed for %s (%s).", intent, name, quality_name)
             return 0
 
         listings = data.get("listings") if isinstance(data, dict) else None
@@ -1443,17 +1505,43 @@ class BackpackTFPriceList:
                 # blocking wait here anyway would still be worth avoiding).
                 return None
             log.warning(
-                "Bulk scan response for %s (%s) had an unexpected shape - raw (truncated): %r",
-                name, quality_name, str(data)[:500],
+                "Bulk scan response for %s (%s, %s) had an unexpected shape - raw (truncated): %r",
+                name, quality_name, intent, str(data)[:500],
             )
             return 0
 
         recorded = 0
         sample_logged = False
         for i, entry in enumerate(listings):
-            if not isinstance(entry, dict) or entry.get("intent") != "buy":
+            if not isinstance(entry, dict) or entry.get("intent") != intent:
                 continue
             try:
+                # Price checked FIRST, before particle/paint/spell
+                # extraction below. For "buy": a buy order below
+                # min_price_keys can never produce a valid alert against
+                # ANY sell listing this project would otherwise evaluate
+                # (that listing must itself be >= min_price_keys - see
+                # matcher.py's own min_price check - so min_price_keys >
+                # buy_order_keys > sell_price is a contradiction) - no
+                # safe upper bound exists the same way (a HIGH buy order
+                # is exactly the useful case). For "sell": BOTH bounds
+                # apply directly, same as matcher.py's own min_price/
+                # max_price check on a live sell listing - this scan
+                # exists to catch what the live stream might have missed,
+                # not to relax what would've been rejected anyway if it
+                # had arrived normally. Same reasoning as handle_bptf_
+                # event's own live-stream version of these checks in
+                # main.py - kept in sync with those deliberately.
+                # min_price_keys/max_price_keys are optional (None skips
+                # that particular bound) since not every caller of this
+                # method has a runtime settings object handy.
+                price_keys = self.currencies_to_keys(entry.get("currencies") or {})
+                if price_keys is None or price_keys <= 0:
+                    continue
+                if min_price_keys is not None and price_keys < min_price_keys:
+                    continue
+                if intent == "sell" and max_price_keys is not None and price_keys > max_price_keys:
+                    continue
                 item = entry.get("item")
                 if not isinstance(item, dict):
                     item = {}
@@ -1480,14 +1568,11 @@ class BackpackTFPriceList:
                         # of silently recording zero forever with no
                         # error anywhere.
                         log.warning(
-                            "DIAGNOSTIC SAMPLE (bulk scan entry with no resolvable particle_id) "
-                            "for %s - raw entry: %r", name, entry,
+                            "DIAGNOSTIC SAMPLE (bulk %s scan entry with no resolvable particle_id) "
+                            "for %s - raw entry: %r", intent, name, entry,
                         )
                         sample_logged = True
                         self._bulk_scan_sample_logged = True
-                    continue
-                price_keys = self.currencies_to_keys(entry.get("currencies") or {})
-                if price_keys is None or price_keys <= 0:
                     continue
                 user_obj = entry.get("user")
                 if not isinstance(user_obj, dict):
@@ -1513,7 +1598,7 @@ class BackpackTFPriceList:
                 # used when the response entry itself has no id at all.
                 listing_id = (
                     entry.get("id") or entry.get("listing_id")
-                    or f"bulk-{name}-{quality_name}-{seller}-{price_keys}"
+                    or f"bulk-{intent}-{name}-{quality_name}-{seller}-{price_keys}"
                 )
                 # Derived from name text, NOT the raw item.craftable
                 # field - same confirmed-unreliable field, same fix, as
@@ -1616,20 +1701,24 @@ class BackpackTFPriceList:
                     defindex=defindex, elevated_quality=entry_elevated,
                 )
                 # Skipped when this entry has no structured spell but its
-                # own free-text note mentions one anyway - see
-                # main.py's own identical check for the full reasoning
-                # (a real, confirmed buy order whose structured price
-                # explicitly, per its own text, only applies to one
-                # specific spell). Every entry here is buy-intent (this
-                # whole function only ever queries intent=buy), so no
-                # separate intent check is needed the way main.py's is.
-                if not entry_spells and spell_effects.note_mentions_spell(entry.get("details")):
-                    continue
-                # Same gap, same fix, for paint - see
-                # bptf_client.note_mentions_paint's own docstring.
-                if not entry_paint_name and note_mentions_paint(entry.get("details")):
-                    continue
-                self.local_listings.record(key, str(listing_id), str(seller), price_keys, "buy")
+                # own free-text note mentions one anyway - see main.py's
+                # own identical check for the full reasoning (a real,
+                # confirmed buy order whose structured price explicitly,
+                # per its own text, only applies to one specific spell).
+                # BUY-only: a sell listing's structured item fields ARE
+                # that specific, real item's actual attributes - unlike a
+                # buy order, which can be one price conditionally
+                # restricted by free text to a variant its structured
+                # fields never named at all, a sell listing has no
+                # equivalent ambiguity to guard against here.
+                if intent == "buy":
+                    if not entry_spells and spell_effects.note_mentions_spell(entry.get("details")):
+                        continue
+                    # Same gap, same fix, for paint - see
+                    # bptf_client.note_mentions_paint's own docstring.
+                    if not entry_paint_name and note_mentions_paint(entry.get("details")):
+                        continue
+                self.local_listings.record(key, str(listing_id), str(seller), price_keys, intent)
                 recorded += 1
             except Exception:
                 # Per-entry, not per-scan: a real, confirmed case - this
@@ -1642,8 +1731,8 @@ class BackpackTFPriceList:
                 # currencies, a missing nested field some other code path
                 # doesn't guard) should cost that ONE entry, never the
                 # rest of a real, mostly-good response.
-                log.exception("Bulk scan entry failed for %s (%s), entry %d - skipping just this one.",
-                               name, quality_name, i)
+                log.exception("Bulk %s scan entry failed for %s (%s), entry %d - skipping just this one.",
+                               intent, name, quality_name, i)
                 continue
         return recorded
 

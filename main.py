@@ -196,6 +196,14 @@ class Watcher:
         # sampling calls in handle_bptf_event.
         self._sampled_item_kinds = set()
 
+        # Temporary, targeted diagnostic counter - see its own use in
+        # handle_bptf_event for what this is answering and why. 20 is
+        # generous (covers several test edits across more than one
+        # priority item) without risking a real spam source were a
+        # popular priority item to trade heavily.
+        self._priority_raw_samples_logged = 0
+        self.MAX_PRIORITY_RAW_SAMPLES = 20
+
         # name -> identity_key(s), for /checkitem's name-based lookup
         # (identity keys themselves may be defindex-anchored, not
         # name-based). A real, confirmed THIRD OOM-shaped structure this
@@ -468,7 +476,7 @@ class Watcher:
     # than LocalListingStore's own multi-hour trust windows need.
     PROACTIVE_MIN_REFRESH_INTERVAL_SECONDS = 1800
 
-    # How to react to fetch_and_record_all_buy_orders returning None -
+    # How to react to fetch_and_record_all_listings returning None -
     # backpack.tf's snapshot for that SKU was still being generated
     # server-side, not a real error and not a genuine zero (see that
     # function's own docstring). asyncio.sleep() between attempts, not
@@ -479,6 +487,33 @@ class Watcher:
     PROACTIVE_JOB_QUEUED_MAX_RETRIES = 2
     PROACTIVE_JOB_QUEUED_RETRY_DELAY_SECONDS = 4.0
 
+    async def _fetch_and_record_with_retry(self, item_name, item_quality, intent):
+        """One (item, quality, intent) scan, retried a bounded number of
+        times if backpack.tf's snapshot was still being generated (see
+        fetch_and_record_all_listings' own docstring on its None
+        return) - shared by both the buy and sell halves of
+        _proactive_unusual_refresh_worker below, which used to duplicate
+        this same retry loop inline for buy only."""
+        recorded = await self._run_proactive(
+            self.bptf.fetch_and_record_all_listings, item_name, item_quality, intent,
+            self.runtime.min_price_keys, self.runtime.max_price_keys,
+        )
+        attempts = 0
+        while recorded is None and attempts < self.PROACTIVE_JOB_QUEUED_MAX_RETRIES:
+            attempts += 1
+            await asyncio.sleep(self.PROACTIVE_JOB_QUEUED_RETRY_DELAY_SECONDS)
+            recorded = await self._run_proactive(
+                self.bptf.fetch_and_record_all_listings, item_name, item_quality, intent,
+                self.runtime.min_price_keys, self.runtime.max_price_keys,
+            )
+        if recorded is None:
+            # Exhausted retries - still counts as a completed scan (not
+            # an exception), just with nothing recorded this time; the
+            # item will naturally come up for another pass once
+            # PROACTIVE_MIN_REFRESH_INTERVAL_SECONDS elapses again.
+            recorded = 0
+        return recorded
+
     async def _proactive_unusual_refresh_worker(self, worker_id: int):
         """
         One worker of proactive_buy_order_refresh_loop below. Picks the
@@ -487,6 +522,17 @@ class Watcher:
         workers picking the same item), then spends its own time on the
         network request. N workers means N requests in flight, each
         paced by _AccountPool's own per-account throttle.
+
+        Scans BOTH buy and sell for the picked item each cycle (twice
+        the requests per item, same PROACTIVE_MIN_REFRESH_INTERVAL_
+        SECONDS cadence) - a real, confirmed gap this closes: unlike a
+        buy order, which always gets a second chance here even if the
+        live websocket stream missed its event, a sell listing used to
+        have NO such backstop at all (this scanner was buy-only) - a
+        single missed "listing-create" event (a reconnect, a restart -
+        this project has had several of both) left that listing
+        permanently invisible until it changed again for any other
+        reason, no matter how good a deal it was.
         """
         while True:
             # Only consider items whose category is CURRENTLY watched
@@ -509,36 +555,26 @@ class Watcher:
             item_name, item_quality = scan_key
             self._known_scan_items[scan_key]["ts"] = time.time()  # claimed immediately, before awaiting
             try:
-                recorded = await self._run_proactive(
-                    self.bptf.fetch_and_record_all_buy_orders, item_name, item_quality
-                )
-                attempts = 0
-                while recorded is None and attempts < self.PROACTIVE_JOB_QUEUED_MAX_RETRIES:
-                    attempts += 1
-                    await asyncio.sleep(self.PROACTIVE_JOB_QUEUED_RETRY_DELAY_SECONDS)
-                    recorded = await self._run_proactive(
-                        self.bptf.fetch_and_record_all_buy_orders, item_name, item_quality
-                    )
-                if recorded is None:
-                    # Exhausted retries - still counts as a completed scan
-                    # (not an exception), just with nothing recorded this
-                    # time; the item will naturally come up for another
-                    # pass once PROACTIVE_MIN_REFRESH_INTERVAL_SECONDS
-                    # elapses again.
-                    recorded = 0
+                buy_recorded = await self._fetch_and_record_with_retry(item_name, item_quality, "buy")
+                sell_recorded = await self._fetch_and_record_with_retry(item_name, item_quality, "sell")
                 self.stats["proactive_unusual_scans"] += 1
-                self.stats["proactive_unusual_buy_orders_recorded"] += recorded
+                self.stats["proactive_unusual_buy_orders_recorded"] += buy_recorded
+                self.stats["proactive_sell_listings_recorded"] += sell_recorded
             except Exception:
-                log.exception("Proactive buy-order scan failed for %s / %s (worker %d).",
+                log.exception("Proactive scan failed for %s / %s (worker %d).",
                                item_name, item_quality, worker_id)
 
     async def proactive_buy_order_refresh_loop(self):
         """
-        Keeps buy-order data for every Unusual item this project has
-        seen traded "perpetually fresh", rather than only fetching one
-        on demand when a matching sell listing arrives (still the
-        fallback for anything this hasn't gotten to yet - see fetch_
-        live_buy_order_keys).
+        Keeps BOTH buy-order and sell-listing data for every watched
+        item this project has seen traded "perpetually fresh", rather
+        than relying solely on the live websocket stream to ever
+        mention it again (still the fallback for a buy order this
+        hasn't gotten to yet - see fetch_live_buy_order_keys; sell
+        listings have no live-query fallback, so this loop is their
+        ONLY second chance after the live stream - see
+        _proactive_unusual_refresh_worker's own docstring for the real
+        incident that motivated adding sell here at all).
 
         One worker per configured account (more accounts = more workers
         = faster full-cycle time - backpack.tf confirmed running several
@@ -551,7 +587,7 @@ class Watcher:
         # the primary account is also a real slot in the pool and can
         # also do proactive-scan work.
         worker_count = 1 + len(self.cfg.get("backpacktf_accounts") or [])
-        log.info("Starting %d proactive Unusual buy-order refresh worker(s).", worker_count)
+        log.info("Starting %d proactive buy+sell refresh worker(s).", worker_count)
         await asyncio.gather(*(
             self._proactive_unusual_refresh_worker(i) for i in range(worker_count)
         ))
@@ -992,8 +1028,17 @@ class Watcher:
         lines = []
         for matched_name in sorted(matched_names)[:5]:
             for key in self._name_to_identity_keys[matched_name]:
+                # listing_identity_key's real, current return order (see
+                # bptf_client.py) - a real, confirmed bug this fixes:
+                # this used to unpack into 11 names for what is actually
+                # a 12-element tuple (missing elevated_quality, the LAST
+                # element, added when "Strange Unusual" support landed),
+                # so /checkitem raised ValueError on every single call -
+                # caught by _handle_telegram_event's own try/except, so
+                # it never crashed the bot, but it also never sent back
+                # so much as an error message either - just silence.
                 (_, quality_name, particle_id, paint_dec, craftable, spell, ks_tier, australium,
-                 texture, killstreaker, sheen) = key
+                 texture, killstreaker, sheen, elevated_quality) = key
                 bits = [quality_name]
                 if not craftable:
                     bits.append("Non-Craftable")
@@ -1013,6 +1058,8 @@ class Watcher:
                     bits.append(f"killstreaker={killstreaker}")
                 if sheen:
                     bits.append(f"sheen={sheen}")
+                if elevated_quality:
+                    bits.append(f"elevated={elevated_quality}")
                 variant_desc = ", ".join(bits)
 
                 buy_price, buy_count = store.get_max_buy_price(key)
@@ -1171,6 +1218,30 @@ class Watcher:
         name = item.get("name") or item.get("marketName") or item.get("baseName")
         if not name:
             return
+
+        # Temporary, targeted diagnostic - logs the FULL raw payload,
+        # unconditionally, the first few times ANY event (any intent,
+        # any quality/category, before every filter below) arrives for
+        # a priority_item_names match. Exists specifically to answer one
+        # question directly instead of by inference: does an edited/
+        # re-priced listing for a name like this reach this function AT
+        # ALL. If this never fires after a real price edit on backpack.tf,
+        # the event genuinely isn't arriving (a backpack.tf-side or
+        # connection issue, not this project's filtering) - if it DOES
+        # fire, the logged raw payload shows exactly which field this
+        # project's own assumptions are wrong about, the same way every
+        # other DIAGNOSTIC SAMPLE in this file has previously found a
+        # real gap. Capped (own small counter, not reusing an existing
+        # one) so this can't spam once it's done its job.
+        if any(p.lower() in name.lower() for p in self.cfg.get("priority_item_names", [])):
+            if self._priority_raw_samples_logged < self.MAX_PRIORITY_RAW_SAMPLES:
+                self._priority_raw_samples_logged += 1
+                log.warning(
+                    "DIAGNOSTIC SAMPLE (priority-item raw event, unfiltered, #%d/%d) - "
+                    "intent=%r name=%r raw payload: %r",
+                    self._priority_raw_samples_logged, self.MAX_PRIORITY_RAW_SAMPLES,
+                    payload.get("intent"), name, payload,
+                )
         # backpack.tf's own particle-name resolution occasionally fails,
         # leaving a raw internal token in the name instead of (or
         # alongside) the real effect name, e.g. "Sakura Smoke Bomb Blast
@@ -1251,10 +1322,11 @@ class Watcher:
             return
 
         intent = payload.get("intent")
-        # min/max price only makes sense against a SELL listing's own
-        # asking price, never a buy order's - a buy order outside this
-        # range is still exactly the reference data a later in-range
-        # sell listing needs. Checked early (before the expensive
+        # min/max price gates the SELL listing's own asking price here -
+        # a buy order's price isn't a "worthwhile deal" threshold the
+        # same way, so no UPPER bound applies to it (see the "buy" branch
+        # below for the one exception: a LOWER bound, for a different,
+        # provable reason). Checked early (before the expensive
         # extraction below), gated on intent == "sell" specifically for
         # correctness, not just style. Still checked in matcher.py's
         # evaluate_listing too, as a backstop for other sources.
@@ -1265,6 +1337,28 @@ class Watcher:
             if self.runtime.max_price_keys is not None and price_keys > self.runtime.max_price_keys:
                 self.stats["bptf_rejected_price"] += 1
                 return
+        elif intent == "buy" and price_keys < self.runtime.min_price_keys:
+            # NOT the same reasoning as the sell-side check above - a buy
+            # order ABOVE some price is still exactly the useful
+            # reference data the comment above describes (the higher a
+            # buy order, the bigger a possible discount against it), so
+            # there is deliberately no upper-bound filter here. But a buy
+            # order price is also the CEILING a matching sell listing's
+            # discount is measured against (see evaluate_listing's own
+            # discount_percent) - and that sell listing must itself be
+            # >= min_price_keys to ever be considered at all (see the
+            # "sell" branch above and matcher.py's own min_price check).
+            # A buy order priced below min_price_keys can therefore never
+            # produce a valid alert against ANY listing this project would
+            # otherwise evaluate - min_price_keys > buy_order_keys >
+            # sell_price is a contradiction. Skipped here, before the
+            # expensive particle/spell/paint extraction below, same as
+            # the sell-side skip above - real, saved work, not just an
+            # unreachable code path being tidied up (14000+ buy orders
+            # recorded in 15 minutes on real traffic - some real share of
+            # that was almost certainly stuff-that-can-never-matter).
+            self.stats["bptf_buy_skipped_below_min_price"] += 1
+            return
 
         if quality == "Unusual" and "bptf_unusual" not in self._sampled_item_kinds:
             self._sampled_item_kinds.add("bptf_unusual")

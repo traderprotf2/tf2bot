@@ -124,6 +124,7 @@ async def stream_listing_events(on_event):
                     if not isinstance(events, list):
                         events = [events]
 
+                    force_reconnect = False
                     for e in events:
                         event_type = e.get("event")
                         if event_type == "listing-delete":
@@ -141,6 +142,57 @@ async def stream_listing_events(on_event):
                             delete_payload = e.get("payload") or {}
                             delete_payload["_bptf_event_type"] = "delete"
                             _spawn_dispatch(on_event, delete_payload)
+                            continue
+                        if event_type == "buffer-limit-exceeded":
+                            # Real, documented backpack.tf event (their own
+                            # developer docs, verbatim): "you will not
+                            # receive any further events until the buffer
+                            # clears" - and "due to the nature of the data
+                            # buffer, you won't see this event until after
+                            # the problem arises". Before this fix, this
+                            # event type fell straight through the generic
+                            # "not listing-update, ignore" branch below -
+                            # completely silent, no log line, nothing -
+                            # meaning a connection could go quietly dead
+                            # (deliver zero further listings) with no trace
+                            # anywhere explaining why, indistinguishable
+                            # from "nothing interesting happened to alert
+                            # on" from every other part of this project's
+                            # own logging. The docs don't promise this
+                            # self-heals - breaking out to force a fresh
+                            # reconnect is the only way to be SURE events
+                            # resume, rather than trusting an already-
+                            # degraded connection to recover on its own.
+                            # force_reconnect (checked right after this
+                            # for loop) is what actually exits the message
+                            # loop below - a bare break here would only
+                            # exit THIS for loop, not that one.
+                            log.warning(
+                                "backpack.tf: buffer-limit-exceeded received - this connection "
+                                "will deliver no further events until reconnected. Forcing a "
+                                "fresh connection now."
+                            )
+                            force_reconnect = True
+                            break
+                        if event_type == "client-limit-exceeeded":
+                            # Also real and documented (backpack.tf's own
+                            # spelling, three e's, kept verbatim so a log
+                            # search for the exact event name still
+                            # matches): too many concurrent connections
+                            # from this IP - backpack.tf closes the
+                            # connection itself right after sending this,
+                            # so the outer reconnect will fire regardless,
+                            # but logging it explicitly turns "mysteriously
+                            # stopped receiving events" into an actionable
+                            # signal (e.g. another script - a manual
+                            # diagnostic test, a second instance of this
+                            # same project - sharing this same IP/
+                            # connection budget) instead of silence.
+                            log.warning(
+                                "backpack.tf: client-limit-exceeeded received - too many "
+                                "concurrent connections from this IP. backpack.tf will close "
+                                "this connection; reconnecting after that happens."
+                            )
                             continue
                         if event_type != "listing-update":
                             continue
@@ -164,6 +216,9 @@ async def stream_listing_events(on_event):
                         if payload.get("status") not in (None, "active"):
                             continue
                         _spawn_dispatch(on_event, payload)
+
+                    if force_reconnect:
+                        break
         except asyncio.CancelledError:
             raise
         except Exception:
