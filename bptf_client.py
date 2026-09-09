@@ -882,14 +882,6 @@ class LocalListingStore:
         with self._lock:
             return len(self._entries)
 
-    def total_entry_count(self):
-        """Sum of every listing across every bucket - bucket_count()
-        alone can't distinguish "many buckets, each nearly empty" from
-        "few buckets, each near max_entries_per_key", and those two
-        shapes have very different memory implications."""
-        with self._lock:
-            return sum(len(b) for b in self._entries.values())
-
     def evict_coldest_buckets(self, count):
         """Force-evicts up to `count` of the least-recently-touched
         buckets (move_to_end() in record() above keeps self._entries
@@ -1111,6 +1103,38 @@ class LocalListingStore:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 serializable = json.load(f)
+            # Trim BEFORE materializing into self._entries, not after -
+            # a real, confirmed risk: json.load above already holds one
+            # full copy of the file's contents in memory: inserting
+            # every item into self._entries first (old code) briefly
+            # held a SECOND full copy at the same time, no matter how
+            # large the file - and that peak lands at the worst possible
+            # moment, straight after a restart, before memory_guard_loop
+            # has had its first 60s chance to run at all. A file saved
+            # under an older, larger max_total_buckets (or just built up
+            # over a long uptime before this cap existed) can easily be
+            # bigger than whatever cap THIS run is configured with.
+            # Trimming the raw parsed list first means self._entries
+            # only ever holds up to max_total_buckets entries, even for
+            # one instant during load.
+            if len(serializable) > self._max_total_buckets:
+                overflow = len(serializable) - self._max_total_buckets
+
+                def _bucket_items(bucket):
+                    return bucket.values() if isinstance(bucket, dict) else bucket
+
+                serializable.sort(
+                    key=lambda item: max(
+                        (e.get("ts", 0) for e in _bucket_items(item["bucket"])), default=0,
+                    )
+                )
+                serializable = serializable[overflow:]
+                log.warning(
+                    "Loaded local listing store file had over %d buckets - trimmed "
+                    "the %d oldest before materializing (not after) to avoid a "
+                    "memory spike during load itself.",
+                    self._max_total_buckets, overflow,
+                )
             with self._lock:
                 for item in serializable:
                     key = tuple(item["key"])
@@ -1118,26 +1142,6 @@ class LocalListingStore:
                     if isinstance(bucket, list):
                         bucket = {e["listing_id"]: e for e in bucket if "listing_id" in e}
                     self._entries[key] = bucket
-                # Trims down to max_total_buckets right after loading
-                # too, not just going forward in record() - a file saved
-                # before this cap existed could hold far more buckets
-                # than allowed, restoring that same memory footprint
-                # immediately on load. Keeps the most recently-updated
-                # buckets - a perfect LRU replay isn't needed for a
-                # one-time startup trim, just bounding the size is.
-                if len(self._entries) > self._max_total_buckets:
-                    overflow = len(self._entries) - self._max_total_buckets
-                    by_recency = sorted(
-                        self._entries.items(),
-                        key=lambda kv: max((e.get("ts", 0) for e in kv[1].values()), default=0),
-                    )
-                    for stale_key, _ in by_recency[:overflow]:
-                        del self._entries[stale_key]
-                    log.warning(
-                        "Loaded local listing store had %d buckets, over the %d cap - "
-                        "trimmed the %d oldest.",
-                        len(self._entries) + overflow, self._max_total_buckets, overflow,
-                    )
                 # Rebuilt from self._entries, not persisted directly (see
                 # __init__'s own comment on why) - has to happen after
                 # the trim above, not before, so it only ever reflects

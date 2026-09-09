@@ -1733,7 +1733,7 @@ class Watcher:
                     stats=self.stats, stats_since=self.stats_since,
                     currently_rate_limited=bptf_client.is_rate_limited(),
                     store_bucket_count=self.bptf.local_listings.bucket_count(),
-                    store_entry_count=self.bptf.local_listings.total_entry_count(),
+                    store_entry_count=self.bptf.local_listings.entry_count(),
                     rss_mb=_current_rss_mb(),
                     name_cache_count=len(self._name_to_identity_keys),
                 )
