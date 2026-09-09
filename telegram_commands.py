@@ -400,7 +400,8 @@ def _find_category(name: str):
 
 
 def _format_stats(stats, stats_since, currently_rate_limited=False,
-                   store_bucket_count=None, store_entry_count=None, rss_mb=None) -> str:
+                   store_bucket_count=None, store_entry_count=None, rss_mb=None,
+                   name_cache_count=None) -> str:
     """
     Answers "is the bot even seeing the volume I'd expect, and if so,
     where's it narrowing down" - a real question that came up when alert
@@ -433,6 +434,8 @@ def _format_stats(stats, stats_since, currently_rate_limited=False,
         memory_bits.append(f"RSS {rss_mb:.0f} МБ")
     if store_bucket_count is not None and store_entry_count is not None:
         memory_bits.append(f"стор: {store_bucket_count} корзин / {store_entry_count} записей")
+    if name_cache_count is not None:
+        memory_bits.append(f"кэш имён: {name_cache_count}")
     memory_line = f"💾 {', '.join(memory_bits)}\n\n" if memory_bits else ""
 
     if not stats:
@@ -607,7 +610,8 @@ def _format_errors(error_entries) -> str:
 
 def handle_command(text: str, runtime, stats=None, stats_since=None,
                     currently_rate_limited: bool = False, error_entries=None,
-                    store_bucket_count=None, store_entry_count=None, rss_mb=None) -> str:
+                    store_bucket_count=None, store_entry_count=None, rss_mb=None,
+                    name_cache_count=None) -> str:
     """Parses one typed command and applies it to `runtime`, returning
     the reply text. Any state change is saved to disk before returning."""
     parts = text.strip().split(maxsplit=1)
@@ -619,7 +623,7 @@ def handle_command(text: str, runtime, stats=None, stats_since=None,
 
     if command == "stats":
         return _format_stats(stats, stats_since, currently_rate_limited,
-                              store_bucket_count, store_entry_count, rss_mb)
+                              store_bucket_count, store_entry_count, rss_mb, name_cache_count)
 
     if command == "errors":
         return _format_errors(error_entries)

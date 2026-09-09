@@ -198,22 +198,26 @@ class Watcher:
 
         # name -> identity_key(s), for /checkitem's name-based lookup
         # (identity keys themselves may be defindex-anchored, not
-        # name-based). The OUTER dict is still fine unbounded - distinct
-        # item NAMES are a small, finite set. The INNER set per name is
-        # capped (MAX_IDENTITY_KEYS_PER_NAME below) - a defensive
-        # tightening: this project's own identity key has grown from a
-        # handful of dimensions to a dozen over this session (spell
-        # combos, paint, grade, elevated quality, killstreaker/sheen
-        # combinations...), so a single popular item's own realistic
-        # variant count is far larger now than when this was first
-        # called "small enough not to matter" - given this project's
-        # repeated real OOM incidents from exactly this kind of
-        # "theoretically bounded, never actually capped" structure,
-        # capping here too costs nothing (this is diagnostic-only, for
-        # /checkitem, not core matching logic) and removes one more
-        # structure from that risk category entirely.
-        self._name_to_identity_keys = collections.defaultdict(set)
-        self.MAX_IDENTITY_KEYS_PER_NAME = 500
+        # name-based). A real, confirmed THIRD OOM-shaped structure this
+        # session found: the OUTER dict used to be treated as "fine
+        # unbounded - distinct item NAMES are a small, finite set" - but
+        # combined with the per-name set allowing up to 500 twelve-
+        # dimension identity-key tuples each (this project's own identity
+        # key grew from a handful of dimensions to a dozen over this same
+        # session - spell combos, paint, grade, elevated quality,
+        # killstreaker/sheen...), and real traffic touching thousands of
+        # distinct names within minutes, that assumption didn't hold:
+        # RSS kept climbing steadily even after memory_guard_loop had
+        # evicted LocalListingStore down to zero buckets - proof this is
+        # a SEPARATE structure, not just more of the same one. Now
+        # bounded the same way as _known_scan_items below: an
+        # OrderedDict, LRU-evicted by total NAME count (see the
+        # population site in handle_bptf_event), not just per-name set
+        # size - this is diagnostic-only, for /checkitem, not core
+        # matching logic, so bounding it costs nothing real.
+        self._name_to_identity_keys = collections.OrderedDict()  # name -> set(identity_key, ...), LRU by name
+        self.MAX_IDENTITY_KEYS_PER_NAME = 150
+        self.MAX_TRACKED_NAMES = 3000
 
         # (name, quality_name) -> {"ts": last proactive-refresh time (0 =
         # never), "category": classify_category() result} - drives
@@ -1089,6 +1093,30 @@ class Watcher:
 
     # -- backpack.tf side ---------------------------------------------------
 
+    def _remember_identity_key(self, name_lower: str, identity_key):
+        """Records one more identity_key seen for this (lowercased) item
+        name into self._name_to_identity_keys, for /checkitem's name-
+        based lookup - see that dict's own __init__ comment for the full
+        history of why BOTH dimensions here are bounded (total names
+        tracked, AND variants per name). A plain method (not inlined in
+        handle_bptf_event) specifically so this LRU logic can be tested
+        on its own, the same as LocalListingStore's equivalent eviction
+        logic elsewhere in this project.
+        """
+        if name_lower in self._name_to_identity_keys:
+            # Touch: LRU-bumps this name so eviction below always drops
+            # the coldest one first - same move_to_end() idiom as
+            # LocalListingStore.record() elsewhere in this project.
+            self._name_to_identity_keys.move_to_end(name_lower)
+            name_keys_set = self._name_to_identity_keys[name_lower]
+        else:
+            if len(self._name_to_identity_keys) >= self.MAX_TRACKED_NAMES:
+                self._name_to_identity_keys.popitem(last=False)
+            name_keys_set = set()
+            self._name_to_identity_keys[name_lower] = name_keys_set
+        if identity_key in name_keys_set or len(name_keys_set) < self.MAX_IDENTITY_KEYS_PER_NAME:
+            name_keys_set.add(identity_key)
+
     async def handle_bptf_event(self, payload: dict):
         if payload.get("_bptf_event_type") == "delete":
             # Processed regardless of pause state - keeping the local
@@ -1538,9 +1566,8 @@ class Watcher:
             texture=texture, defindex=defindex, killstreaker=killstreaker, sheen=sheen,
             elevated_quality=elevated_quality,
         )
-        name_keys_set = self._name_to_identity_keys[name.lower()]
-        if identity_key in name_keys_set or len(name_keys_set) < self.MAX_IDENTITY_KEYS_PER_NAME:
-            name_keys_set.add(identity_key)
+        name_lower = name.lower()
+        self._remember_identity_key(name_lower, identity_key)
         # excluded_types already rejected above - anything reaching here
         # is guaranteed not excluded.
         is_currently_watched_quality = quality == "Unusual" or quality in self.runtime.watched_qualities
@@ -1681,8 +1708,9 @@ class Watcher:
             elif command == "checkitem":
                 # Dispatched to a thread - a real, confirmed risk found
                 # during a systematic Telegram-load sweep: this scans
-                # self._name_to_identity_keys (unbounded, slowly growing
-                # for the whole process lifetime) AND reads store._entries
+                # self._name_to_identity_keys (now LRU-bounded, see
+                # __init__ - was unbounded in the outer dict when this
+                # comment was first written) AND reads store._entries
                 # directly (bypassing LocalListingStore's own lock
                 # entirely, unlike every other read path in this
                 # project) - both were running synchronously on the
@@ -1707,6 +1735,7 @@ class Watcher:
                     store_bucket_count=self.bptf.local_listings.bucket_count(),
                     store_entry_count=self.bptf.local_listings.total_entry_count(),
                     rss_mb=_current_rss_mb(),
+                    name_cache_count=len(self._name_to_identity_keys),
                 )
                 log.info("Telegram command: %r -> %s", text, reply.splitlines()[0])
                 await self._run_telegram(self.telegram.send, reply)
