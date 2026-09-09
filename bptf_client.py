@@ -1306,7 +1306,7 @@ class BackpackTFPriceList:
                                     killstreaker=killstreaker, sheen=sheen, elevated_quality=elevated_quality)
         return self.local_listings.get_max_buy_price(key)
 
-    def fetch_and_record_all_buy_orders(self, name: str, quality_name: str) -> int:
+    def fetch_and_record_all_buy_orders(self, name: str, quality_name: str) -> int | None:
         """
         Bulk proactive scan: ONE snapshot API request for this item at
         this quality (buy intent) - for Unusual, covers EVERY particle
@@ -1315,7 +1315,11 @@ class BackpackTFPriceList:
         single effect the way fetch_live_buy_order_keys is. Records
         every listing directly into LocalListingStore, so a real sell
         listing later likely finds a fresh buy order already waiting -
-        no live-query wait needed. Returns how many listings recorded.
+        no live-query wait needed. Returns how many listings recorded,
+        or None specifically when the snapshot for this SKU was still
+        being generated server-side (see the "createdAt"-only shape
+        check below) - the caller (main.py's proactive worker) treats
+        that as worth a quick retry, NOT the same as a genuine zero.
 
         Covers every watched quality, not just Unusual - a real, direct
         point: with fewer known items than worker accounts, idle workers
@@ -1351,6 +1355,27 @@ class BackpackTFPriceList:
 
         listings = data.get("listings") if isinstance(data, dict) else None
         if not isinstance(listings, list):
+            if isinstance(data, dict) and "createdAt" in data and "listings" not in data:
+                # The known "snapshot job just queued server-side for this
+                # SKU, not ready yet" envelope - see _get_with_retry's own
+                # docstring on this exact {"appid","sku","createdAt"} shape.
+                # A real, confirmed case: a whole proactive-scan window came
+                # back 100% this way across many different, otherwise
+                # unrelated items in a row - not the sporadic pattern a
+                # genuine per-account rate limit produces (that would still
+                # let SOME of a large, diverse batch through) - consistent
+                # with a "cold" (not recently requested) item's snapshot
+                # being generated asynchronously and only ready a few
+                # seconds after this same call kicks it off, not on the
+                # first response. None (not 0) tells the caller this
+                # specific attempt is worth a short, separately-paced retry
+                # rather than a dead end or a genuine zero-listings result -
+                # see _proactive_unusual_refresh_worker in main.py, which
+                # retries with asyncio.sleep() between attempts rather than
+                # blocking in here (this function runs on asyncio.to_thread's
+                # shared default pool - the same one a slow call was already
+                # confirmed to starve, see fetch_live_buy_order_keys).
+                return None
             log.warning(
                 "Bulk scan response for %s (%s) had an unexpected shape - raw (truncated): %r",
                 name, quality_name, str(data)[:500],

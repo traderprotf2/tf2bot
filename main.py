@@ -388,6 +388,16 @@ class Watcher:
     # than LocalListingStore's own multi-hour trust windows need.
     PROACTIVE_MIN_REFRESH_INTERVAL_SECONDS = 1800
 
+    # How to react to fetch_and_record_all_buy_orders returning None -
+    # backpack.tf's snapshot for that SKU was still being generated
+    # server-side, not a real error and not a genuine zero (see that
+    # function's own docstring). asyncio.sleep() between attempts, not
+    # a blocking wait - this call already shares asyncio.to_thread's
+    # small default pool with live evaluation (see fetch_live_buy_
+    # order_keys' docstring on that same pool getting starved before).
+    PROACTIVE_JOB_QUEUED_MAX_RETRIES = 2
+    PROACTIVE_JOB_QUEUED_RETRY_DELAY_SECONDS = 4.0
+
     async def _proactive_unusual_refresh_worker(self, worker_id: int):
         """
         One worker of proactive_buy_order_refresh_loop below. Picks the
@@ -421,6 +431,20 @@ class Watcher:
                 recorded = await asyncio.to_thread(
                     self.bptf.fetch_and_record_all_buy_orders, item_name, item_quality
                 )
+                attempts = 0
+                while recorded is None and attempts < self.PROACTIVE_JOB_QUEUED_MAX_RETRIES:
+                    attempts += 1
+                    await asyncio.sleep(self.PROACTIVE_JOB_QUEUED_RETRY_DELAY_SECONDS)
+                    recorded = await asyncio.to_thread(
+                        self.bptf.fetch_and_record_all_buy_orders, item_name, item_quality
+                    )
+                if recorded is None:
+                    # Exhausted retries - still counts as a completed scan
+                    # (not an exception), just with nothing recorded this
+                    # time; the item will naturally come up for another
+                    # pass once PROACTIVE_MIN_REFRESH_INTERVAL_SECONDS
+                    # elapses again.
+                    recorded = 0
                 self.stats["proactive_unusual_scans"] += 1
                 self.stats["proactive_unusual_buy_orders_recorded"] += recorded
             except Exception:
