@@ -25,6 +25,7 @@ import logging
 import os
 import signal
 import time
+import tracemalloc
 
 import bptf_client
 import bptf_ws
@@ -1005,6 +1006,44 @@ class Watcher:
             log.exception("Failed to format /unknowneffects reply.")
             return "Не получилось собрать список - подробности в логах."
 
+    def _format_memtop(self, top_n=15) -> str:
+        """
+        /memtop - top allocation sites by CURRENT size, straight from
+        Python's own stdlib tracemalloc (must be started first, see
+        /memtrace) - a real, confirmed answer instead of more guessing:
+        this project has already found and fixed several distinct real
+        memory issues (LocalListingStore's own bucket/entry caps,
+        _name_to_identity_keys' unbounded outer dict, load_from_disk's
+        double-materialization) purely by code review and reasoning
+        about what COULD grow - each one real, but each also leaving
+        real OOM incidents still happening afterwards, meaning something
+        was still unaccounted for. This shows what's ACTUALLY holding
+        memory right now, ranked, with a file:line pointing straight at
+        the responsible allocation - no more reasoning about what
+        plausibly could be the cause.
+        """
+        if not tracemalloc.is_tracing():
+            return (
+                "tracemalloc не включён - сначала пришли /memtrace, дай памяти "
+                "подрасти (минут 10-20), потом смотри сюда снова."
+            )
+        snapshot = tracemalloc.take_snapshot()
+        stats = snapshot.statistics("lineno")
+        lines = [f"📊 <b>Топ-{top_n} по памяти (tracemalloc)</b>\n"]
+        for i, stat in enumerate(stats[:top_n], 1):
+            frame = stat.traceback[0]
+            size_mb = stat.size / (1024 * 1024)
+            lines.append(
+                f"{i}. {size_mb:.1f} МБ, {stat.count} блок(ов) - "
+                f"{os.path.basename(frame.filename)}:{frame.lineno}"
+            )
+        total_mb = sum(s.size for s in stats) / (1024 * 1024)
+        lines.append(f"\nВсего отслежено tracemalloc: {total_mb:.1f} МБ")
+        text = "\n".join(lines)
+        if len(text) > 3900:
+            text = text[:3900] + "\n\n… (обрезано)"
+        return text
+
     def _check_item(self, name_query: str) -> str:
         """
         /checkitem <name> - shows exactly what the local store currently
@@ -1368,35 +1407,15 @@ class Watcher:
                 item.get("particle"), item.get("particleId"), item.get("attributes"),
             )
 
+        particle_id = bptf_client.resolve_particle_id(item, name, quality)
+        particle_name = None
         particle_obj = bptf_client.safe_dict(item.get("particle"))
-        particle_id = particle_obj.get("id")
-        particle_name = particle_obj.get("name")
-
-        if particle_id is None:
-            # Fallback: flat field names.
-            particle_id = item.get("particleId") or item.get("particle_id")
-        if particle_id is None:
-            # Fallback: raw attributes, defindex 134 = "attach particle
-            # effect", value = the particle id.
-            for attr in (item.get("attributes") or []):
-                if isinstance(attr, dict) and attr.get("defindex") == 134:
-                    raw_value = attr.get("value", attr.get("float_value"))
-                    try:
-                        particle_id = int(raw_value) if raw_value is not None else None
-                    except (TypeError, ValueError):
-                        particle_id = None
-                    break
-        if particle_id is None and quality == "Unusual":
-            # Last resort: the websocket stream doesn't always include a
-            # usable particle id via any of the fields above, even for
-            # common, long-established effects. The item's own `name`
-            # text still carries the effect as a literal prefix though
-            # (backpack.tf bakes this in unconditionally) - matched
-            # against the bundled effect list, picking the LONGEST
-            # matching name so a short one never wins over a longer one
-            # sharing the same first word ("Stardust" vs "Stardust
-            # Pathway").
-            _, particle_id, _ = bptf_client.find_effect_prefix(name)
+        if particle_obj.get("id") == particle_id:
+            # Only trust the payload's own name alongside an id that
+            # actually came from this SAME object - a fallback-resolved
+            # id (flat field, raw attribute, or name-prefix match) has
+            # no matching name of its own from the payload to pair with.
+            particle_name = particle_obj.get("name")
         if particle_id is not None:
             # Prefer the schema's canonical name over the raw payload's
             # own name for this event - the raw one can vary in
@@ -1828,6 +1847,36 @@ class Watcher:
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "unknowneffects":
                 reply = self._format_unknown_effects()
+                await self._run_telegram(self.telegram.send, reply)
+            elif command == "memtrace":
+                # tracemalloc - Python's own stdlib memory profiler.
+                # Opt-in (never started automatically) because it carries
+                # its own real memory/CPU overhead while running - not
+                # something to leave on permanently, only for actively
+                # chasing a specific leak. Started here rather than at
+                # process startup specifically so it can be turned off
+                # again (/memtraceoff) once done, unlike a startup-time
+                # decision that would need a redeploy to undo.
+                if tracemalloc.is_tracing():
+                    reply = "tracemalloc уже включён и собирает данные."
+                else:
+                    tracemalloc.start(25)
+                    reply = (
+                        "tracemalloc включён - теперь отслеживает выделения памяти "
+                        "по каждой строке кода. Даёт небольшую доп. нагрузку сам по "
+                        "себе, так что выключи его (/memtraceoff), когда разберёмся. "
+                        "Дай памяти подрасти, потом смотри /memtop."
+                    )
+                await self._run_telegram(self.telegram.send, reply)
+            elif command == "memtraceoff":
+                if tracemalloc.is_tracing():
+                    tracemalloc.stop()
+                    reply = "tracemalloc выключен."
+                else:
+                    reply = "tracemalloc и так был выключен."
+                await self._run_telegram(self.telegram.send, reply)
+            elif command == "memtop":
+                reply = await asyncio.to_thread(self._format_memtop)
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "setaccounts":
                 raw = text.split(maxsplit=1)[1] if " " in text or "\n" in text else ""

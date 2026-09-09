@@ -567,6 +567,54 @@ def find_effect_prefix(name: str):
     return best_name, best_id, name[best_len:]
 
 
+def resolve_particle_id(item, name, quality_name):
+    """
+    Resolves an Unusual particle effect id from a raw item payload,
+    trying every fallback main.py's handle_bptf_event uses for the live
+    websocket stream, in the same order: item.particle.id, the flat
+    particleId/particle_id fields, raw attributes (defindex 134 =
+    "attach particle effect"), and finally the item name's own text
+    prefix (see find_effect_prefix above) when every structured field
+    comes up empty.
+
+    A real, confirmed bug this fixes: fetch_and_record_all_listings' own
+    bulk-scan path used to only ever try item.particle.id - none of
+    these other three fallbacks - silently dropping every Unusual entry
+    whose particle only showed up in one of them (a real, frequent
+    occurrence, not a rare edge case - this project's own "no resolvable
+    particle_id" diagnostic fired dozens of times over one session).
+    That meant a real sell listing's buy-order comparison could come up
+    "no live buy order" not because none existed, but because the bulk
+    scan had silently failed to record ones it should have - a live-
+    stream sell listing (robust extraction) compared against buy-order
+    data from the weaker bulk-scan path (fragile extraction) is a worse
+    mismatch than a symmetrical failure would be, since nothing about it
+    looks broken from either side alone.
+
+    Returns particle_id or None - never raises. Never resolves a NAME
+    (unlike main.py's own fuller version) - the unknown-effect
+    tracking/logging main.py layers on top of this is Watcher-state
+    specific (a saved-to-disk id->info map) and stays there; this
+    function is just the shared, stateless core both call.
+    """
+    particle_obj = safe_dict(item.get("particle"))
+    particle_id = particle_obj.get("id")
+    if particle_id is None:
+        particle_id = item.get("particleId") or item.get("particle_id")
+    if particle_id is None:
+        for attr in (item.get("attributes") or []):
+            if isinstance(attr, dict) and attr.get("defindex") == 134:
+                raw_value = attr.get("value", attr.get("float_value"))
+                try:
+                    particle_id = int(raw_value) if raw_value is not None else None
+                except (TypeError, ValueError):
+                    particle_id = None
+                break
+    if particle_id is None and quality_name == "Unusual":
+        _, particle_id, _ = find_effect_prefix(name or "")
+    return particle_id
+
+
 def safe_dict(value):
     """
     Returns value if it's a dict, else {} - the safe replacement for the
@@ -1545,10 +1593,7 @@ class BackpackTFPriceList:
                 item = entry.get("item")
                 if not isinstance(item, dict):
                     item = {}
-                particle_obj = item.get("particle")
-                if not isinstance(particle_obj, dict):
-                    particle_obj = {}
-                particle_id = particle_obj.get("id")
+                particle_id = resolve_particle_id(item, name, quality_name)
                 # particle_id is only EXPECTED for Unusual - for every
                 # other quality, no particle is the normal case, not a
                 # reason to skip (a real, confirmed bug fixed while
