@@ -322,6 +322,17 @@ class Watcher:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(executor, func, *args)
 
+    async def _run_proactive(self, func, *args):
+        """Same pattern as _run_telegram above, for
+        proactive_buy_order_refresh_loop's own workers - see run()'s
+        comment on self._proactive_executor for the real incident this
+        isolates against."""
+        executor = getattr(self, "_proactive_executor", None)
+        if executor is None:
+            return await asyncio.to_thread(func, *args)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(executor, func, *args)
+
     def refresh_mannco_key_price(self):
         rate = self.mannco.get_key_price_usd_cents()
         if rate:
@@ -461,9 +472,10 @@ class Watcher:
     # backpack.tf's snapshot for that SKU was still being generated
     # server-side, not a real error and not a genuine zero (see that
     # function's own docstring). asyncio.sleep() between attempts, not
-    # a blocking wait - this call already shares asyncio.to_thread's
-    # small default pool with live evaluation (see fetch_live_buy_
-    # order_keys' docstring on that same pool getting starved before).
+    # a blocking wait - even on its own dedicated executor (see run()'s
+    # self._proactive_executor), a blocking sleep here would still hold
+    # one of ITS threads idle for no reason across every concurrent
+    # worker, when a plain asyncio.sleep costs nothing but wall time.
     PROACTIVE_JOB_QUEUED_MAX_RETRIES = 2
     PROACTIVE_JOB_QUEUED_RETRY_DELAY_SECONDS = 4.0
 
@@ -497,14 +509,14 @@ class Watcher:
             item_name, item_quality = scan_key
             self._known_scan_items[scan_key]["ts"] = time.time()  # claimed immediately, before awaiting
             try:
-                recorded = await asyncio.to_thread(
+                recorded = await self._run_proactive(
                     self.bptf.fetch_and_record_all_buy_orders, item_name, item_quality
                 )
                 attempts = 0
                 while recorded is None and attempts < self.PROACTIVE_JOB_QUEUED_MAX_RETRIES:
                     attempts += 1
                     await asyncio.sleep(self.PROACTIVE_JOB_QUEUED_RETRY_DELAY_SECONDS)
-                    recorded = await asyncio.to_thread(
+                    recorded = await self._run_proactive(
                         self.bptf.fetch_and_record_all_buy_orders, item_name, item_quality
                     )
                 if recorded is None:
@@ -1801,6 +1813,23 @@ class Watcher:
         # threads) solves the lag without the shared pool needing to be
         # huge - see _run_telegram below.
         self._telegram_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+
+        # Same reasoning as _telegram_executor above, for the same
+        # underlying reason - a real, confirmed case: a plain restart's
+        # shutdown-time save_to_disk (see the end of this method) sat
+        # queued for 90+ seconds behind proactive_buy_order_refresh_
+        # loop's own worker_count (up to 1 + every configured account)
+        # concurrent network calls, ALL competing for the same small
+        # shared default to_thread pool used by evaluate_listing too -
+        # systemd's stop timeout expired first and had to SIGKILL the
+        # process, losing that run's final save entirely (the opposite
+        # of what that save exists for). Proactive scanning can tolerate
+        # being its own separately-paced citizen; evaluate_listing and a
+        # clean shutdown cannot wait behind it. Sized to worker_count so
+        # every proactive worker always has its own thread rather than
+        # queuing behind siblings too.
+        proactive_worker_count = 1 + len(self.cfg.get("backpacktf_accounts") or [])
+        self._proactive_executor = concurrent.futures.ThreadPoolExecutor(max_workers=proactive_worker_count)
 
         # Restores whatever the local listing store had saved before -
         # comparison data available, not an empty store. Cleans up any

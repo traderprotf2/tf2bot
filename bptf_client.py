@@ -1435,9 +1435,12 @@ class BackpackTFPriceList:
                 # rather than a dead end or a genuine zero-listings result -
                 # see _proactive_unusual_refresh_worker in main.py, which
                 # retries with asyncio.sleep() between attempts rather than
-                # blocking in here (this function runs on asyncio.to_thread's
-                # shared default pool - the same one a slow call was already
-                # confirmed to starve, see fetch_live_buy_order_keys).
+                # blocking in here (this function now runs on its own
+                # dedicated executor, self._proactive_executor - see run()'s
+                # own comment for why: it used to share asyncio.to_thread's
+                # default pool with evaluate_listing and shutdown's final
+                # save, and a real incident showed that queuing behind a
+                # blocking wait here anyway would still be worth avoiding).
                 return None
             log.warning(
                 "Bulk scan response for %s (%s) had an unexpected shape - raw (truncated): %r",
