@@ -1,0 +1,1 @@
+{"time": 1788959547.9526486, "level": "WARNING", "logger": "main", "message": "Memory guard: RSS 1500MB >= 1000MB budget - evicted 4000 coldest bucket(s) from the local listing store."}

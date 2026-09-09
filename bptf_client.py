@@ -738,8 +738,8 @@ class LocalListingStore:
     asyncio.to_thread(evaluate_listing, ...).
     """
 
-    def __init__(self, max_age_seconds=3600, buy_max_age_seconds=None, max_entries_per_key=300,
-                 max_total_buckets=50000):
+    def __init__(self, max_age_seconds=3600, buy_max_age_seconds=None, max_entries_per_key=150,
+                 max_total_buckets=20000):
         # OrderedDict, not a plain dict - move_to_end() in record() below
         # keeps buckets ordered LEAST-recently-updated first, so eviction
         # always drops the coldest bucket first, cheaply (O(1)).
@@ -750,9 +750,26 @@ class LocalListingStore:
         # to 24h so a missed delete event doesn't lose data, nothing aged
         # out at all for the first 24h of a fresh start. At real volume
         # (181,113 buy orders in 80 minutes) that unbounded growth is
-        # what took the whole process down via the OOM killer. 50,000
-        # buckets bounds worst-case memory to a fixed ceiling regardless
-        # of uptime or how much of the marketplace is seen.
+        # what took the whole process down via the OOM killer.
+        #
+        # 50,000/300 (this project's ORIGINAL fix for that incident) was
+        # sized as "a fixed ceiling", but never checked against any
+        # particular deployment's actual available RAM - a real, confirmed
+        # second incident: on a small VPS (1.8GB, 0 swap - see `free -h`),
+        # real traffic reliably reached OOM in 15-45 minutes, every run,
+        # clustering tightly around the same ~1.64GB RSS each time (a
+        # repeatable ceiling being hit, not random drift) - nowhere near
+        # what 50,000 buckets could theoretically hold. 20,000/150 is a
+        # more conservative default, but still just a fixed number with
+        # the exact same blind spot: it directly bounds MEMORY only if the
+        # actual bytes-per-entry guess holds, and different deployments
+        # have different RAM. main.py's memory_guard_loop is the real,
+        # deployment-agnostic backstop - it watches the process's ACTUAL
+        # RSS directly and evicts proactively (see evict_coldest_buckets
+        # below) well before any OOM point, whatever that point turns out
+        # to be on a given machine. These two constructor caps remain a
+        # secondary, static bound underneath that - never the only thing
+        # standing between this store and another OOM kill.
         self._entries = collections.OrderedDict()  # identity_key -> {listing_id: {listing_id, seller_id, price_keys, ts, intent}}
         # listing_id -> identity_key currently holding it - see record()'s
         # own comment for why this exists: without it, a listing whose
@@ -855,6 +872,48 @@ class LocalListingStore:
                 return
             for bucket in self._entries.values():
                 bucket.pop(listing_id, None)
+
+    def bucket_count(self):
+        """Number of distinct identity-key buckets currently held - see
+        main.py's memory_guard_loop and /stats, which surface this so a
+        deployment's real memory footprint is visible BEFORE it becomes
+        another OOM incident, not just discoverable afterwards from
+        journalctl forensics."""
+        with self._lock:
+            return len(self._entries)
+
+    def total_entry_count(self):
+        """Sum of every listing across every bucket - bucket_count()
+        alone can't distinguish "many buckets, each nearly empty" from
+        "few buckets, each near max_entries_per_key", and those two
+        shapes have very different memory implications."""
+        with self._lock:
+            return sum(len(b) for b in self._entries.values())
+
+    def evict_coldest_buckets(self, count):
+        """Force-evicts up to `count` of the least-recently-touched
+        buckets (move_to_end() in record() above keeps self._entries
+        ordered coldest-first, same as the automatic max_total_buckets
+        eviction there) - used by main.py's memory_guard_loop as a
+        direct response to actual process RSS approaching its budget,
+        independent of whatever max_total_buckets/max_entries_per_key
+        happen to be configured to. Returns how many buckets were
+        actually evicted (fewer than requested if the store holds less
+        than `count` to begin with)."""
+        evicted = 0
+        with self._lock:
+            for _ in range(count):
+                if not self._entries:
+                    break
+                evicted_key, evicted_bucket = self._entries.popitem(last=False)
+                for evicted_listing_id in evicted_bucket:
+                    # Same "still points at THIS bucket" guard as the
+                    # automatic eviction path in record() - a listing_id
+                    # could have already moved to a newer bucket since.
+                    if self._listing_locations.get(evicted_listing_id) == evicted_key:
+                        del self._listing_locations[evicted_listing_id]
+                evicted += 1
+        return evicted
 
     def _max_age_for(self, intent):
         return self._buy_max_age_seconds if intent == "buy" else self._max_age_seconds

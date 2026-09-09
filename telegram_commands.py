@@ -399,7 +399,8 @@ def _find_category(name: str):
     return None
 
 
-def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
+def _format_stats(stats, stats_since, currently_rate_limited=False,
+                   store_bucket_count=None, store_entry_count=None, rss_mb=None) -> str:
     """
     Answers "is the bot even seeing the volume I'd expect, and if so,
     where's it narrowing down" - a real question that came up when alert
@@ -421,8 +422,21 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
     if currently_rate_limited:
         header += "⏳ Сейчас в кулдауне после 429 от backpack.tf - оценка временно приостановлена.\n\n"
 
+    # Real process memory + local-store size, not funnel counters - added
+    # after a real OOM incident where the only way to see this at all was
+    # SSH+journalctl forensics AFTER the crash already happened. Shown
+    # regardless of whether any events happened this window (below the
+    # early "Событий пока не было" return), since memory pressure can be
+    # building even during a quiet period for alerts specifically.
+    memory_bits = []
+    if rss_mb is not None:
+        memory_bits.append(f"RSS {rss_mb:.0f} МБ")
+    if store_bucket_count is not None and store_entry_count is not None:
+        memory_bits.append(f"стор: {store_bucket_count} корзин / {store_entry_count} записей")
+    memory_line = f"💾 {', '.join(memory_bits)}\n\n" if memory_bits else ""
+
     if not stats:
-        return header + "Событий пока не было."
+        return header + memory_line + "Событий пока не было."
 
     lines = []
     total_alerts = 0
@@ -520,7 +534,7 @@ def _format_stats(stats, stats_since, currently_rate_limited=False) -> str:
             f"{recorded} buy-заявок обновлено"
         )
 
-    return header + "\n".join(lines)
+    return header + memory_line + "\n".join(lines)
 
 
 ERRORS_PAGE_SIZE = 15
@@ -592,7 +606,8 @@ def _format_errors(error_entries) -> str:
 
 
 def handle_command(text: str, runtime, stats=None, stats_since=None,
-                    currently_rate_limited: bool = False, error_entries=None) -> str:
+                    currently_rate_limited: bool = False, error_entries=None,
+                    store_bucket_count=None, store_entry_count=None, rss_mb=None) -> str:
     """Parses one typed command and applies it to `runtime`, returning
     the reply text. Any state change is saved to disk before returning."""
     parts = text.strip().split(maxsplit=1)
@@ -603,7 +618,8 @@ def handle_command(text: str, runtime, stats=None, stats_since=None,
         return HELP_TEXT
 
     if command == "stats":
-        return _format_stats(stats, stats_since, currently_rate_limited)
+        return _format_stats(stats, stats_since, currently_rate_limited,
+                              store_bucket_count, store_entry_count, rss_mb)
 
     if command == "errors":
         return _format_errors(error_entries)

@@ -102,6 +102,28 @@ def classify_category(name, slot=None):
     return "other"
 
 
+def _current_rss_mb():
+    """Current process resident memory in MB, or None if it can't be
+    determined - a monitoring helper should never itself be a reason to
+    crash. Reads /proc/self/status directly rather than
+    resource.getrusage(RUSAGE_SELF).ru_maxrss - that field is the
+    process's PEAK RSS over its entire lifetime (monotonically
+    non-decreasing), not its CURRENT RSS, so it would never reflect
+    memory actually freed by memory_guard_loop's own eviction below,
+    making the guard trigger every single check forever after the first
+    time it ever fired. /proc/self/status's VmRSS is Linux-specific -
+    fine here, this project's only real deployment target is a Linux VPS
+    under systemd (see the .service file)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024  # kB -> MB
+    except Exception:
+        return None
+    return None
+
+
 class Watcher:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -348,6 +370,49 @@ class Watcher:
                 await asyncio.to_thread(self.bptf.local_listings.prune_expired)
             except Exception:
                 log.exception("Local listing store prune failed, will retry next cycle.")
+
+    # Direct backstop against OOM, independent of LocalListingStore's own
+    # max_total_buckets/max_entries_per_key caps (see that class'
+    # __init__ for the full history) - a real, confirmed second OOM
+    # incident showed those caps, sized as "a fixed ceiling" without
+    # checking against any particular deployment's actual RAM, were far
+    # too generous for a small VPS: real traffic reached OOM in 15-45
+    # minutes, repeatedly, well before either cap was ever reached. Buy
+    # orders are kept up to 24h (see BUY_ORDER_SAFETY_NET_SECONDS) - on a
+    # small/busy deployment, local_store_prune_loop's own age-based
+    # pruning above genuinely has nothing to remove for that whole
+    # window, so bucket-count caps were the ONLY thing standing between
+    # this store and OOM during exactly the period this guard covers.
+    # Checking real process RSS directly (not a proxy like bucket count,
+    # which only bounds memory correctly if the bytes-per-entry guess
+    # happens to hold) is the only check that adapts to whatever RAM a
+    # given machine actually has. 60s interval, not local_store_prune_
+    # loop's 600s - a real, confirmed growth rate on the VPS that
+    # surfaced this (~60MB/minute) would add up to 600MB between two
+    # 600s checks alone, uncomfortably close to the ~1.6GB OOM point
+    # already; 60s leaves ample reaction time under that same rate.
+    MEMORY_GUARD_CHECK_INTERVAL_SECONDS = 60
+    MEMORY_GUARD_RSS_MB = 1000
+    MEMORY_GUARD_EVICT_BUCKETS = 4000
+
+    async def memory_guard_loop(self):
+        while True:
+            await asyncio.sleep(self.MEMORY_GUARD_CHECK_INTERVAL_SECONDS)
+            try:
+                rss_mb = _current_rss_mb()
+                if rss_mb is None or rss_mb < self.MEMORY_GUARD_RSS_MB:
+                    continue
+                evicted = await asyncio.to_thread(
+                    self.bptf.local_listings.evict_coldest_buckets,
+                    self.MEMORY_GUARD_EVICT_BUCKETS,
+                )
+                log.warning(
+                    "Memory guard: RSS %.0fMB >= %dMB budget - evicted %d coldest "
+                    "bucket(s) from the local listing store.",
+                    rss_mb, self.MEMORY_GUARD_RSS_MB, evicted,
+                )
+            except Exception:
+                log.exception("Memory guard check failed.")
 
     async def alert_cooldowns_prune_loop(self):
         """Periodically removes expired entries from
@@ -1639,6 +1704,9 @@ class Watcher:
                     text, self.runtime,
                     stats=self.stats, stats_since=self.stats_since,
                     currently_rate_limited=bptf_client.is_rate_limited(),
+                    store_bucket_count=self.bptf.local_listings.bucket_count(),
+                    store_entry_count=self.bptf.local_listings.total_entry_count(),
+                    rss_mb=_current_rss_mb(),
                 )
                 log.info("Telegram command: %r -> %s", text, reply.splitlines()[0])
                 await self._run_telegram(self.telegram.send, reply)
@@ -1763,6 +1831,7 @@ class Watcher:
             self.telegram_command_loop(),
             self.health_check_loop(),
             self.local_store_prune_loop(),
+            self.memory_guard_loop(),
             self.alert_cooldowns_prune_loop(),
             self.local_store_snapshot_loop(),
             self.proactive_buy_order_refresh_loop(),
