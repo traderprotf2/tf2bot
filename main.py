@@ -374,16 +374,30 @@ class Watcher:
 
     async def _run_diagnostics(self, func, *args):
         """Same pattern as _run_telegram/_run_proactive above, for
-        heavy on-demand diagnostic commands (currently just /memtop) -
-        a real, confirmed case: tracemalloc.take_snapshot() can take a
-        long time once a lot of allocations are tracked, and dispatching
-        it through plain asyncio.to_thread (the same small shared
-        default pool evaluate_listing uses) tied up one of that pool's
-        few threads for the whole duration - a user report of the WHOLE
-        bot lagging for roughly a minute right after sending /memtop,
-        the exact same class of problem _telegram_executor and
+        on-demand Telegram command work in general (/memtop, /checkitem,
+        and every other command's reply-building, via the else-branch
+        closure in _handle_telegram_event) - a real, confirmed case,
+        found in two stages:
+
+        First just /memtop: tracemalloc.take_snapshot() can take a long
+        time once a lot of allocations are tracked, and dispatching it
+        through plain asyncio.to_thread (the same small shared default
+        pool evaluate_listing AND record() use) tied up one of that
+        pool's few threads for the whole duration - a user report of the
+        whole bot lagging for roughly a minute right after sending
+        /memtop.
+
+        Then a second, broader report: EVERY command, not just /memtop,
+        freezing the whole bot - because record() (dispatched on every
+        single websocket event, at real volume tens of thousands of
+        times a session) shares that exact same default pool too. Under
+        load, a command's own to_thread dispatch could queue behind a
+        backlog of pending record() calls before it even started
+        running, regardless of how fast the command's own work was.
+        Moving ALL command work here, not just /memtop, is what actually
+        closes that - the same class of problem _telegram_executor and
         _proactive_executor already exist to prevent, just not yet
-        extended to cover this command too."""
+        extended to cover general command dispatch too."""
         executor = getattr(self, "_diagnostics_executor", None)
         if executor is None:
             return await asyncio.to_thread(func, *args)
@@ -1908,7 +1922,7 @@ class Watcher:
                 # project) - both were running synchronously on the
                 # event loop itself, the same event-loop-blocking risk
                 # already fixed for record()/remove_listing() above.
-                reply = await asyncio.to_thread(
+                reply = await self._run_diagnostics(
                     self._check_item, text.split(maxsplit=1)[1] if " " in text else ""
                 )
                 await self._run_telegram(self.telegram.send, reply)
@@ -1994,7 +2008,7 @@ class Watcher:
                         rss_mb=_current_rss_mb(),
                         name_cache_count=len(self._name_to_identity_keys),
                     )
-                reply = await asyncio.to_thread(_build_command_reply)
+                reply = await self._run_diagnostics(_build_command_reply)
                 log.info("Telegram command: %r -> %s", text, reply.splitlines()[0])
                 await self._run_telegram(self.telegram.send, reply)
                 if command == "stats":
@@ -2078,9 +2092,12 @@ class Watcher:
         self._proactive_executor = concurrent.futures.ThreadPoolExecutor(max_workers=proactive_worker_count)
 
         # See _run_diagnostics' own docstring for the real report this
-        # isolates against (a full ~1 minute bot-wide lag right after
-        # /memtop). Small - this is an on-demand, human-paced command,
-        # never more than one or two in flight at once.
+        # See _run_diagnostics' own docstring for the real reports this
+        # isolates against (a ~1 minute /memtop-only lag, then a second,
+        # broader "every command freezes the bot" report once general
+        # command dispatch was found to share the same problem). Small -
+        # these are on-demand, human-paced commands, never more than one
+        # or two in flight at once.
         self._diagnostics_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
         # Restores whatever the local listing store had saved before -
