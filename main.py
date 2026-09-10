@@ -1490,6 +1490,30 @@ class Watcher:
                 item.get("particle"), item.get("particleId"), item.get("attributes"),
             )
 
+        # Explicit yield point, right at the boundary between the cheap
+        # filters above (reject most events fast) and the more expensive
+        # work below (particle/spell/paint extraction, identity-key
+        # building) - a real, confirmed report this fixes: under
+        # sustained real event volume (tens of thousands of events in a
+        # short window), _spawn_dispatch in bptf_ws.py creates one
+        # asyncio task per event, and without a yield point, a single
+        # task's own synchronous CPU work (however individually brief)
+        # ran start-to-finish before the event loop got a chance to
+        # schedule anything ELSE waiting its turn - including
+        # telegram_command_loop's own pending work, whenever there
+        # happened to be a lot of these tasks queued back-to-back. A
+        # user report: right after a fresh restart (when a burst of
+        # events arrives quickly), the bot didn't respond to ANY
+        # Telegram command for several minutes, and /stats, once it
+        # finally did respond, showed tens of thousands of events already
+        # processed in that same window - the event loop was busy the
+        # whole time, just never with Telegram's own turn. await
+        # asyncio.sleep(0) is the standard, minimal way to yield back to
+        # the loop without actually waiting - it re-queues this task at
+        # the back of the ready queue, letting every other ready task
+        # (Telegram's included) get a turn first.
+        await asyncio.sleep(0)
+
         particle_id = bptf_client.resolve_particle_id(item, name, quality)
         particle_name = None
         particle_obj = bptf_client.safe_dict(item.get("particle"))
@@ -2050,6 +2074,28 @@ class Watcher:
         )
         await self._run_telegram(self.telegram.send, message)
 
+    async def _delayed_startup_sanity_check(self, delay_seconds=120):
+        """Runs _startup_sanity_check after a delay, as one of main_tasks'
+        own gathered coroutines, instead of run() awaiting it directly
+        before main_tasks even starts. A real, confirmed reason this
+        moved: price_refresh_loop/key_price_refresh_loop's own first
+        fetch (see each loop's own body) needs a real chance to
+        complete - including surviving a mannco.store rate limit, which
+        has taken 400+ seconds in practice - before this check can tell
+        a genuine problem apart from "just hasn't finished its first
+        fetch yet". Blocking run() itself on either the fetch or this
+        check, before Telegram (or anything else gathered below) even
+        started, was the real, confirmed incident - see the comment
+        right before main_tasks for the fuller story. Not exact science
+        (2 minutes is a reasonable, not guaranteed, window), but errs
+        toward Telegram being responsive immediately over this specific
+        check's own timing precision."""
+        await asyncio.sleep(delay_seconds)
+        try:
+            await self._startup_sanity_check()
+        except Exception:
+            log.exception("Delayed startup sanity check failed.")
+
     async def run(self):
         # Started unconditionally now, not gated behind /memtrace - a
         # real, practical problem this fixes: manually catching the
@@ -2114,26 +2160,26 @@ class Watcher:
         await asyncio.to_thread(self.bptf.local_listings.load_from_disk, bptf_client.LOCAL_LISTINGS_STATE_PATH)
         self._load_alert_cooldowns()
 
-        log.info("Starting up: loading initial prices...")
-        try:
-            await asyncio.to_thread(self.refresh_prices)
-        except Exception:
-            # A transient hiccup here shouldn't take down the whole
-            # process - price_refresh_loop below retries on its own
-            # schedule anyway, so it's fine to start the websocket
-            # listeners now and let prices catch up shortly after.
-            log.exception("Initial price load failed - continuing anyway, will retry on schedule.")
-
-        try:
-            # Fetched once immediately here too (not just on
-            # key_price_refresh_loop's own, much slower schedule) so a
-            # price is available right away at startup, rather than
-            # leaving mannco_key_usd_cents unset for up to a week.
-            await asyncio.to_thread(self.refresh_mannco_key_price)
-        except Exception:
-            log.exception("Initial mannco.store key price load failed - continuing anyway, will retry on schedule.")
-
-        await self._startup_sanity_check()
+        # NOT awaited sequentially here before anything else starts - a
+        # real, confirmed incident this fixes: mannco.store's login has
+        # hit real rate limits before (up to a ~400+ second wait, per
+        # this project's own retry logic), and this used to run as a
+        # blocking step BEFORE main_tasks (below) ever started - meaning
+        # telegram_command_loop hadn't even begun polling yet, so the
+        # WHOLE bot looked completely unresponsive to every Telegram
+        # command for however long that wait took, every single restart,
+        # with restarts themselves (frequent, for unrelated reasons this
+        # project has already chased down) plausibly making mannco.store
+        # rate-limit it even harder each time. price_refresh_loop and
+        # key_price_refresh_loop below already fetch immediately as
+        # their own first action before settling into their normal
+        # schedule (see each loop's own body) - so removing the
+        # duplicate sequential fetch here, and starting every loop
+        # (including Telegram) together via main_tasks right away,
+        # costs nothing: the same initial fetch still happens, just
+        # concurrently with Telegram being responsive instead of gating
+        # it.
+        log.info("Starting up - background loops (prices, mannco key, Telegram, ...) start concurrently now.")
 
         # Graceful-shutdown handling: saves the local listing store the
         # MOMENT the process is asked to stop, not just on
@@ -2165,6 +2211,7 @@ class Watcher:
             self.alert_cooldowns_prune_loop(),
             self.local_store_snapshot_loop(),
             self.proactive_buy_order_refresh_loop(),
+            self._delayed_startup_sanity_check(),
             bptf_ws.stream_listing_events(self.handle_bptf_event),
         )
         shutdown_waiter = asyncio.create_task(shutdown_event.wait())
