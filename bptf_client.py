@@ -1523,7 +1523,15 @@ class BackpackTFPriceList:
             resp.raise_for_status()
             data = resp.json()
         except Exception:
-            log.warning("Bulk %s scan failed for %s (%s).", intent, name, quality_name)
+            # log.exception (not log.warning) specifically so the actual
+            # traceback lands in the log - a real, confirmed gap: a bare
+            # "failed" message with no exception detail at all made a
+            # genuine new failure (a real error, not the anticipated
+            # "unexpected shape" job-queued case handled separately
+            # below) completely undiagnosable after the fact, no
+            # different from a passing network hiccup even if it turns
+            # out to be a real, repeatable bug.
+            log.exception("Bulk %s scan failed for %s (%s).", intent, name, quality_name)
             return 0
 
         listings = data.get("listings") if isinstance(data, dict) else None
