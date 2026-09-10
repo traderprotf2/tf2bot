@@ -20,7 +20,6 @@ See README.md for setup instructions.
 import asyncio
 import collections
 import concurrent.futures
-import ctypes
 import json
 import logging
 import os
@@ -102,35 +101,6 @@ def classify_category(name, slot=None):
             return "badge"
 
     return "other"
-
-
-try:
-    _libc = ctypes.CDLL("libc.so.6")
-except OSError:
-    _libc = None
-
-
-def _malloc_trim():
-    """Asks glibc to release freed-but-unreturned heap memory back to
-    the OS (malloc_trim(3)) - a real, confirmed finding: tracemalloc
-    (Python's own stdlib memory profiler) showed only ~0.1MB tracked
-    while this process's actual RSS was climbing past 480MB - meaning
-    the gap isn't unfreed Python OBJECTS (tracemalloc would see those),
-    it's memory Python already freed that glibc's allocator hasn't
-    given back to the OS yet. This is a well-documented real pattern
-    for a long-running, multi-threaded Python process with high
-    allocate/free churn (tens of thousands of short-lived dicts/tuples
-    parsing events per minute here) - glibc's malloc can accumulate
-    fragmented, technically-free-but-still-resident arena space rather
-    than returning it. Best-effort: not every distro/libc guarantees
-    this symbol under this exact name, so failure here is silently
-    ignored, same philosophy as _current_rss_mb above."""
-    if _libc is None:
-        return
-    try:
-        _libc.malloc_trim(0)
-    except Exception:
-        pass
 
 
 def _current_rss_mb():
@@ -494,10 +464,10 @@ class Watcher:
                 # practical problem this solves: this project's own OOM
                 # cycle made manually catching a useful window (before
                 # tracemalloc's data resets on the next restart) hard to
-                # coordinate by hand. Logged BEFORE the trim/eviction
-                # below so it reflects the state that actually triggered
-                # this cycle, not what's left after this cycle's own
-                # cleanup already changed it.
+                # coordinate by hand. Logged BEFORE eviction below so it
+                # reflects the state that actually triggered this cycle,
+                # not what's left after this cycle's own cleanup already
+                # changed it.
                 entries, total_mb = await self._run_diagnostics(self._memtop_entries, 5)
                 if entries is not None:
                     top_summary = "; ".join(
@@ -507,33 +477,33 @@ class Watcher:
                         "Memory guard: RSS %.0fMB >= %dMB - tracemalloc top-5 (%.1fMB tracked total): %s",
                         rss_mb, self.MEMORY_GUARD_RSS_MB, total_mb, top_summary,
                     )
-                # Trim FIRST, before touching LocalListingStore at all -
-                # a real, confirmed finding: tracemalloc showed only a
-                # tiny fraction of actual RSS as tracked Python objects,
-                # meaning most of what this guard was fighting wasn't
-                # live data to evict in the first place, it was freed-
-                # but-unreturned glibc arena space (see _malloc_trim's
-                # own docstring). Re-checking RSS after the trim avoids
-                # evicting real, useful cached market data when a trim
-                # alone would have brought RSS back under budget anyway.
-                await asyncio.to_thread(_malloc_trim)
-                rss_after_trim = _current_rss_mb()
-                if rss_after_trim is not None and rss_after_trim < self.MEMORY_GUARD_RSS_MB:
-                    log.warning(
-                        "Memory guard: RSS %.0fMB >= %dMB budget - malloc_trim alone brought "
-                        "it to %.0fMB, no eviction needed this cycle.",
-                        rss_mb, self.MEMORY_GUARD_RSS_MB, rss_after_trim,
-                    )
-                    continue
+                # NOT malloc_trim(0) - removed after a real, confirmed
+                # incident: on this project's actual live process (busy,
+                # genuinely multi-threaded, constant allocate/free churn
+                # from record() and everything else), malloc_trim can
+                # need to hold glibc's own INTERNAL heap lock while it
+                # walks and releases arenas - a lock every OTHER thread's
+                # own malloc/free also needs, not something scoped to
+                # just the one to_thread worker it was dispatched on. A
+                # direct user report: sending the manual /memtrim command
+                # froze the WHOLE bot, not just that one reply - and this
+                # loop had been calling the exact same function
+                # automatically, every ~hour, since RSS crosses 1000MB
+                # about that often. That's a strictly worse trade than
+                # the OOM this was meant to prevent: a controlled,
+                # predictable crash-and-restart versus an unpredictable,
+                # silent freeze with no recovery until something else
+                # intervenes. Eviction alone (below) is safe - it only
+                # ever holds LocalListingStore's own local Python lock,
+                # nothing glibc-global.
                 evicted = await asyncio.to_thread(
                     self.bptf.local_listings.evict_coldest_buckets,
                     self.MEMORY_GUARD_EVICT_BUCKETS,
                 )
                 log.warning(
-                    "Memory guard: RSS %.0fMB >= %dMB budget (still %.0fMB after malloc_trim) - "
-                    "evicted %d coldest bucket(s) from the local listing store.",
-                    rss_mb, self.MEMORY_GUARD_RSS_MB, rss_after_trim if rss_after_trim is not None else rss_mb,
-                    evicted,
+                    "Memory guard: RSS %.0fMB >= %dMB budget - evicted %d coldest "
+                    "bucket(s) from the local listing store.",
+                    rss_mb, self.MEMORY_GUARD_RSS_MB, evicted,
                 )
             except Exception:
                 log.exception("Memory guard check failed.")
@@ -1981,23 +1951,6 @@ class Watcher:
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "memtop":
                 reply = await self._run_diagnostics(self._format_memtop)
-                await self._run_telegram(self.telegram.send, reply)
-            elif command == "memtrim":
-                # Manual trigger for the same trim memory_guard_loop now
-                # does automatically at its own 1000MB threshold - lets
-                # this be tested/observed right now, on demand, instead
-                # of waiting for the next guard cycle or another RSS
-                # climb to confirm it.
-                rss_before = _current_rss_mb()
-                await asyncio.to_thread(_malloc_trim)
-                rss_after = _current_rss_mb()
-                if rss_before is None or rss_after is None:
-                    reply = "malloc_trim выполнен, но RSS прочитать не удалось (/proc/self/status недоступен?)."
-                else:
-                    reply = (
-                        f"RSS до: {rss_before:.0f} МБ → после malloc_trim: {rss_after:.0f} МБ "
-                        f"(освобождено: {rss_before - rss_after:.0f} МБ)"
-                    )
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "setaccounts":
                 raw = text.split(maxsplit=1)[1] if " " in text or "\n" in text else ""
