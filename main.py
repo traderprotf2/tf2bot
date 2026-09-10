@@ -1967,15 +1967,34 @@ class Watcher:
                 reply = self._set_accounts(raw)
                 await self._run_telegram(self.telegram.send, reply)
             else:
-                reply = telegram_commands.handle_command(
-                    text, self.runtime,
-                    stats=self.stats, stats_since=self.stats_since,
-                    currently_rate_limited=bptf_client.is_rate_limited(),
-                    store_bucket_count=self.bptf.local_listings.bucket_count(),
-                    store_entry_count=self.bptf.local_listings.entry_count(),
-                    rss_mb=_current_rss_mb(),
-                    name_cache_count=len(self._name_to_identity_keys),
-                )
+                # A real, confirmed bug this fixes: the memory-stats
+                # arguments below (bucket_count(), entry_count()) each
+                # acquire LocalListingStore's own lock - and simply
+                # wrapping the handle_command() call itself in
+                # asyncio.to_thread does NOT defer evaluating them,
+                # since Python evaluates a call's arguments BEFORE
+                # to_thread ever runs, on the event loop thread, same as
+                # any other call. If that lock is held elsewhere for any
+                # real duration (a save, a prune, an eviction), this
+                # blocked the WHOLE event loop - not just this one
+                # command, EVERYTHING (the websocket stream, every other
+                # Telegram command) until the lock freed up. A real user
+                # report: "any command" freezing the whole bot for
+                # minutes. Wrapping the gathering AND the call together
+                # in one function, then dispatching THAT via to_thread,
+                # is what actually moves the lock-waiting off the event
+                # loop.
+                def _build_command_reply():
+                    return telegram_commands.handle_command(
+                        text, self.runtime,
+                        stats=self.stats, stats_since=self.stats_since,
+                        currently_rate_limited=bptf_client.is_rate_limited(),
+                        store_bucket_count=self.bptf.local_listings.bucket_count(),
+                        store_entry_count=self.bptf.local_listings.entry_count(),
+                        rss_mb=_current_rss_mb(),
+                        name_cache_count=len(self._name_to_identity_keys),
+                    )
+                reply = await asyncio.to_thread(_build_command_reply)
                 log.info("Telegram command: %r -> %s", text, reply.splitlines()[0])
                 await self._run_telegram(self.telegram.send, reply)
                 if command == "stats":
