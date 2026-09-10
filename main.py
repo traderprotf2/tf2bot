@@ -488,6 +488,25 @@ class Watcher:
                 rss_mb = _current_rss_mb()
                 if rss_mb is None or rss_mb < self.MEMORY_GUARD_RSS_MB:
                     continue
+                # Automatic tracemalloc snapshot, logged right here, every
+                # time the guard fires - not dependent on anyone being
+                # online to send /memtop at the right moment. A real,
+                # practical problem this solves: this project's own OOM
+                # cycle made manually catching a useful window (before
+                # tracemalloc's data resets on the next restart) hard to
+                # coordinate by hand. Logged BEFORE the trim/eviction
+                # below so it reflects the state that actually triggered
+                # this cycle, not what's left after this cycle's own
+                # cleanup already changed it.
+                entries, total_mb = await self._run_diagnostics(self._memtop_entries, 5)
+                if entries is not None:
+                    top_summary = "; ".join(
+                        f"{size_mb:.1f}MB {filename}:{lineno}" for size_mb, _count, filename, lineno in entries
+                    )
+                    log.warning(
+                        "Memory guard: RSS %.0fMB >= %dMB - tracemalloc top-5 (%.1fMB tracked total): %s",
+                        rss_mb, self.MEMORY_GUARD_RSS_MB, total_mb, top_summary,
+                    )
                 # Trim FIRST, before touching LocalListingStore at all -
                 # a real, confirmed finding: tracemalloc showed only a
                 # tiny fraction of actual RSS as tracked Python objects,
@@ -1087,6 +1106,26 @@ class Watcher:
             log.exception("Failed to format /unknowneffects reply.")
             return "Не получилось собрать список - подробности в логах."
 
+    def _memtop_entries(self, top_n=15):
+        """Shared core for /memtop (Telegram, HTML-formatted, Russian)
+        and memory_guard_loop's own automatic logging (plain English log
+        line) below - returns (entries, total_mb) where entries is a
+        list of (size_mb, block_count, filename, lineno) tuples, or
+        (None, None) if tracemalloc isn't tracing. Raw data, not
+        pre-formatted text, so each caller keeps its own language/style
+        instead of this shared core picking one for both."""
+        if not tracemalloc.is_tracing():
+            return None, None
+        snapshot = tracemalloc.take_snapshot()
+        stats = snapshot.statistics("lineno")
+        entries = [
+            (stat.size / (1024 * 1024), stat.count, os.path.basename(stat.traceback[0].filename),
+             stat.traceback[0].lineno)
+            for stat in stats[:top_n]
+        ]
+        total_mb = sum(s.size for s in stats) / (1024 * 1024)
+        return entries, total_mb
+
     def _format_memtop(self, top_n=15) -> str:
         """
         /memtop - top allocation sites by CURRENT size, straight from
@@ -1103,22 +1142,15 @@ class Watcher:
         the responsible allocation - no more reasoning about what
         plausibly could be the cause.
         """
-        if not tracemalloc.is_tracing():
+        entries, total_mb = self._memtop_entries(top_n)
+        if entries is None:
             return (
                 "tracemalloc не включён - сначала пришли /memtrace, дай памяти "
                 "подрасти (минут 10-20), потом смотри сюда снова."
             )
-        snapshot = tracemalloc.take_snapshot()
-        stats = snapshot.statistics("lineno")
         lines = [f"📊 <b>Топ-{top_n} по памяти (tracemalloc)</b>\n"]
-        for i, stat in enumerate(stats[:top_n], 1):
-            frame = stat.traceback[0]
-            size_mb = stat.size / (1024 * 1024)
-            lines.append(
-                f"{i}. {size_mb:.1f} МБ, {stat.count} блок(ов) - "
-                f"{os.path.basename(frame.filename)}:{frame.lineno}"
-            )
-        total_mb = sum(s.size for s in stats) / (1024 * 1024)
+        for i, (size_mb, count, filename, lineno) in enumerate(entries, 1):
+            lines.append(f"{i}. {size_mb:.1f} МБ, {count} блок(ов) - {filename}:{lineno}")
         lines.append(f"\nВсего отслежено tracemalloc: {total_mb:.1f} МБ")
         text = "\n".join(lines)
         if len(text) > 3900:
@@ -1930,24 +1962,15 @@ class Watcher:
                 reply = self._format_unknown_effects()
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "memtrace":
-                # tracemalloc - Python's own stdlib memory profiler.
-                # Opt-in (never started automatically) because it carries
-                # its own real memory/CPU overhead while running - not
-                # something to leave on permanently, only for actively
-                # chasing a specific leak. Started here rather than at
-                # process startup specifically so it can be turned off
-                # again (/memtraceoff) once done, unlike a startup-time
-                # decision that would need a redeploy to undo.
+                # tracemalloc now starts automatically at process launch
+                # (see run()) - this command just confirms that, kept
+                # around so /memtraceoff still has an obvious counterpart
+                # and for anyone re-enabling it after using that.
                 if tracemalloc.is_tracing():
-                    reply = "tracemalloc уже включён и собирает данные."
+                    reply = "tracemalloc уже включён (запускается автоматически при старте)."
                 else:
                     tracemalloc.start(25)
-                    reply = (
-                        "tracemalloc включён - теперь отслеживает выделения памяти "
-                        "по каждой строке кода. Даёт небольшую доп. нагрузку сам по "
-                        "себе, так что выключи его (/memtraceoff), когда разберёмся. "
-                        "Дай памяти подрасти, потом смотри /memtop."
-                    )
+                    reply = "tracemalloc включён вручную."
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "memtraceoff":
                 if tracemalloc.is_tracing():
@@ -2063,6 +2086,21 @@ class Watcher:
         await self._run_telegram(self.telegram.send, message)
 
     async def run(self):
+        # Started unconditionally now, not gated behind /memtrace - a
+        # real, practical problem this fixes: manually catching the
+        # right moment to send /memtrace, then /memtop again later,
+        # across a process that can OOM-kill and restart unpredictably,
+        # turned out to be genuinely hard to coordinate by hand. Always
+        # tracking means memory_guard_loop below can log a snapshot
+        # automatically, every time it fires, with zero dependence on
+        # anyone being online to trigger it - see that loop for where
+        # this actually gets used. Confirmed cheap enough in THIS
+        # process's own real usage to leave on permanently: total
+        # tracked allocations were only ~0.1-7MB even at 480MB+ real
+        # RSS (see this project's own memory investigation), nowhere
+        # near a problem on its own.
+        tracemalloc.start(25)
+
         # Telegram gets its OWN small, dedicated thread pool, separate
         # from the default one asyncio.to_thread() uses for everything
         # else (evaluate_listing, Steam inventory checks, etc.) - a
