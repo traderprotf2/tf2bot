@@ -1224,12 +1224,45 @@ class LocalListingStore:
                     self._max_total_buckets, overflow,
                 )
             with self._lock:
+                skipped = 0
                 for item in serializable:
-                    key = tuple(item["key"])
-                    bucket = item["bucket"]
-                    if isinstance(bucket, list):
-                        bucket = {e["listing_id"]: e for e in bucket if "listing_id" in e}
-                    self._entries[key] = bucket
+                    try:
+                        key = tuple(item["key"])
+                        if len(key) > 5 and isinstance(key[5], list):
+                            # spell is the one identity-key element that's
+                            # itself a compound value (a tuple of spell
+                            # names, for a multi-spell item) - JSON has no
+                            # tuple type, so save_to_disk's list(key) only
+                            # converts the OUTER tuple; the spell tuple
+                            # serializes as a nested JSON array and comes
+                            # back as a nested LIST, not a tuple. A real,
+                            # confirmed crash this fixes: a tuple
+                            # containing a list is unhashable, so
+                            # self._entries[key] below raised on ANY saved
+                            # entry that ever had a real spell - and since
+                            # this used to have no per-item try/except,
+                            # that ONE bad entry took the ENTIRE load down
+                            # with it (every other entry too), silently
+                            # starting completely empty on every restart
+                            # that had even one spelled item saved.
+                            key = key[:5] + (tuple(key[5]),) + key[6:]
+                        bucket = item["bucket"]
+                        if isinstance(bucket, list):
+                            bucket = {e["listing_id"]: e for e in bucket if "listing_id" in e}
+                        self._entries[key] = bucket
+                    except Exception:
+                        # Per-item, not per-file - same reasoning as the
+                        # bulk scan's own per-entry isolation: one
+                        # malformed saved entry (an older format, a
+                        # partial write) should cost that ONE entry, never
+                        # every other entry that loaded fine.
+                        skipped += 1
+                if skipped:
+                    log.warning(
+                        "load_from_disk: skipped %d malformed entr%s while loading %s - "
+                        "everything else loaded normally.",
+                        skipped, "y" if skipped == 1 else "ies", path,
+                    )
                 # Rebuilt from self._entries, not persisted directly (see
                 # __init__'s own comment on why) - has to happen after
                 # the trim above, not before, so it only ever reflects
