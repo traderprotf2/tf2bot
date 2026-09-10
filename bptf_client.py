@@ -826,7 +826,7 @@ class LocalListingStore:
     asyncio.to_thread(evaluate_listing, ...).
     """
 
-    def __init__(self, max_age_seconds=3600, buy_max_age_seconds=None, max_entries_per_key=50,
+    def __init__(self, max_age_seconds=3600, buy_max_age_seconds=None, max_entries_per_key=10,
                  max_total_buckets=5000):
         # OrderedDict, not a plain dict - move_to_end() in record() below
         # keeps buckets ordered LEAST-recently-updated first, so eviction
@@ -851,17 +851,22 @@ class LocalListingStore:
         # restart: a correctly-persisting store now starts each fresh
         # process already carrying its prior size forward, rather than
         # regrowing from zero - cutting time-to-OOM from 15-90 minutes to
-        # a near-constant ~9-12 minutes. 5,000/50 is smaller by an order
-        # of magnitude, on the same reasoning as before: this is still
-        # just a fixed number with the same blind spot (it only bounds
-        # memory correctly if the bytes-per-entry guess holds), so
-        # main.py's memory_guard_loop remains the real, deployment-
-        # agnostic backstop - it watches the process's ACTUAL RSS
-        # directly and evicts proactively (see evict_coldest_buckets
-        # below), whatever the true ceiling on a given machine turns out
-        # to be. These two constructor caps are a secondary, static bound
-        # underneath that - never the only thing standing between this
-        # store and another OOM kill.
+        # a near-constant ~9-12 minutes. 5,000/10 is smaller still, but
+        # on DIFFERENT reasoning for max_entries_per_key specifically
+        # (max_total_buckets is the same "still just a fixed number, the
+        # real backstop is memory_guard_loop watching actual RSS"
+        # reasoning as always): record() below now trims each bucket by
+        # PRICE, not recency - keeping only the top buy prices and the
+        # bottom sell prices, per intent - and the only thing anything
+        # ever reads from a bucket is its single best buy price
+        # (get_max_buy_price) or single best sell price
+        # (get_min_sell_price). A handful of runners-up per side is
+        # already generous headroom for "the current best gets deleted,
+        # serve the next-best without a live query" - 50 (or the
+        # original 150/300) was never buying any additional correctness
+        # once trimming stopped being able to discard the actual best
+        # price by mistake, only extra memory for alternatives nothing
+        # downstream looks at.
         self._entries = collections.OrderedDict()  # identity_key -> {listing_id: {listing_id, seller_id, price_keys, ts, intent}}
         # listing_id -> identity_key currently holding it - see record()'s
         # own comment for why this exists: without it, a listing whose
@@ -924,12 +929,34 @@ class LocalListingStore:
                 "price_keys": price_keys, "ts": ts, "intent": intent,
             }
             if len(bucket) > self._max_entries_per_key:
-                # Rare (most items never see 300+ distinct fresh
-                # listings) - O(n log n) trim only paid when it happens.
-                oldest_first = sorted(bucket.values(), key=lambda e: e["ts"])
-                for stale in oldest_first[:len(bucket) - self._max_entries_per_key]:
-                    del bucket[stale["listing_id"]]
-                    self._listing_locations.pop(stale["listing_id"], None)
+                # Trims buy and sell SEPARATELY, and by PRICE, not by
+                # recency - a real, confirmed correctness bug this fixes,
+                # not just a memory one: only the single BEST buy order
+                # (the highest price) and the single BEST sell listing
+                # (the lowest price) are ever actually used by anything
+                # that reads this store (get_max_buy_price,
+                # get_min_sell_price) - keeping "whichever 50 are most
+                # RECENT" could (and, by construction, eventually would)
+                # discard the one entry that actually mattered - the
+                # genuinely best price - in favor of newer but WORSE
+                # ones, for no reason at all. Ranking by value instead
+                # means a much smaller max_entries_per_key is not just
+                # safe but strictly MORE correct than a larger
+                # recency-based one ever was: it can never lose the best
+                # price, only the redundant, already-beaten alternatives
+                # behind it (kept only as a fallback for when the current
+                # best gets deleted, so the next-best is already on hand
+                # without waiting on a live query).
+                buys = [e for e in bucket.values() if e["intent"] == "buy"]
+                sells = [e for e in bucket.values() if e["intent"] == "sell"]
+                buys.sort(key=lambda e: e["price_keys"], reverse=True)  # highest kept
+                sells.sort(key=lambda e: e["price_keys"])  # lowest kept
+                keep_ids = {e["listing_id"] for e in buys[:self._max_entries_per_key]}
+                keep_ids.update(e["listing_id"] for e in sells[:self._max_entries_per_key])
+                for stale_id in list(bucket.keys()):
+                    if stale_id not in keep_ids:
+                        del bucket[stale_id]
+                        self._listing_locations.pop(stale_id, None)
             if is_new_bucket and len(self._entries) > self._max_total_buckets:
                 # LRU eviction of a whole bucket, not just entries within
                 # one - see __init__'s own comment for the real incident
