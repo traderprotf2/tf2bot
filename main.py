@@ -1905,56 +1905,68 @@ class Watcher:
             if not text.startswith("/"):
                 return
             command = text.split(maxsplit=1)[0].lower().lstrip("/").split("@")[0]
+            # EVERY command's own work (not just the reply-send) is
+            # dispatched via _run_diagnostics below now, no exceptions -
+            # a real, confirmed pattern: this project found and fixed
+            # this SAME event-loop-blocking risk for one command at a
+            # time (checkitem, then the general stats path, then
+            # memtop) and kept getting a fresh "any command still
+            # freezes the bot" report after each fix, because a handler
+            # that looked obviously fast in isolation (build_main_menu,
+            # _error_buffer.recent()) could still sit behind whatever
+            # else happened to be holding a lock or doing I/O at that
+            # moment, same as the ones already found. Rather than
+            # auditing each remaining handler one at a time again, every
+            # one of them is moved off the event loop now, without
+            # exception - the cost of doing this for a handler that
+            # truly never blocks is negligible; the cost of leaving even
+            # one real blocker unmoved is the whole bot freezing again.
             if command in ("menu", "settings", "start"):
-                menu_text, keyboard = telegram_commands.build_main_menu(self.runtime)
+                menu_text, keyboard = await self._run_diagnostics(
+                    telegram_commands.build_main_menu, self.runtime
+                )
                 await self._run_telegram(self.telegram.send, menu_text, keyboard)
             elif command == "errors":
                 # Sent WITH a keyboard (pagination buttons) - unlike the
                 # other typed commands below, which are plain text.
-                errors_text, keyboard = telegram_commands.build_errors_view(_error_buffer.recent(100))
+                def _build_errors_view():
+                    return telegram_commands.build_errors_view(_error_buffer.recent(100))
+                errors_text, keyboard = await self._run_diagnostics(_build_errors_view)
                 await self._run_telegram(self.telegram.send, errors_text, keyboard)
             elif command == "checkitem":
-                # Dispatched to a thread - a real, confirmed risk found
-                # during a systematic Telegram-load sweep: this scans
-                # self._name_to_identity_keys (now LRU-bounded, see
-                # __init__ - was unbounded in the outer dict when this
-                # comment was first written) AND reads store._entries
-                # directly (bypassing LocalListingStore's own lock
-                # entirely, unlike every other read path in this
-                # project) - both were running synchronously on the
-                # event loop itself, the same event-loop-blocking risk
-                # already fixed for record()/remove_listing() above.
                 reply = await self._run_diagnostics(
                     self._check_item, text.split(maxsplit=1)[1] if " " in text else ""
                 )
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "unknowneffects":
-                reply = self._format_unknown_effects()
+                reply = await self._run_diagnostics(self._format_unknown_effects)
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "memtrace":
                 # tracemalloc now starts automatically at process launch
                 # (see run()) - this command just confirms that, kept
                 # around so /memtraceoff still has an obvious counterpart
                 # and for anyone re-enabling it after using that.
-                if tracemalloc.is_tracing():
-                    reply = "tracemalloc уже включён (запускается автоматически при старте)."
-                else:
+                def _do_memtrace():
+                    if tracemalloc.is_tracing():
+                        return "tracemalloc уже включён (запускается автоматически при старте)."
                     tracemalloc.start(25)
-                    reply = "tracemalloc включён вручную."
+                    return "tracemalloc включён вручную."
+                reply = await self._run_diagnostics(_do_memtrace)
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "memtraceoff":
-                if tracemalloc.is_tracing():
-                    tracemalloc.stop()
-                    reply = "tracemalloc выключен."
-                else:
-                    reply = "tracemalloc и так был выключен."
+                def _do_memtraceoff():
+                    if tracemalloc.is_tracing():
+                        tracemalloc.stop()
+                        return "tracemalloc выключен."
+                    return "tracemalloc и так был выключен."
+                reply = await self._run_diagnostics(_do_memtraceoff)
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "memtop":
                 reply = await self._run_diagnostics(self._format_memtop)
                 await self._run_telegram(self.telegram.send, reply)
             elif command == "setaccounts":
                 raw = text.split(maxsplit=1)[1] if " " in text or "\n" in text else ""
-                reply = self._set_accounts(raw)
+                reply = await self._run_diagnostics(self._set_accounts, raw)
                 await self._run_telegram(self.telegram.send, reply)
             else:
                 # A real, confirmed bug this fixes: the memory-stats
