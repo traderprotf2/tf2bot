@@ -442,14 +442,20 @@ class Watcher:
     # Checking real process RSS directly (not a proxy like bucket count,
     # which only bounds memory correctly if the bytes-per-entry guess
     # happens to hold) is the only check that adapts to whatever RAM a
-    # given machine actually has. 60s interval, not local_store_prune_
-    # loop's 600s - a real, confirmed growth rate on the VPS that
-    # surfaced this (~60MB/minute) would add up to 600MB between two
-    # 600s checks alone, uncomfortably close to the ~1.6GB OOM point
-    # already; 60s leaves ample reaction time under that same rate.
-    MEMORY_GUARD_CHECK_INTERVAL_SECONDS = 60
-    MEMORY_GUARD_RSS_MB = 1000
-    MEMORY_GUARD_EVICT_BUCKETS = 4000
+    # given machine actually has. 30s interval (was 60s) - a real,
+    # confirmed THIRD incident: once load_from_disk was fixed to
+    # actually succeed (see its own history) instead of silently
+    # failing and starting empty every restart, a correctly-persisting
+    # store now carries its prior size forward into each fresh process
+    # instead of regrowing from zero - cutting time-to-OOM from
+    # 15-90 minutes to a near-constant ~9-12 minutes, with growth rates
+    # observed up to ~180MB/minute in the fastest phase. 600MB (was
+    # 1000MB) leaves a full ~1GB of margin below the ~1.64GB ceiling
+    # this VPS repeatably hits, giving real reaction room even at that
+    # faster rate.
+    MEMORY_GUARD_CHECK_INTERVAL_SECONDS = 30
+    MEMORY_GUARD_RSS_MB = 600
+    MEMORY_GUARD_EVICT_BUCKETS = 2000
 
     async def memory_guard_loop(self):
         while True:

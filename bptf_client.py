@@ -826,8 +826,8 @@ class LocalListingStore:
     asyncio.to_thread(evaluate_listing, ...).
     """
 
-    def __init__(self, max_age_seconds=3600, buy_max_age_seconds=None, max_entries_per_key=150,
-                 max_total_buckets=20000):
+    def __init__(self, max_age_seconds=3600, buy_max_age_seconds=None, max_entries_per_key=50,
+                 max_total_buckets=5000):
         # OrderedDict, not a plain dict - move_to_end() in record() below
         # keeps buckets ordered LEAST-recently-updated first, so eviction
         # always drops the coldest bucket first, cheaply (O(1)).
@@ -840,24 +840,28 @@ class LocalListingStore:
         # (181,113 buy orders in 80 minutes) that unbounded growth is
         # what took the whole process down via the OOM killer.
         #
-        # 50,000/300 (this project's ORIGINAL fix for that incident) was
-        # sized as "a fixed ceiling", but never checked against any
-        # particular deployment's actual available RAM - a real, confirmed
-        # second incident: on a small VPS (1.8GB, 0 swap - see `free -h`),
-        # real traffic reliably reached OOM in 15-45 minutes, every run,
-        # clustering tightly around the same ~1.64GB RSS each time (a
-        # repeatable ceiling being hit, not random drift) - nowhere near
-        # what 50,000 buckets could theoretically hold. 20,000/150 is a
-        # more conservative default, but still just a fixed number with
-        # the exact same blind spot: it directly bounds MEMORY only if the
-        # actual bytes-per-entry guess holds, and different deployments
-        # have different RAM. main.py's memory_guard_loop is the real,
-        # deployment-agnostic backstop - it watches the process's ACTUAL
-        # RSS directly and evicts proactively (see evict_coldest_buckets
-        # below) well before any OOM point, whatever that point turns out
-        # to be on a given machine. These two constructor caps remain a
-        # secondary, static bound underneath that - never the only thing
-        # standing between this store and another OOM kill.
+        # 50,000/300, then 20,000/150 (this project's first two attempts
+        # at fixing that incident) were each sized as "a fixed ceiling",
+        # but never checked against any particular deployment's actual
+        # available RAM - a real, confirmed THIRD incident: on a small
+        # VPS (1.8GB, 0 swap - see `free -h`), even 20,000/150 reliably
+        # reached OOM, every run - and got WORSE, not better, once
+        # load_from_disk was fixed to actually succeed (see its own
+        # history) instead of silently failing and starting empty every
+        # restart: a correctly-persisting store now starts each fresh
+        # process already carrying its prior size forward, rather than
+        # regrowing from zero - cutting time-to-OOM from 15-90 minutes to
+        # a near-constant ~9-12 minutes. 5,000/50 is smaller by an order
+        # of magnitude, on the same reasoning as before: this is still
+        # just a fixed number with the same blind spot (it only bounds
+        # memory correctly if the bytes-per-entry guess holds), so
+        # main.py's memory_guard_loop remains the real, deployment-
+        # agnostic backstop - it watches the process's ACTUAL RSS
+        # directly and evicts proactively (see evict_coldest_buckets
+        # below), whatever the true ceiling on a given machine turns out
+        # to be. These two constructor caps are a secondary, static bound
+        # underneath that - never the only thing standing between this
+        # store and another OOM kill.
         self._entries = collections.OrderedDict()  # identity_key -> {listing_id: {listing_id, seller_id, price_keys, ts, intent}}
         # listing_id -> identity_key currently holding it - see record()'s
         # own comment for why this exists: without it, a listing whose
