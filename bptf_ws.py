@@ -105,7 +105,30 @@ async def stream_listing_events(on_event):
             # buy order that updates during that gap is simply never
             # seen), so cutting down on FALSE disconnects directly means
             # fewer missed events, not just fewer log lines.
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=60, max_size=None) as ws:
+            # compression=None disables permessage-deflate entirely - a
+            # real, confirmed finding: tracemalloc (Python's own stdlib
+            # memory profiler, see the /memtop command) showed only ~7MB
+            # tracked while this project's actual process RSS was
+            # climbing into the hundreds of MB / low GB before yet
+            # another OOM kill - meaning the real growth was happening
+            # OUTSIDE anything Python's own allocator (and therefore
+            # tracemalloc) can see at all. zlib - which permessage-
+            # deflate uses under the hood for every compressed frame -
+            # keeps its compression window and internal buffers in raw C
+            # memory, invisible to tracemalloc, and is a well-known real
+            # source of native memory growth on long-lived compressed
+            # connections; every reconnect (and this project forces one
+            # on buffer-limit-exceeded now, see the branch above) is
+            # itself a place old compression state could fail to be
+            # fully released. This project's own traffic (JSON text
+            # events) compresses well, so this trades some bandwidth for
+            # ruling out an entire class of native memory growth
+            # tracemalloc structurally cannot see or help diagnose
+            # further - a worthwhile trade given how much time this
+            # project has already spent chasing OOM incidents blind.
+            async with websockets.connect(
+                WS_URL, ping_interval=20, ping_timeout=60, max_size=None, compression=None
+            ) as ws:
                 log.info("Connected to backpack.tf market stream.")
                 while True:
                     try:
