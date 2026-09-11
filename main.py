@@ -352,23 +352,46 @@ class Watcher:
         First just /memtop: tracemalloc.take_snapshot() can take a long
         time once a lot of allocations are tracked, and dispatching it
         through plain asyncio.to_thread (the same small shared default
-        pool evaluate_listing AND record() use) tied up one of that
-        pool's few threads for the whole duration - a user report of the
-        whole bot lagging for roughly a minute right after sending
-        /memtop.
+        pool evaluate_listing used) tied up one of that pool's few
+        threads for the whole duration - a user report of the whole bot
+        lagging for roughly a minute right after sending /memtop.
 
         Then a second, broader report: EVERY command, not just /memtop,
         freezing the whole bot - because record() (dispatched on every
         single websocket event, at real volume tens of thousands of
-        times a session) shares that exact same default pool too. Under
-        load, a command's own to_thread dispatch could queue behind a
-        backlog of pending record() calls before it even started
-        running, regardless of how fast the command's own work was.
-        Moving ALL command work here, not just /memtop, is what actually
-        closes that - the same class of problem _telegram_executor and
-        _proactive_executor already exist to prevent, just not yet
-        extended to cover general command dispatch too."""
+        times a session) shared that exact same default pool too, before
+        it got its own dedicated executor (see self._record_executor in
+        run()). Moving ALL command work here, not just /memtop, is what
+        actually closes that - the same class of problem
+        _telegram_executor, _proactive_executor, and _record_executor
+        already exist to prevent, just not yet extended to cover general
+        command dispatch too."""
         executor = getattr(self, "_diagnostics_executor", None)
+        if executor is None:
+            return await asyncio.to_thread(func, *args)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(executor, func, *args)
+
+    async def _run_record(self, func, *args):
+        """Same pattern as _run_telegram/_run_proactive/_run_diagnostics
+        above, for LocalListingStore.record() specifically - a real,
+        confirmed finding from this project's own automatic tracemalloc
+        logging (see memory_guard_loop): ~190MB was found sitting in
+        json's own decoder (parsed websocket event payloads), together
+        with meaningful memory at bptf_ws.py's own task-dispatch and
+        semaphore-wait lines - meaning events were being CREATED (each
+        holding its own parsed payload alive via its pending task/
+        coroutine frame) faster than they could make it through
+        handle_bptf_event's own record() dispatch and actually finish,
+        at real sustained volume (tens of thousands of events/session).
+        record() itself is fast (one lock, one dict write) - the
+        backlog was queuing for a THREAD in the same small shared
+        default pool evaluate_listing (much heavier - the full
+        discount-comparison pipeline) also competes for. A dedicated,
+        generously-sized pool here (record() needs many quick slots to
+        drain a high-volume queue, not few slow ones) is a direct fix
+        for the backlog itself, not just a symptom of it."""
+        executor = getattr(self, "_record_executor", None)
         if executor is None:
             return await asyncio.to_thread(func, *args)
         loop = asyncio.get_running_loop()
@@ -551,7 +574,25 @@ class Watcher:
     # no real benefit, rather than correctly idling until a refresh is
     # genuinely due. 30 minutes comfortably keeps every item far fresher
     # than LocalListingStore's own multi-hour trust windows need.
-    PROACTIVE_MIN_REFRESH_INTERVAL_SECONDS = 1800
+    # Flat interval for every watched item, no liquidity-based scaling -
+    # per explicit request: adaptive scaling (30min-12h based on how
+    # many buy orders a scan recorded) was tried first, but most
+    # individual Unusual effects are thin markets by nature (few buy
+    # orders each), so most scan traffic stayed at the frequent end
+    # regardless - not the load reduction actually wanted. A flat 12h
+    # (was 30min) is simpler AND matches how this project's own user
+    # actually uses these alerts: every notification gets manually
+    # re-verified on backpack.tf before acting, regardless of what this
+    # store says - a stale top offer costs nothing (never acted on
+    # blind), and what matters is "priced well relative to recent market
+    # data", not a live-verified, guaranteed-still-standing flip.
+    # Individual items still refresh spread out over time, not all at
+    # once - see _proactive_unusual_refresh_worker below: each item has
+    # its own last-scanned timestamp, and N workers always pick the
+    # single MOST OVERDUE one next, so refreshes land continuously
+    # throughout each 12h window as items individually become due,
+    # never as one big periodic batch.
+    PROACTIVE_MIN_REFRESH_INTERVAL_SECONDS = 43200
 
     # How to react to fetch_and_record_all_listings returning None -
     # backpack.tf's snapshot for that SKU was still being generated
@@ -1817,13 +1858,15 @@ class Watcher:
                 oldest_key = next(iter(self._known_scan_items))
                 del self._known_scan_items[oldest_key]
             self._known_scan_items[scan_key] = {"ts": 0.0, "category": category}
-        # Dispatched to a thread, not called directly on the event loop -
-        # record() takes a plain threading.Lock shared with every
-        # evaluate_listing() read too, and this function runs directly
-        # on the asyncio event loop - if that lock were ever held by a
-        # worker thread, this call would block the WHOLE event loop
-        # (including Telegram's own command dispatch) waiting for it.
-        await asyncio.to_thread(
+        # Dispatched to its own DEDICATED thread pool (_run_record, see
+        # its own docstring) - record() takes a plain threading.Lock
+        # shared with every evaluate_listing() read too, and this
+        # function runs directly on the asyncio event loop, so a plain
+        # asyncio.to_thread (the small shared default pool) risked
+        # blocking on that lock, AND (the confirmed real incident) risked
+        # queuing behind evaluate_listing's own heavier work under
+        # sustained high event volume, letting parsed payloads pile up.
+        await self._run_record(
             self.bptf.local_listings.record,
             identity_key, str(listing_id), seller_steamid, price_keys, intent,
         )
@@ -2017,7 +2060,8 @@ class Watcher:
                 # is what actually moves the lock-waiting off the event
                 # loop.
                 def _build_command_reply():
-                    return telegram_commands.handle_command(
+                    categories_before = set(self.runtime.watched_categories)
+                    reply = telegram_commands.handle_command(
                         text, self.runtime,
                         stats=self.stats, stats_since=self.stats_since,
                         currently_rate_limited=bptf_client.is_rate_limited(),
@@ -2026,6 +2070,15 @@ class Watcher:
                         rss_mb=_current_rss_mb(),
                         name_cache_count=len(self._name_to_identity_keys),
                     )
+                    # See _purge_category_data's own docstring - same
+                    # immediate purge as the menu button's own category
+                    # toggle, for the typed /category command path too.
+                    removed_categories = categories_before - set(self.runtime.watched_categories)
+                    for category in removed_categories:
+                        purged = self._purge_category_data(category)
+                        log.info("Category %r unwatched via /category - purged %d item(s) from the store.",
+                                  category, purged)
+                    return reply
                 reply = await self._run_diagnostics(_build_command_reply)
                 log.info("Telegram command: %r -> %s", text, reply.splitlines()[0])
                 await self._run_telegram(self.telegram.send, reply)
@@ -2037,15 +2090,54 @@ class Watcher:
                     self.stats_since = time.time()
 
         elif event["type"] == "callback_query":
-            menu_text, keyboard = telegram_commands.handle_callback(
-                event["data"], self.runtime, error_entries=_error_buffer.recent(100)
-            )
+            # Moved off the event loop (was synchronous, direct on it) -
+            # same reasoning as every other command handler in this
+            # function: handle_callback reads _error_buffer (its own
+            # lock, however briefly held) and, for a category toggle
+            # specifically, now also triggers an immediate store purge
+            # (see _purge_category_data) - neither belongs running
+            # directly on the event loop, consistent with every text
+            # command already moved here.
+            def _build_callback_reply():
+                categories_before = set(self.runtime.watched_categories)
+                menu_text, keyboard = telegram_commands.handle_callback(
+                    event["data"], self.runtime, error_entries=_error_buffer.recent(100)
+                )
+                removed_categories = categories_before - set(self.runtime.watched_categories)
+                for category in removed_categories:
+                    purged = self._purge_category_data(category)
+                    log.info("Category %r unwatched via button - purged %d item(s) from the store.",
+                              category, purged)
+                return menu_text, keyboard
+            menu_text, keyboard = await self._run_diagnostics(_build_callback_reply)
             log.info("Telegram button: %r", event["data"])
             # Answer first so Telegram clears the button's loading spinner
             # even if the edit below is slow or fails.
             await self._run_telegram(self.telegram.answer_callback_query, event["id"])
             if event["message_id"] is not None:
                 await self._run_telegram(self.telegram.edit_message, event["message_id"], menu_text, keyboard)
+
+    def _purge_category_data(self, category: str) -> int:
+        """Called right after a category gets unwatched (see the two
+        call sites below - the typed /category command and the menu
+        button toggle) - immediately removes every item of that
+        category from BOTH _known_scan_items (so the proactive scanner
+        stops trying to refresh it at all) AND LocalListingStore (so its
+        already-recorded buy/sell data doesn't just sit there quietly
+        aging out over the next 12h+ instead of actually being gone).
+        Explicit request: data for something no longer tracked at all
+        shouldn't outlive its own relevance. Runs synchronously - called
+        from a thread already (see both call sites), never from the
+        event loop directly, so blocking here on LocalListingStore's own
+        lock is fine. Returns how many items were purged, for the
+        caller's own log line."""
+        purged = 0
+        for scan_key in [k for k, v in self._known_scan_items.items() if v["category"] == category]:
+            item_name, _item_quality = scan_key
+            self.bptf.local_listings.remove_all_for_name(item_name)
+            del self._known_scan_items[scan_key]
+            purged += 1
+        return purged
 
     async def _startup_sanity_check(self):
         """
@@ -2146,7 +2238,6 @@ class Watcher:
         proactive_worker_count = 1 + len(self.cfg.get("backpacktf_accounts") or [])
         self._proactive_executor = concurrent.futures.ThreadPoolExecutor(max_workers=proactive_worker_count)
 
-        # See _run_diagnostics' own docstring for the real report this
         # See _run_diagnostics' own docstring for the real reports this
         # isolates against (a ~1 minute /memtop-only lag, then a second,
         # broader "every command freezes the bot" report once general
@@ -2154,6 +2245,16 @@ class Watcher:
         # these are on-demand, human-paced commands, never more than one
         # or two in flight at once.
         self._diagnostics_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
+        # See _run_record's own docstring for the real, confirmed finding
+        # this isolates against (~190MB sitting in json's own decoder -
+        # parsed event payloads kept alive by a growing backlog of
+        # pending record() calls, all queuing for threads in the same
+        # small shared default pool evaluate_listing also uses).
+        # Generously sized - record() itself is fast, this pool exists
+        # to drain a high-volume queue quickly, not to bound concurrency
+        # tightly the way the others above do.
+        self._record_executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 
         # Restores whatever the local listing store had saved before -
         # comparison data available, not an empty store. Cleans up any

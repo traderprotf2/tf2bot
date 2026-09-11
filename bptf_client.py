@@ -992,6 +992,27 @@ class LocalListingStore:
             for bucket in self._entries.values():
                 bucket.pop(listing_id, None)
 
+    def remove_all_for_name(self, name):
+        """Removes every bucket for this item name, across ALL its
+        variants (every quality, particle effect, paint, spell, etc. -
+        whatever's in identity_key[0]) - called when a whole item stops
+        being watched at all (a category gets unwatched, see main.py's
+        _purge_category_data), not on any single listing's own
+        lifecycle the way remove_listing above is. Immediate, not a
+        wait-for-it-to-age-out - a real, explicit request: data for
+        something no longer being tracked shouldn't just quietly outlive
+        its own relevance until prune_expired or the memory guard
+        eventually gets to it. Returns how many buckets were removed,
+        for the caller's own logging."""
+        removed = 0
+        with self._lock:
+            for key in [k for k in self._entries if k[0] == name]:
+                bucket = self._entries.pop(key)
+                for listing_id in bucket:
+                    self._listing_locations.pop(listing_id, None)
+                removed += 1
+        return removed
+
     def bucket_count(self):
         """Number of distinct identity-key buckets currently held - see
         main.py's memory_guard_loop and /stats, which surface this so a
@@ -1372,13 +1393,19 @@ class BackpackTFPriceList:
         # pattern that caused a real OOM kill elsewhere in this project.
         self._history_cache_max_entries = 20000
         self.local_listings = LocalListingStore()
-        # Logs at most ONE raw sample of a bulk-scan entry that has no
-        # resolvable particle_id, across this process's whole lifetime -
-        # see fetch_and_record_all_listings' own diagnostic
-        # comment for why. One real sample is enough to check a field-
-        # name assumption against; a warning on every one of potentially
-        # thousands of scans would just spam the log for no extra value.
-        self._bulk_scan_sample_logged = False
+        # Logs up to MAX_BULK_SCAN_SAMPLES raw samples of a bulk-scan
+        # entry that has no resolvable particle_id, across this process's
+        # whole lifetime - see fetch_and_record_all_listings' own
+        # diagnostic comment for why. Was capped at exactly ONE ever - a
+        # real, confirmed blind spot this fixes: once any single item hit
+        # this path, every OTHER item's own unresolvable entries (a real,
+        # reported one: a specific effect on a specific hat with a real,
+        # confirmed live buy order that never made it into this store)
+        # went completely unlogged for the rest of that process's life,
+        # with nothing distinguishing "resolved fine" from "silently
+        # dropped, but the one free sample was already spent elsewhere."
+        self._bulk_scan_sample_logged = 0
+        self.MAX_BULK_SCAN_SAMPLES = 30
 
     def refresh(self):
         log.info("Refreshing backpack.tf price list...")
@@ -1631,7 +1658,6 @@ class BackpackTFPriceList:
             return 0
 
         recorded = 0
-        sample_logged = False
         for i, entry in enumerate(listings):
             if not isinstance(entry, dict) or entry.get("intent") != intent:
                 continue
@@ -1674,22 +1700,29 @@ class BackpackTFPriceList:
                 # silently recorded nothing at all for every non-Unusual
                 # quality).
                 if quality_name == "Unusual" and particle_id is None:
-                    if not sample_logged and not self._bulk_scan_sample_logged:
+                    if self._bulk_scan_sample_logged < self.MAX_BULK_SCAN_SAMPLES:
                         # Diagnostic sample - a real, confirmed case: the
                         # response CAN be a valid list (no "unexpected
-                        # shape" warning fires) while every entry still
-                        # fails to record anything, if this project's
-                        # field-name assumptions about EACH entry's own
-                        # structure (not the outer response) are wrong.
-                        # One real, raw sample makes that visible instead
-                        # of silently recording zero forever with no
-                        # error anywhere.
+                        # shape" warning fires) while individual entries
+                        # still fail to record anything, if this
+                        # project's field-name assumptions about THAT
+                        # entry's own structure (not the outer response)
+                        # are wrong for some real, live listings but not
+                        # others (a real, confirmed report: a specific
+                        # effect on a specific hat, with a real, live buy
+                        # order confirmed present on backpack.tf itself,
+                        # that this store never recorded at all). Several
+                        # real samples, not just one, make that kind of
+                        # partial, item-specific failure visible instead
+                        # of silently recording zero for JUST that one
+                        # entry, indistinguishable from every OTHER
+                        # already-resolved-fine entry in the same
+                        # response.
                         log.warning(
                             "DIAGNOSTIC SAMPLE (bulk %s scan entry with no resolvable particle_id) "
                             "for %s - raw entry: %r", intent, name, entry,
                         )
-                        sample_logged = True
-                        self._bulk_scan_sample_logged = True
+                        self._bulk_scan_sample_logged += 1
                     continue
                 user_obj = entry.get("user")
                 if not isinstance(user_obj, dict):
@@ -1894,19 +1927,40 @@ class BackpackTFPriceList:
                 "quality": QUALITY_NAME_TO_ID.get(quality_name), "intent": "buy",
             }
             # timeout kept short (5s, not the usual 15-20s elsewhere in
-            # this file) - a real, confirmed case: this call runs inside
-            # evaluate_listing, itself dispatched via asyncio.to_thread's
-            # small, SHARED default thread pool - a slow/hanging request
-            # here ties up one of that pool's few threads for the full
-            # duration, and enough of these piling up (Unusual items are
-            # unconditionally "priority", so this can fire often) was
-            # observed starving everything else sharing that same pool,
-            # including Telegram responsiveness. A live buy order that
-            # takes this long to answer isn't worth blocking a thread
-            # for anyway - the local-store value remains the fallback.
-            resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=5, treat_missing_listings_as_rate_limit=True)
-            resp.raise_for_status()
-            data = resp.json()
+            # this file) - this call runs inside evaluate_listing, itself
+            # dispatched via asyncio.to_thread. record() (this project's
+            # highest-frequency user of that same shared default pool)
+            # has since moved to its own dedicated executor (see main.py's
+            # _run_record) - the ORIGINAL reason this function had zero
+            # retries at all (a slow request here starving that shared
+            # pool, Telegram included) no longer applies, so ONE short,
+            # bounded retry is added below specifically for the known
+            # "snapshot job just queued, not ready yet" shape - a real,
+            # confirmed cost of never retrying here: a real, live,
+            # confirmed-on-backpack.tf-itself buy order (a specific
+            # Unusual effect, seen missing from this project's own store)
+            # never got recorded ANYWHERE for that exact effect - not by
+            # the live event stream (no matching "listing-update" event
+            # happened to arrive during this process's uptime) and not by
+            # the periodic bulk scan (same "cold snapshot" shape hits
+            # that path too, hence its own retry - see fetch_and_record_
+            # all_listings) - THIS single-shot live query was the last
+            # remaining path with no retry at all, for exactly the
+            # highest-priority case (every Unusual sell listing routes
+            # through it whenever the local store has nothing cached
+            # yet). One retry, not the bulk scanner's two - this path is
+            # latency-sensitive (a live user-facing alert decision is
+            # waiting on it), so it stays bounded tighter.
+            data = None
+            for attempt in range(2):
+                resp = _get_with_retry(self.session, SNAPSHOT_URL, params, timeout=5, treat_missing_listings_as_rate_limit=True)
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, dict) and "listings" not in data and "createdAt" in data:
+                    if attempt == 0:
+                        time.sleep(3)
+                        continue
+                break
         except Exception:
             log.warning("Live snapshot buy-order query failed for %s - falling back to local store only.", name)
             return None, 0
