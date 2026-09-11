@@ -62,12 +62,26 @@ RECONNECT_DELAY_SECONDS = 5
 IDLE_TIMEOUT_SECONDS = 300
 
 
-async def stream_listing_events(on_event):
+async def stream_listing_events(on_event, on_drop=None):
     """
     Connects to backpack.tf's market stream forever, calling
     `on_event(payload_dict)` for every active TF2 'sell' listing-update.
     Automatically reconnects on any connection drop OR if the connection
     goes idle for IDLE_TIMEOUT_SECONDS.
+
+    on_drop(payload_dict), if given, is called for a SELL event (or a
+    delete) specifically dropped because the dispatch backlog was
+    completely full (see _spawn_dispatch's own comments) - NOT for a
+    dropped buy event, which main.py's own proactive scanner already
+    re-covers on its normal schedule regardless (a fresh, complete
+    snapshot each cycle, not an incremental catch-up), so flagging those
+    individually would add complexity without adding anything the
+    scanner wasn't already going to do. A dropped sell event is
+    different: it's what an actual alert would have come from, and by
+    design this only fires in the rare case that even the buy-side
+    reserve wasn't enough headroom - see on_drop's caller in main.py for
+    what it actually does with this (an accelerated re-scan of that one
+    item, rather than waiting out its normal interval).
 
     max_size=None (no cap) on the connection - confirmed via a real
     production log that backpack.tf sends batched messages over 1 MiB
@@ -165,7 +179,7 @@ async def stream_listing_events(on_event):
                             # shape alone.
                             delete_payload = e.get("payload") or {}
                             delete_payload["_bptf_event_type"] = "delete"
-                            _spawn_dispatch(on_event, delete_payload)
+                            _spawn_dispatch(on_event, delete_payload, on_drop)
                             continue
                         if event_type == "buffer-limit-exceeded":
                             # Real, documented backpack.tf event (their own
@@ -239,7 +253,7 @@ async def stream_listing_events(on_event):
                             continue
                         if payload.get("status") not in (None, "active"):
                             continue
-                        _spawn_dispatch(on_event, payload)
+                        _spawn_dispatch(on_event, payload, on_drop)
 
                     if force_reconnect:
                         break
@@ -280,6 +294,20 @@ _dispatch_semaphore = asyncio.Semaphore(60)
 # project kept observing: the WHOLE process OOM-killed, losing every
 # event, not just the overflow.
 MAX_PENDING_DISPATCH_TASKS = 300
+# Reserved headroom for sell events (and deletes) specifically, once the
+# backlog gets deep - per explicit request: buy-intent events are far
+# higher volume (this project's own /stats: buy-order counts routinely
+# run 5-10x sell counts) and lower urgency (they feed the local price
+# reference, refreshed independently by the proactive scanner too), while
+# sell events are what an actual alert comes from - losing THOSE under
+# pressure is a direct, felt loss (a missed deal) in a way a dropped buy
+# update mostly isn't. Below this lower threshold, buy events are ALSO
+# still accepted normally; only once the backlog is already this deep do
+# buy events start getting turned away first, preserving the remaining
+# room up to the full cap for sell events (and deletes, which matter for
+# correctness - an unprocessed delete could leave a stale, already-sold
+# listing looking live) specifically.
+BUY_DISPATCH_RESERVE_THRESHOLD = 250
 _dispatch_overflow_last_logged = 0.0
 _DISPATCH_OVERFLOW_LOG_INTERVAL_SECONDS = 60
 
@@ -296,17 +324,48 @@ _DISPATCH_OVERFLOW_LOG_INTERVAL_SECONDS = 60
 _background_tasks = set()
 
 
-def _spawn_dispatch(on_event, payload):
+def _log_dispatch_overflow():
+    """Shared, rate-limited warning for both overflow paths in
+    _spawn_dispatch below (the hard cap, and the buy-specific reserve
+    threshold) - one shared cooldown, not two independent ones, so a
+    dropped buy event followed shortly by a dropped sell event still
+    only logs once per _DISPATCH_OVERFLOW_LOG_INTERVAL_SECONDS window,
+    not once per reason."""
     global _dispatch_overflow_last_logged
-    if len(_background_tasks) >= MAX_PENDING_DISPATCH_TASKS:
-        now = time.time()
-        if now - _dispatch_overflow_last_logged >= _DISPATCH_OVERFLOW_LOG_INTERVAL_SECONDS:
-            log.warning(
-                "Dispatch backlog hit its %d-task cap - dropping new events until it drains "
-                "(processing genuinely isn't keeping up with arrival rate right now).",
-                MAX_PENDING_DISPATCH_TASKS,
-            )
-            _dispatch_overflow_last_logged = now
+    now = time.time()
+    if now - _dispatch_overflow_last_logged >= _DISPATCH_OVERFLOW_LOG_INTERVAL_SECONDS:
+        log.warning(
+            "Dispatch backlog under pressure (cap %d, buy reserve threshold %d) - dropping "
+            "some new events until it drains (processing genuinely isn't keeping up with "
+            "arrival rate right now).",
+            MAX_PENDING_DISPATCH_TASKS, BUY_DISPATCH_RESERVE_THRESHOLD,
+        )
+        _dispatch_overflow_last_logged = now
+
+
+def _spawn_dispatch(on_event, payload, on_drop=None):
+    backlog_size = len(_background_tasks)
+    # is_high_priority: sell events (what an alert actually comes from)
+    # and deletes (correctness - a stale listing looking live if its own
+    # delete never gets processed) - everything else (buy updates) is
+    # the lower-priority majority this reserve protects against. See
+    # BUY_DISPATCH_RESERVE_THRESHOLD's own comment for the reasoning.
+    is_high_priority = payload.get("intent") == "sell" or payload.get("_bptf_event_type") == "delete"
+    if backlog_size >= MAX_PENDING_DISPATCH_TASKS:
+        _log_dispatch_overflow()
+        # Only high-priority (sell/delete) drops get flagged for an
+        # accelerated re-scan - see stream_listing_events' own docstring
+        # on on_drop for why a dropped BUY event deliberately does NOT
+        # trigger this (the scanner already re-covers it on its own
+        # schedule regardless, so there's nothing extra to catch up on).
+        if is_high_priority and on_drop is not None:
+            try:
+                on_drop(payload)
+            except Exception:
+                log.exception("on_drop callback failed for a dropped high-priority event.")
+        return
+    if not is_high_priority and backlog_size >= BUY_DISPATCH_RESERVE_THRESHOLD:
+        _log_dispatch_overflow()
         return
     task = asyncio.create_task(_dispatch_event(on_event, payload))
     _background_tasks.add(task)

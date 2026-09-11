@@ -1345,6 +1345,36 @@ class Watcher:
         if identity_key in name_keys_set or len(name_keys_set) < self.MAX_IDENTITY_KEYS_PER_NAME:
             name_keys_set.add(identity_key)
 
+    def _on_dropped_sell_event(self, payload: dict):
+        """Called by bptf_ws.stream_listing_events (as on_drop) when a
+        sell event (or a delete) is dropped because the dispatch backlog
+        was completely full - see that function's own docstring for why
+        this is scoped to sell/delete specifically, never buy. Flags the
+        item for an accelerated re-scan (resets its known-scan-items
+        timestamp to make it immediately eligible) rather than letting
+        it wait out its normal ~12h interval - a dropped sell event is
+        what an actual alert would have come from, so catching up on it
+        sooner has real value, unlike a dropped buy event (already
+        covered by the scanner's own normal schedule regardless).
+        Deliberately synchronous and cheap (one dict lookup, no lock, no
+        I/O) - called directly on the event loop from bptf_ws, same as
+        this project's other genuinely-fast synchronous callbacks, not
+        routed through to_thread/_run_diagnostics the way slower work
+        is."""
+        try:
+            item = bptf_client.safe_dict(payload.get("item"))
+            quality_obj = bptf_client.safe_dict(item.get("quality"))
+            quality = quality_obj.get("name")
+            name = item.get("name") or item.get("marketName") or item.get("baseName")
+            if not name or not quality:
+                return
+            scan_key = (name, quality)
+            if scan_key in self._known_scan_items:
+                self._known_scan_items[scan_key]["ts"] = 0.0
+                log.info("Dropped sell event for %r - flagged for an accelerated re-scan.", name)
+        except Exception:
+            log.exception("_on_dropped_sell_event failed.")
+
     async def handle_bptf_event(self, payload: dict):
         if payload.get("_bptf_event_type") == "delete":
             # Processed regardless of pause state - keeping the local
@@ -2319,7 +2349,7 @@ class Watcher:
             self.local_store_snapshot_loop(),
             self.proactive_buy_order_refresh_loop(),
             self._delayed_startup_sanity_check(),
-            bptf_ws.stream_listing_events(self.handle_bptf_event),
+            bptf_ws.stream_listing_events(self.handle_bptf_event, on_drop=self._on_dropped_sell_event),
         )
         shutdown_waiter = asyncio.create_task(shutdown_event.wait())
 
