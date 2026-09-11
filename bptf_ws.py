@@ -43,6 +43,7 @@ see bptf_listener.py's DEBUG logging if something looks off.
 import asyncio
 import json
 import logging
+import time
 
 import websockets
 
@@ -257,6 +258,31 @@ async def stream_listing_events(on_event):
 # arriving in one batch spinning up thousands of simultaneous tasks.
 _dispatch_semaphore = asyncio.Semaphore(60)
 
+# Hard cap on TOTAL pending dispatch tasks, not just the semaphore's own
+# "60 running at once" - a real, confirmed gap the semaphore alone left
+# open: it bounds how many _dispatch_event calls actively RUN at a time,
+# but nothing bounded how many could be QUEUED waiting for a semaphore
+# slot to free up. Every queued-but-not-yet-run task keeps its own
+# parsed event payload alive (via _background_tasks' own strong
+# reference below, and the task's own coroutine frame) for as long as
+# it waits - and under sustained real event volume, this project's own
+# automatic tracemalloc logging (see main.py's memory_guard_loop) kept
+# finding ~190MB sitting in json's own decoder, tied to exactly this
+# queuing, even AFTER record() (the highest-frequency consumer inside
+# each handler) got its own dedicated thread pool - meaning the backlog
+# was forming here, before record() is ever reached, not inside it.
+# 300 (5x the semaphore's own concurrency) gives real buffering room for
+# a legitimate short burst without ever letting the queue itself become
+# unbounded - past that, an event is dropped (logged, rate-limited so
+# the drop itself can't also become a memory/log-spam problem) rather
+# than accepted into an ever-growing backlog. A dropped event is a real,
+# missed listing - a strictly better trade than the alternative this
+# project kept observing: the WHOLE process OOM-killed, losing every
+# event, not just the overflow.
+MAX_PENDING_DISPATCH_TASKS = 300
+_dispatch_overflow_last_logged = 0.0
+_DISPATCH_OVERFLOW_LOG_INTERVAL_SECONDS = 60
+
 # Holds a strong reference to every task created via _spawn_dispatch
 # below, for as long as it's running - a real, confirmed Python pitfall
 # found during a systematic sweep of files this project hadn't audited
@@ -271,6 +297,17 @@ _background_tasks = set()
 
 
 def _spawn_dispatch(on_event, payload):
+    global _dispatch_overflow_last_logged
+    if len(_background_tasks) >= MAX_PENDING_DISPATCH_TASKS:
+        now = time.time()
+        if now - _dispatch_overflow_last_logged >= _DISPATCH_OVERFLOW_LOG_INTERVAL_SECONDS:
+            log.warning(
+                "Dispatch backlog hit its %d-task cap - dropping new events until it drains "
+                "(processing genuinely isn't keeping up with arrival rate right now).",
+                MAX_PENDING_DISPATCH_TASKS,
+            )
+            _dispatch_overflow_last_logged = now
+        return
     task = asyncio.create_task(_dispatch_event(on_event, payload))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
