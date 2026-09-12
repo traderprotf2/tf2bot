@@ -754,31 +754,21 @@ class Watcher:
         error_log.py) - not a routine "all good" check-in, which would
         just be noise.
 
-        When the threshold is crossed, this PAUSES deal alerts (the same
-        /pause a person can trigger by hand) rather than stopping the
-        process - a full stop risks systemd just restarting it (defeating
-        the point) and misses real, time-sensitive deals while down.
-        Pausing keeps monitoring alive in the background and is fully
-        reversible with /resume once /errors has been checked.
+        NEVER pauses deal alerts by itself (it used to - see git history
+        for that removed behavior). Per explicit request, after the
+        config-based threshold meant to fix repeated false auto-pauses
+        (raised from 5 to 1000) still didn't take effect on a real
+        deployment - the config value evidently wasn't what was actually
+        taking effect there, and rather than keep debugging config
+        loading, the auto-pause CAPABILITY itself is removed from the
+        code entirely here, so it can no longer misfire regardless of
+        what any config file says. This is now purely informational:
+        the message still fires so a genuine spike is still visible, but
+        alerts themselves are never touched.
         """
         last_error_count = _error_buffer.total_emitted
         interval_seconds = self.cfg.get("health_check_interval_minutes", 180) * 60
-        # Default raised from 5 - a real, confirmed miscalibration: this
-        # threshold predates two now-routine, expected warning sources
-        # (the dispatch backlog's own safety valve in bptf_ws.py, and
-        # backpack.tf's "snapshot job just queued" response shape) that
-        # together produce 150-350+ warnings in a normal, healthy
-        # 180-minute window on their own - meaning the OLD threshold of
-        # 5 triggered on essentially every single cycle regardless of
-        # whether anything was actually wrong, auto-pausing real alerts
-        # on pure noise. 1000 sits comfortably above that normal range
-        # while still catching a genuine anomaly (a real bug spamming
-        # errors far past ordinary volume). This is only the CODE
-        # default - if health_check_error_threshold is already set
-        # explicitly in config.json, that value wins; update it there
-        # too if it's still 5 or similarly low.
         threshold = self.cfg.get("health_check_error_threshold", 1000)
-        auto_pause = self.cfg.get("health_check_auto_pause", True)
         while True:
             await asyncio.sleep(interval_seconds)
             try:
@@ -787,24 +777,15 @@ class Watcher:
                     current_errors = _error_buffer.recent(1000)
                     recent_messages = [e["message"][:150] for e in current_errors]
                     summary = "\n".join(f"• {m}" for m in recent_messages[-5:])
-                    pause_note = ""
-                    if auto_pause and not self.runtime.paused:
-                        self.runtime.paused = True
-                        self.runtime.save()
-                        pause_note = (
-                            "\n\n⏸ <b>Уведомления о сделках приостановлены</b>, чтобы это точно "
-                            "не потерялось - мониторинг продолжает работать в фоне. Посмотри /errors "
-                            "и напиши, что нашлось - или просто /resume, если показалось лишним."
-                        )
                     await asyncio.to_thread(
                         self.telegram.send,
                         f"⚠️ <b>За последние {interval_seconds // 60:.0f} мин. накопилось "
-                        f"{new_error_count} предупреждений/ошибок</b>.\n\nПоследние:\n{summary}"
-                        f"{pause_note}",
+                        f"{new_error_count} предупреждений/ошибок</b>.\n\nПоследние:\n{summary}",
                     )
                 last_error_count = _error_buffer.total_emitted
             except Exception:
                 log.exception("Health check loop itself failed - continuing anyway.")
+
     def _build_alert_keyboard(self, deal: dict):
         """
         Inline URL buttons for the alert (Trade/Buy, classifieds search)
