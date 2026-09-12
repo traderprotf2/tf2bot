@@ -1758,7 +1758,36 @@ class BackpackTFPriceList:
                 # that specific buy order's own next websocket event -
                 # "a later real event corrects it" doesn't hold for a
                 # long time if that later event may not come for hours.
-                entry_name = item.get("name") or name
+                #
+                # NOT "or name" (the outer query name) when this entry's
+                # own item.name is missing - a real, confirmed bug this
+                # fixes: strip_variant_prefixes above deliberately strips
+                # "Non-Craftable " (and killstreak-tier/Australium)
+                # BEFORE it ever becomes the sku sent to backpack.tf (see
+                # that function's own docstring - those are separate
+                # filter params for OTHER endpoints, not this one), so
+                # THIS endpoint's response is a MIX of every craftable
+                # status for that name, not scoped to whatever the outer
+                # scan happened to be called with. A confirmed real
+                # report: a Non-Craftable, spelled item's own alert
+                # showed a Craftable, spell-less buy order instead - a
+                # buy order whose own entry evidently had no name field
+                # of its own, silently defaulting to whatever the OUTER
+                # scan's name implied instead of this entry's real,
+                # different craftable status. Skipped (like an
+                # unresolvable particle_id above) rather than guessed -
+                # an entry too ambiguous to place correctly is worse than
+                # not recording it at all.
+                if not item.get("name"):
+                    if self._bulk_scan_sample_logged < self.MAX_BULK_SCAN_SAMPLES:
+                        log.warning(
+                            "DIAGNOSTIC SAMPLE (bulk %s scan entry with no per-entry name - "
+                            "craftable status can't be determined reliably) for %s - raw entry: %r",
+                            intent, name, entry,
+                        )
+                        self._bulk_scan_sample_logged += 1
+                    continue
+                entry_name = item.get("name")
                 craftable = not entry_name.startswith("Non-Craftable ")
                 killstreaker_obj = item.get("killstreaker")
                 if not isinstance(killstreaker_obj, dict):
@@ -2013,7 +2042,22 @@ class BackpackTFPriceList:
                     entry_particle = safe_dict(item.get("particle")).get("id")
                     if entry_particle != particle_id:
                         continue
-                entry_name = item.get("name") or ""
+                # Entries with no per-entry item.name at all are skipped
+                # outright (same reasoning as fetch_and_record_all_
+                # listings' own identical fix) rather than defaulting
+                # craftable to True via an empty-string startswith check -
+                # that default silently REJECTED a genuinely non-craftable
+                # match here (this function compares against a specific
+                # target craftable value, unlike the bulk scan's own
+                # version of this bug, which silently ACCEPTED a wrong
+                # one) whenever the one entry that actually matched
+                # happened to lack its own name field. Skipping is
+                # symmetric with that same fix: an entry too ambiguous to
+                # place correctly is worse to guess about than to leave
+                # out, whichever direction the guess would have gone.
+                entry_name = item.get("name")
+                if not entry_name:
+                    continue
                 entry_craftable = not entry_name.startswith("Non-Craftable ")
                 if bool(craftable) != entry_craftable:
                     continue
