@@ -18,7 +18,7 @@
   "australium_only": false,
   "min_profit_keys": 1.0,
   "health_check_interval_minutes": 180,
-  "health_check_error_threshold": 5,
+  "health_check_error_threshold": 1000,
   "health_check_auto_pause": true,
   "max_days_since_price_update": 90,
   "fetch_price_history_data": false,

@@ -763,7 +763,21 @@ class Watcher:
         """
         last_error_count = _error_buffer.total_emitted
         interval_seconds = self.cfg.get("health_check_interval_minutes", 180) * 60
-        threshold = self.cfg.get("health_check_error_threshold", 5)
+        # Default raised from 5 - a real, confirmed miscalibration: this
+        # threshold predates two now-routine, expected warning sources
+        # (the dispatch backlog's own safety valve in bptf_ws.py, and
+        # backpack.tf's "snapshot job just queued" response shape) that
+        # together produce 150-350+ warnings in a normal, healthy
+        # 180-minute window on their own - meaning the OLD threshold of
+        # 5 triggered on essentially every single cycle regardless of
+        # whether anything was actually wrong, auto-pausing real alerts
+        # on pure noise. 1000 sits comfortably above that normal range
+        # while still catching a genuine anomaly (a real bug spamming
+        # errors far past ordinary volume). This is only the CODE
+        # default - if health_check_error_threshold is already set
+        # explicitly in config.json, that value wins; update it there
+        # too if it's still 5 or similarly low.
+        threshold = self.cfg.get("health_check_error_threshold", 1000)
         auto_pause = self.cfg.get("health_check_auto_pause", True)
         while True:
             await asyncio.sleep(interval_seconds)
