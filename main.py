@@ -465,19 +465,34 @@ class Watcher:
     # Checking real process RSS directly (not a proxy like bucket count,
     # which only bounds memory correctly if the bytes-per-entry guess
     # happens to hold) is the only check that adapts to whatever RAM a
-    # given machine actually has. 30s interval (was 60s) - a real,
-    # confirmed THIRD incident: once load_from_disk was fixed to
-    # actually succeed (see its own history) instead of silently
-    # failing and starting empty every restart, a correctly-persisting
-    # store now carries its prior size forward into each fresh process
-    # instead of regrowing from zero - cutting time-to-OOM from
-    # 15-90 minutes to a near-constant ~9-12 minutes, with growth rates
-    # observed up to ~180MB/minute in the fastest phase. 600MB (was
-    # 1000MB) leaves a full ~1GB of margin below the ~1.64GB ceiling
-    # this VPS repeatably hits, giving real reaction room even at that
-    # faster rate.
+    # given machine actually has. 30s interval - real, confirmed growth
+    # rates up to ~180MB/minute were observed during the actual leak
+    # this guard was chasing (see record()/dispatch-backlog history in
+    # bptf_ws.py and main.py), so this interval stays tight even though
+    # that leak is now fixed - a NEW one, if it ever appears, deserves
+    # the same fast reaction time.
+    #
+    # 1100MB (was 600MB, briefly, WHILE actively chasing that leak) - a
+    # real, confirmed recalibration once the leak was actually fixed:
+    # this project's own automatic tracemalloc logging (see
+    # _memtop_entries) showed RSS settling, STABLE (not climbing), at
+    # ~789MB in real, sustained operation, with only ~35-40MB of that
+    # tracked as live Python objects at all - meaning the rest is this
+    # process's ordinary baseline (interpreter, every loaded module, the
+    # full ~46,583-item price list, and everything else genuinely needed
+    # to run), not leaked memory. 600MB sat BELOW that healthy baseline,
+    # so the guard fired on every single check without ever finding
+    # anything to evict (bucket eviction can only remove LocalListing-
+    # Store's own data, and that was never the actual majority of usage)
+    # - pure log noise, not protection. 1100MB leaves real headroom above
+    # the observed healthy baseline (so normal operation stops
+    # constantly tripping it) while still leaving a genuine ~540MB of
+    # margin below the ~1.64GB ceiling this VPS repeatably hits - at the
+    # worst observed growth rate (~180MB/min), that's still a good three
+    # minutes of real reaction time if genuine unbounded growth ever
+    # resumes, same as before.
     MEMORY_GUARD_CHECK_INTERVAL_SECONDS = 30
-    MEMORY_GUARD_RSS_MB = 600
+    MEMORY_GUARD_RSS_MB = 1100
     MEMORY_GUARD_EVICT_BUCKETS = 2000
 
     async def memory_guard_loop(self):
